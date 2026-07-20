@@ -10,12 +10,12 @@
 //! environment's `auth_url` then points back at this server
 //! (`ucs-auth://<host>:<grpc-port>`).
 //!
-//! Authorization note: until the per-repository access store lands,
-//! `ExchangeUserTokenForMultiresourceToken` grants every *authenticated*
-//! user `read`/`write` on any requested resource, and the permission-check
-//! RPCs answer permissively. This upgrades an auth-less deployment to
-//! "must be logged in" without yet distinguishing per-repository roles.
-//! `RebacApi` resource registration is a no-op for the same reason.
+//! Authorization: when per-repository access control is installed (always
+//! the case with server-local auth), `ExchangeUserTokenForMultiresourceToken`
+//! resolves the caller's granted role per repository — deny-by-default —
+//! and embeds the role's permission verbs in the minted authorization
+//! token. The permission-check RPCs and `RebacApi` registration answer
+//! from the same grants.
 
 use std::sync::Arc;
 
@@ -42,6 +42,14 @@ fn default_permissions() -> Vec<String> {
         .iter()
         .map(ToString::to_string)
         .collect()
+}
+
+/// Parse a `urc-<repository-id>` resource id. Wildcards and non-repository
+/// resources yield `None`.
+fn parse_repository_resource(resource_id: &str) -> Option<lore_revision::lore::RepositoryId> {
+    use std::str::FromStr;
+    let hex = resource_id.strip_prefix("urc-")?;
+    lore_revision::lore::RepositoryId::from_str(hex).ok()
 }
 
 pub struct LoreAuthService {
@@ -195,13 +203,39 @@ impl UrcAuthApi for LoreAuthService {
             return Err(Status::invalid_argument("no resource ids requested"));
         }
 
-        let resources = resource_ids
-            .into_iter()
-            .map(|resource_id| ResourcePermission {
-                resource_id,
-                permission: default_permissions(),
-            })
-            .collect();
+        let resources = if let Some(access) = crate::access::installed() {
+            let principals = crate::access::Principals::from_claims(&user_claims);
+            let mut resources = Vec::with_capacity(resource_ids.len());
+            for resource_id in resource_ids {
+                let role = match parse_repository_resource(&resource_id) {
+                    Some(repository) => access
+                        .role_for(&principals, repository)
+                        .await
+                        .map_err(|e| Status::internal(format!("Access lookup failed: {e}")))?,
+                    // Wildcards and non-repository resources are never
+                    // granted to users.
+                    None => None,
+                };
+                let Some(role) = role else {
+                    return Err(Status::permission_denied(format!(
+                        "No access granted for {resource_id}"
+                    )));
+                };
+                resources.push(ResourcePermission {
+                    resource_id,
+                    permission: role.verbs().iter().map(ToString::to_string).collect(),
+                });
+            }
+            resources
+        } else {
+            resource_ids
+                .into_iter()
+                .map(|resource_id| ResourcePermission {
+                    resource_id,
+                    permission: default_permissions(),
+                })
+                .collect()
+        };
 
         let minted = self
             .auth
@@ -221,19 +255,51 @@ impl UrcAuthApi for LoreAuthService {
         &self,
         request: Request<lore_proto::auth::CheckUserPermissionRequest>,
     ) -> Result<Response<lore_proto::auth::CheckUserPermissionResponse>, Status> {
-        self.verify_caller(&request).await?;
+        let claims = self.verify_caller(&request).await?;
         let resource_ids = request.into_inner().resource_id;
-        let allowed = resource_ids
-            .into_iter()
-            .map(|resource_id| lore_proto::auth::ResourcePermission {
-                resource_id,
-                permission: default_permissions(),
-            })
-            .collect();
+
+        let Some(access) = crate::access::installed() else {
+            let allowed = resource_ids
+                .into_iter()
+                .map(|resource_id| lore_proto::auth::ResourcePermission {
+                    resource_id,
+                    permission: default_permissions(),
+                })
+                .collect();
+            return Ok(Response::new(
+                lore_proto::auth::CheckUserPermissionResponse {
+                    allowed_resource_permission: allowed,
+                    denied_resource_permission: Vec::new(),
+                },
+            ));
+        };
+
+        let principals = crate::access::Principals::from_claims(&claims);
+        let mut allowed = Vec::new();
+        let mut denied = Vec::new();
+        for resource_id in resource_ids {
+            let role = match parse_repository_resource(&resource_id) {
+                Some(repository) => access
+                    .role_for(&principals, repository)
+                    .await
+                    .map_err(|e| Status::internal(format!("Access lookup failed: {e}")))?,
+                None => None,
+            };
+            match role {
+                Some(role) => allowed.push(lore_proto::auth::ResourcePermission {
+                    resource_id,
+                    permission: role.verbs().iter().map(ToString::to_string).collect(),
+                }),
+                None => denied.push(lore_proto::auth::ResourcePermission {
+                    resource_id,
+                    permission: Vec::new(),
+                }),
+            }
+        }
         Ok(Response::new(
             lore_proto::auth::CheckUserPermissionResponse {
                 allowed_resource_permission: allowed,
-                denied_resource_permission: Vec::new(),
+                denied_resource_permission: denied,
             },
         ))
     }
@@ -243,17 +309,44 @@ impl UrcAuthApi for LoreAuthService {
         &self,
         request: Request<lore_proto::auth::LookupUserPermissionsRequest>,
     ) -> Result<Response<lore_proto::auth::LookupUserPermissionsResponse>, Status> {
-        self.verify_caller(&request).await?;
-        // Until the access store lands there is no per-user grant list to
-        // enumerate; answer with a wildcard so repository listing shows
-        // every repository to any authenticated user.
+        let claims = self.verify_caller(&request).await?;
         let filter = request.into_inner().resource_filter;
+
+        let Some(access) = crate::access::installed() else {
+            // No access store: answer with a wildcard so repository listing
+            // shows every repository to any authenticated user.
+            return Ok(Response::new(
+                lore_proto::auth::LookupUserPermissionsResponse {
+                    resource_permission: vec![lore_proto::auth::ResourcePermission {
+                        resource_id: format!("{filter}-*"),
+                        permission: default_permissions(),
+                    }],
+                    next_page_token: None,
+                },
+            ));
+        };
+
+        let principals = crate::access::Principals::from_claims(&claims);
+        let mut resource_permission = Vec::new();
+        for repository in access
+            .authorized_repositories(&principals)
+            .await
+            .map_err(|e| Status::internal(format!("Access lookup failed: {e}")))?
+        {
+            let role = access
+                .role_for(&principals, repository)
+                .await
+                .map_err(|e| Status::internal(format!("Access lookup failed: {e}")))?;
+            if let Some(role) = role {
+                resource_permission.push(lore_proto::auth::ResourcePermission {
+                    resource_id: format!("urc-{repository}"),
+                    permission: role.verbs().iter().map(ToString::to_string).collect(),
+                });
+            }
+        }
         Ok(Response::new(
             lore_proto::auth::LookupUserPermissionsResponse {
-                resource_permission: vec![lore_proto::auth::ResourcePermission {
-                    resource_id: format!("{filter}-*"),
-                    permission: default_permissions(),
-                }],
+                resource_permission,
                 next_page_token: None,
             },
         ))
@@ -309,9 +402,9 @@ impl UrcAuthApi for LoreAuthService {
     }
 }
 
-/// No-op `RebacApi`: repository create/delete register auth resources when
-/// an `auth_url` is configured; with server-local auth those registrations
-/// become meaningful once the access store lands.
+/// `RebacApi` backed by the access store: repository creation grants the
+/// caller the admin role, deletion clears the repository's grants. Falls
+/// back to a no-op when no access control is installed.
 pub struct LoreRebacService {
     auth: Arc<LocalAuth>,
 }
@@ -339,7 +432,15 @@ impl RebacApi for LoreRebacService {
         &self,
         request: Request<lore_proto::rebac::CreateResourceRequest>,
     ) -> Result<Response<lore_proto::rebac::CreateResourceResponse>, Status> {
-        self.verify_caller(&request).await?;
+        let claims = self.verify_caller(&request).await?;
+        if let Some(access) = crate::access::installed()
+            && let Some(repository) = parse_repository_resource(&request.get_ref().resource_id)
+        {
+            access
+                .on_repository_created(repository, &claims.user_id)
+                .await
+                .map_err(|e| Status::internal(format!("Failed to record creator grant: {e}")))?;
+        }
         Ok(Response::new(lore_proto::rebac::CreateResourceResponse {}))
     }
 
@@ -348,7 +449,25 @@ impl RebacApi for LoreRebacService {
         &self,
         request: Request<lore_proto::rebac::DeleteResourceRequest>,
     ) -> Result<Response<lore_proto::rebac::DeleteResourceResponse>, Status> {
-        self.verify_caller(&request).await?;
+        let claims = self.verify_caller(&request).await?;
+        if let Some(access) = crate::access::installed()
+            && let Some(repository) = parse_repository_resource(&request.get_ref().resource_id)
+        {
+            let principals = crate::access::Principals::from_claims(&claims);
+            match access.role_for(&principals, repository).await {
+                Ok(Some(crate::access::AccessRole::Admin)) => {}
+                Ok(_) => {
+                    return Err(Status::permission_denied(
+                        "Repository administrator role required",
+                    ));
+                }
+                Err(e) => return Err(Status::internal(format!("Access lookup failed: {e}"))),
+            }
+            access
+                .on_repository_deleted(repository)
+                .await
+                .map_err(|e| Status::internal(format!("Failed to clear grants: {e}")))?;
+        }
         Ok(Response::new(lore_proto::rebac::DeleteResourceResponse {}))
     }
 }

@@ -146,6 +146,8 @@ typedef enum lore_key_type_t {
   LORE_KEY_TYPE_REPOSITORY_ID = 5,
   // Key refers to a repository instance.
   LORE_KEY_TYPE_INSTANCE = 6,
+  // Key refers to per-repository access-control grants.
+  LORE_KEY_TYPE_ACCESS_CONTROL = 7,
 } lore_key_type_t;
 
 // Data for a generic progress event.

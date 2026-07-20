@@ -23,6 +23,11 @@ use crate::auth::minting::TokenMinter;
 use crate::auth::provider::AuthProvider;
 use crate::auth::provider::AuthProviderError;
 use crate::auth::provider::CallbackParams;
+use crate::auth::provider::google::OidcProviderSettings;
+use crate::auth::provider::google::OidcSettingsError;
+use crate::auth::provider::google::generic_oidc_provider;
+use crate::auth::provider::google::google_provider;
+use crate::auth::provider::oidc::ReqwestOidcBackend;
 use crate::auth::provider::static_provider::StaticProvider;
 use crate::auth::provider::static_provider::StaticProviderError;
 use crate::auth::provider::static_provider::StaticProviderSettings;
@@ -32,8 +37,8 @@ use crate::settings::AuthSettings;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AuthProviderSettings {
-    /// Which provider to use: `static` (development/CI). Further providers
-    /// (`google`, `cognito`, `oidc`) are added by follow-up work.
+    /// Which provider to use: `google`, `oidc` (generic), or `static`
+    /// (development/CI).
     pub mode: String,
     /// Externally reachable base URL of the server's HTTP endpoint; login
     /// callback URLs are built under it, e.g.
@@ -41,6 +46,8 @@ pub struct AuthProviderSettings {
     pub callback_base_url: String,
     #[serde(rename = "static")]
     pub static_provider: Option<StaticProviderSettings>,
+    /// OIDC settings for the `google` and `oidc` modes.
+    pub oidc: Option<OidcProviderSettings>,
 }
 
 #[derive(Debug, Error)]
@@ -55,8 +62,14 @@ pub enum LocalAuthError {
     UnknownProvider(String),
     #[error("auth.provider.mode = 'static' requires an [auth.provider.static] section")]
     MissingStaticSettings,
+    #[error("auth.provider.mode = '{0}' requires an [auth.provider.oidc] section")]
+    MissingOidcSettings(String),
+    #[error("Invalid callback base URL: {0}")]
+    InvalidCallbackBase(String),
     #[error(transparent)]
     StaticProvider(#[from] StaticProviderError),
+    #[error(transparent)]
+    OidcSettings(#[from] OidcSettingsError),
     #[error(transparent)]
     Minting(#[from] MintingError),
 }
@@ -138,8 +151,33 @@ impl LocalAuth {
                     &settings.callback_base_url,
                 )?))
             }
+            mode @ ("google" | "oidc") => {
+                let oidc_settings = settings
+                    .oidc
+                    .as_ref()
+                    .ok_or_else(|| LocalAuthError::MissingOidcSettings(mode.to_string()))?;
+                let callback_url = Self::callback_url(&settings.callback_base_url)?;
+                let backend = Arc::new(ReqwestOidcBackend);
+                let provider = if mode == "google" {
+                    google_provider(oidc_settings, &callback_url, backend)?
+                } else {
+                    generic_oidc_provider(oidc_settings, &callback_url, backend)?
+                };
+                Ok(Arc::new(provider))
+            }
             other => Err(LocalAuthError::UnknownProvider(other.to_string())),
         }
+    }
+
+    /// `<callback_base_url>/auth/callback` — the redirect URI registered
+    /// with the identity provider.
+    fn callback_url(callback_base_url: &str) -> Result<String, LocalAuthError> {
+        let base = url::Url::parse(callback_base_url)
+            .map_err(|e| LocalAuthError::InvalidCallbackBase(e.to_string()))?;
+        let callback = base
+            .join("/auth/callback")
+            .map_err(|e| LocalAuthError::InvalidCallbackBase(e.to_string()))?;
+        Ok(callback.to_string())
     }
 
     /// Complete a browser login: resolve the pending session for the
@@ -222,7 +260,9 @@ pub(crate) mod tests {
                         email: Some("alice@example.com".to_string()),
                     }],
                 }),
+                oidc: None,
             }),
+            server_admins: Vec::new(),
         }
     }
 
@@ -244,6 +284,7 @@ pub(crate) mod tests {
             jwt_issuer: None,
             token: None,
             provider: None,
+            server_admins: Vec::new(),
         };
         assert!(
             LocalAuth::from_settings(Some(&bare))
@@ -287,7 +328,7 @@ pub(crate) mod tests {
             Err(LocalAuthError::UnknownProvider(_))
         ));
 
-        let mut no_static = full;
+        let mut no_static = full.clone();
         no_static
             .provider
             .as_mut()
@@ -297,6 +338,41 @@ pub(crate) mod tests {
             LocalAuth::from_settings(Some(&no_static)),
             Err(LocalAuthError::MissingStaticSettings)
         ));
+
+        let mut google_without_oidc = full;
+        google_without_oidc
+            .provider
+            .as_mut()
+            .expect("provider")
+            .mode = "google".to_string();
+        assert!(matches!(
+            LocalAuth::from_settings(Some(&google_without_oidc)),
+            Err(LocalAuthError::MissingOidcSettings(_))
+        ));
+    }
+
+    #[test]
+    fn google_mode_builds_with_oidc_settings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret_path = dir.path().join("client-secret");
+        std::fs::write(&secret_path, "secret").expect("write");
+
+        let mut settings = test_auth_settings(dir.path());
+        let provider = settings.provider.as_mut().expect("provider");
+        provider.mode = "google".to_string();
+        provider.static_provider = None;
+        provider.oidc = Some(crate::auth::provider::google::OidcProviderSettings {
+            client_id: "client-id".to_string(),
+            client_secret_path: secret_path.to_string_lossy().to_string(),
+            discovery_url: None,
+            extra_scopes: vec![],
+            hosted_domain: None,
+        });
+
+        let auth = LocalAuth::from_settings(Some(&settings))
+            .expect("build")
+            .expect("enabled");
+        assert_eq!(auth.provider.name(), "google");
     }
 
     #[tokio::test]

@@ -1743,6 +1743,29 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // Server-local auth (provider + token minting), when configured.
     let local_auth = LocalAuth::from_settings(settings.server.auth.as_ref())?.map(Arc::new);
 
+    // With server-local auth comes per-repository access control, installed
+    // process-globally for the repository handlers and the auth service.
+    if let Some(local_auth) = local_auth.as_ref() {
+        let server_admins = settings
+            .server
+            .auth
+            .as_ref()
+            .map(|auth| auth.server_admins.clone())
+            .unwrap_or_default();
+        if server_admins.is_empty() {
+            warn!(
+                "No auth.server_admins configured; only repository creators and their \
+                 grantees can access each repository"
+            );
+        }
+        crate::access::install(Arc::new(crate::access::AccessControl::new(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            local_auth.verifier.clone(),
+            server_admins,
+        )));
+    }
+
     let jwt_verifier = if let Some(local_auth) = local_auth.as_ref() {
         // Self-minted tokens verify against the local signing key.
         Some(local_auth.verifier.clone())

@@ -119,7 +119,16 @@ async fn list_candidate_ids(
     auth_url: Option<String>,
     authorization: Option<String>,
 ) -> Result<Vec<RepositoryId>, Status> {
-    if let Some(auth_url) = auth_url {
+    if let Some(access) = crate::access::installed() {
+        // Server-local access control: only repositories the caller holds a
+        // grant on are visible (server admins see everything).
+        let claims = access.claims_from_header(authorization.as_deref()).await?;
+        let principals = crate::access::Principals::from_claims(&claims);
+        access
+            .authorized_repositories(&principals)
+            .await
+            .map_err(|err| Status::internal(format!("Access lookup failed: {err}")))
+    } else if let Some(auth_url) = auth_url {
         let ids = lookup_authorized_repositories(auth_url, authorization).await?;
         Ok(ids.into_iter().map(RepositoryId::from).collect())
     } else {

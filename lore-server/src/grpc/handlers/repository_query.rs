@@ -100,16 +100,14 @@ pub async fn repository_query_id(
     auth_url: Option<String>,
     authorization: Option<String>,
 ) -> Result<RepositoryData, RepositoryError> {
-    if let Some(auth_url) = auth_url {
-        check_repository_query_authorization(auth_url, authorization, id)
-            .await
-            .map_err(|status| {
-                warn!("User authorization failed: {status}");
-                RepositoryError::from(RepositoryNotFound {
-                    repository: id.to_string(),
-                })
-            })?;
-    }
+    check_repository_query_authorization(auth_url, authorization, id)
+        .await
+        .map_err(|status| {
+            warn!("User authorization failed: {status}");
+            RepositoryError::from(RepositoryNotFound {
+                repository: id.to_string(),
+            })
+        })?;
 
     let repository = Arc::new(repository.to_server_context(id));
     let metadata_hash = repository::metadata_hash(repository.clone())
@@ -168,16 +166,14 @@ pub async fn repository_query_name(
     let name_repository = Arc::new(repository.to_server_context(RepositoryId::default()));
     let id = repository::id_from_name(name_repository, name).await?;
 
-    if let Some(auth_url) = auth_url {
-        check_repository_query_authorization(auth_url, authorization, id)
-            .await
-            .map_err(|status| {
-                warn!("User authorization failed: {status}");
-                RepositoryError::from(RepositoryNotFound {
-                    repository: name.to_string(),
-                })
-            })?;
-    }
+    check_repository_query_authorization(auth_url, authorization, id)
+        .await
+        .map_err(|status| {
+            warn!("User authorization failed: {status}");
+            RepositoryError::from(RepositoryNotFound {
+                repository: name.to_string(),
+            })
+        })?;
 
     let repository = Arc::new(repository.to_server_context(id));
     let metadata_hash = repository::metadata_hash(repository.clone())
@@ -211,12 +207,31 @@ pub async fn repository_query_name(
     })
 }
 
+/// Check that the caller may see `repository_id`. Server-local access
+/// control takes precedence when installed; otherwise the external auth
+/// service is consulted when `auth_url` is configured; otherwise the check
+/// passes (auth disabled).
 pub(crate) async fn check_repository_query_authorization(
-    auth_url: String,
+    auth_url: Option<String>,
     authorization: Option<String>,
     repository_id: RepositoryId,
 ) -> Result<(), Status> {
     lore_debug!("Repository query authorization check for {}", repository_id,);
+
+    if let Some(access) = crate::access::installed() {
+        // Internal callers (create/delete existence probes) pass no
+        // authorization; real requests always carry a bearer past the
+        // interceptor.
+        if authorization.is_none() {
+            return Ok(());
+        }
+        return access
+            .check_visibility(authorization.as_deref(), repository_id)
+            .await;
+    }
+    let Some(auth_url) = auth_url else {
+        return Ok(());
+    };
 
     let mut client = grpc_get_auth_client(auth_url).await?;
     let resource_id = format!("urc-{repository_id}");

@@ -107,7 +107,17 @@ async fn repository_delete(
 
     let user_id = execution_context().user_id().await;
 
-    if let Some(auth_url) = auth_url {
+    if let Some(access) = crate::access::installed() {
+        // Server-local access control: deletion requires the admin role;
+        // grants are removed with the repository.
+        access
+            .check_admin(authorization.as_deref(), repository.id)
+            .await?;
+        access
+            .on_repository_deleted(repository.id)
+            .await
+            .map_err(|err| Status::internal(format!("Failed to clear repository grants: {err}")))?;
+    } else if let Some(auth_url) = auth_url {
         // Use external auth service to authorize deletion
         repository_delete_auth_resource(auth_url, authorization, repository.id).await?;
     } else {

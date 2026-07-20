@@ -56,7 +56,31 @@ pub async fn handler(
     LORE_CONTEXT
         .scope(execution, async move {
             // TODO(mjansson): Change this to a streaming response
-            let mut authorized_repositories = if let Some(auth_url) = auth_url {
+            let mut authorized_repositories = if let Some(access) = crate::access::installed() {
+                // Server-local access control: only granted repositories are
+                // visible (server admins see everything).
+                let claims = access.claims_from_header(authorization.as_deref()).await?;
+                let principals = crate::access::Principals::from_claims(&claims);
+                let ids = access
+                    .authorized_repositories(&principals)
+                    .await
+                    .map_err(|err| Status::internal(format!("Access lookup failed: {err}")))?;
+
+                let mut meta_tasks = JoinSet::new();
+                for id in ids {
+                    let id: Context = id.into();
+                    let repository = Arc::new(repository.to_server_context(id.into()));
+                    meta_tasks.spawn(
+                        LORE_CONTEXT
+                            .scope(execution_context(), async move {
+                                (id, repository::metadata_hash(repository).await)
+                            })
+                            .in_current_span(),
+                    );
+                }
+
+                meta_tasks
+            } else if let Some(auth_url) = auth_url {
                 let authorized_repositories =
                     lookup_authorized_repositories(auth_url, authorization).await?;
 

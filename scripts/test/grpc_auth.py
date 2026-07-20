@@ -159,3 +159,77 @@ def exchange_for_resources(
     if not token_bytes:
         raise ValueError("exchange response missing token")
     return _parse_user_token(token_bytes[0])
+
+
+_CHECK_PERMISSION = "/epic_urc.UrcAuthApi/CheckUserPermission"
+_LOOKUP_PERMISSIONS = "/epic_urc.UrcAuthApi/LookupUserPermissions"
+_REBAC_CREATE = "/ucs.auth.RebacApi/CreateResource"
+_REBAC_DELETE = "/ucs.auth.RebacApi/DeleteResource"
+
+
+def _authed_call(
+    grpc_target: str,
+    method: str,
+    request: bytes,
+    user_token: str,
+    timeout: float = 10.0,
+) -> bytes:
+    with grpc.insecure_channel(grpc_target) as channel:
+        call = channel.unary_unary(
+            method,
+            request_serializer=lambda payload: payload,
+            response_deserializer=lambda response: response,
+        )
+        return call(
+            request,
+            timeout=timeout,
+            metadata=(("authorization", f"Bearer {user_token}"),),
+        )
+
+
+def _parse_resource_permissions(values: list) -> dict[str, list[str]]:
+    """Parse repeated ResourcePermission into {resource_id: [permissions]}."""
+    out: dict[str, list[str]] = {}
+    for value in values:
+        fields = _parse_fields(value)
+        resource_id = _first_string(fields, 1)
+        out[resource_id] = [v.decode("utf-8") for v in fields.get(2, [])]
+    return out
+
+
+def check_user_permission(
+    grpc_target: str, user_token: str, resource_ids: list[str]
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Returns (allowed, denied) as {resource_id: [permissions]}."""
+    request = b"".join(_encode_string_field(1, rid) for rid in resource_ids)
+    fields = _parse_fields(
+        _authed_call(grpc_target, _CHECK_PERMISSION, request, user_token)
+    )
+    return (
+        _parse_resource_permissions(fields.get(1, [])),
+        _parse_resource_permissions(fields.get(2, [])),
+    )
+
+
+def lookup_user_permissions(
+    grpc_target: str, user_token: str, resource_filter: str = "urc"
+) -> dict[str, list[str]]:
+    request = _encode_string_field(1, resource_filter)
+    fields = _parse_fields(
+        _authed_call(grpc_target, _LOOKUP_PERMISSIONS, request, user_token)
+    )
+    return _parse_resource_permissions(fields.get(1, []))
+
+
+def rebac_create_resource(
+    grpc_target: str, user_token: str, resource_id: str, resource_name: str
+) -> None:
+    request = _encode_string_field(1, resource_id) + _encode_string_field(
+        2, resource_name
+    )
+    _authed_call(grpc_target, _REBAC_CREATE, request, user_token)
+
+
+def rebac_delete_resource(grpc_target: str, user_token: str, resource_id: str) -> None:
+    request = _encode_string_field(1, resource_id)
+    _authed_call(grpc_target, _REBAC_DELETE, request, user_token)

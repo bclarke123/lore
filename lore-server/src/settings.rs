@@ -232,6 +232,11 @@ pub struct AuthSettings {
     /// Identity provider backing server-local login (`static`, and OIDC
     /// providers in follow-up work). Requires `token`.
     pub provider: Option<crate::auth::local_auth::AuthProviderSettings>,
+    /// Server administrators (canonical `<idp>:<subject>` ids or email
+    /// aliases) who hold every role on every repository. Only meaningful
+    /// with server-local auth.
+    #[serde(default)]
+    pub server_admins: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

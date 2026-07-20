@@ -110,7 +110,9 @@ impl SessionManager {
             session_code: random_value(),
             client_state: client_state.to_string(),
             csrf_state: random_value(),
-            pkce_verifier: random_value(),
+            // RFC 7636 requires a 43–128 character code verifier; two
+            // concatenated 32-char values give 64.
+            pkce_verifier: format!("{}{}", random_value(), random_value()),
             nonce: random_value(),
             created: Instant::now(),
         };

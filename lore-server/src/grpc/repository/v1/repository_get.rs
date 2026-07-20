@@ -110,16 +110,14 @@ pub(super) async fn repository_load_id(
     auth_url: Option<String>,
     authorization: Option<String>,
 ) -> Result<(RepositoryMetadata, Hash), RepositoryError> {
-    if let Some(auth_url) = auth_url {
-        check_repository_query_authorization(auth_url, authorization, id)
-            .await
-            .map_err(|status| {
-                debug!(%id, "User authorization failed: {status}");
-                RepositoryError::from(RepositoryNotFound {
-                    repository: id.to_string(),
-                })
-            })?;
-    }
+    check_repository_query_authorization(auth_url, authorization, id)
+        .await
+        .map_err(|status| {
+            debug!(%id, "User authorization failed: {status}");
+            RepositoryError::from(RepositoryNotFound {
+                repository: id.to_string(),
+            })
+        })?;
 
     let repository = Arc::new(repository.to_server_context(id));
     let metadata_hash = repository::metadata_hash(repository.clone())
@@ -177,16 +175,14 @@ pub(super) async fn repository_load_name(
     let name_repository = Arc::new(repository.to_server_context(RepositoryId::default()));
     let id = repository::id_from_name(name_repository, name).await?;
 
-    if let Some(auth_url) = auth_url {
-        check_repository_query_authorization(auth_url, authorization, id)
-            .await
-            .map_err(|status| {
-                debug!(%id, "User authorization failed: {status}");
-                RepositoryError::from(RepositoryNotFound {
-                    repository: name.to_string(),
-                })
-            })?;
-    }
+    check_repository_query_authorization(auth_url, authorization, id)
+        .await
+        .map_err(|status| {
+            debug!(%id, "User authorization failed: {status}");
+            RepositoryError::from(RepositoryNotFound {
+                repository: name.to_string(),
+            })
+        })?;
 
     let repository = Arc::new(repository.to_server_context(id));
     let metadata_hash = repository::metadata_hash(repository.clone())

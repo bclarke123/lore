@@ -18,7 +18,12 @@ import urllib.request
 
 import grpc
 import pytest
-from grpc_auth import exchange_for_resources, get_auth_session, start_auth_session
+from grpc_auth import (
+    exchange_for_resources,
+    get_auth_session,
+    rebac_create_resource,
+    start_auth_session,
+)
 from lore_server import (
     _kill_server_by_pid,
     allocate_free_port,
@@ -188,14 +193,20 @@ def test_exchange_mints_authorization_token(auth_server):
     user_token = get_auth_session(auth_server["grpc"], session_code, client_state)
     assert user_token is not None
 
+    # Access is deny-by-default: register the resource first (what
+    # RepositoryCreate does), granting the caller the admin role.
     resource = "urc-00000000000000000000000000000000"
+    rebac_create_resource(
+        auth_server["grpc"], user_token.user_token, resource, "smoke-repo"
+    )
     authz = exchange_for_resources(
         auth_server["grpc"], user_token.user_token, [resource]
     )
     claims = decode_jwt_claims(authz.user_token)
-    assert claims["resources"] == [
-        {"resource_id": resource, "permission": ["read", "write"]}
-    ]
+    assert len(claims["resources"]) == 1
+    assert claims["resources"][0]["resource_id"] == resource
+    for verb in ("read", "write", "admin"):
+        assert verb in claims["resources"][0]["permission"]
 
     # Exchange without a token is refused.
     with pytest.raises(grpc.RpcError) as error:

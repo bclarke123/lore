@@ -233,7 +233,15 @@ async fn repository_create_inner(
         };
     }
 
-    if let Some(auth_url) = auth_url {
+    if let Some(access) = crate::access::installed() {
+        // Server-local access control: the creator receives an automatic
+        // admin grant on the new repository.
+        let claims = access.claims_from_header(authorization.as_deref()).await?;
+        access
+            .on_repository_created(repository.id, &claims.user_id)
+            .await
+            .map_err(|err| Status::internal(format!("Failed to record creator grant: {err}")))?;
+    } else if let Some(auth_url) = auth_url {
         let client = Box::new(crate::authnz::rebac::grpc_get_rebac_client(auth_url).await?);
         repository_create_auth_resource(client, authorization, repository.id, name).await?;
     }

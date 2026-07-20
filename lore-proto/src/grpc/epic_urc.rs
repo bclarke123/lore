@@ -635,3 +635,843 @@ pub mod urc_auth_api_client {
         }
     }
 }
+/// Generated server implementations.
+pub mod urc_auth_api_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with UrcAuthApiServer.
+    #[async_trait]
+    pub trait UrcAuthApi: std::marker::Send + std::marker::Sync + 'static {
+        async fn health_check(
+            &self,
+            request: tonic::Request<super::HealthCheckRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::HealthCheckResponse>,
+            tonic::Status,
+        >;
+        async fn start_auth_session(
+            &self,
+            request: tonic::Request<super::StartAuthSessionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::StartAuthSessionResponse>,
+            tonic::Status,
+        >;
+        async fn get_auth_session(
+            &self,
+            request: tonic::Request<super::GetAuthSessionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetAuthSessionResponse>,
+            tonic::Status,
+        >;
+        async fn refresh_auth_session(
+            &self,
+            request: tonic::Request<super::RefreshAuthSessionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RefreshAuthSessionResponse>,
+            tonic::Status,
+        >;
+        async fn verify_user(
+            &self,
+            request: tonic::Request<super::VerifyUserRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::VerifyUserResponse>,
+            tonic::Status,
+        >;
+        /// For external authentication token login
+        async fn exchange_external_token_for_user_token(
+            &self,
+            request: tonic::Request<super::ExchangeExternalTokenForUserTokenRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ExchangeExternalTokenForUserTokenResponse>,
+            tonic::Status,
+        >;
+        /// For API key login
+        async fn exchange_api_key_for_user_token(
+            &self,
+            request: tonic::Request<super::ExchangeApiKeyForUserTokenRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ExchangeApiKeyForUserTokenResponse>,
+            tonic::Status,
+        >;
+        /// For token exchange
+        async fn exchange_user_token_for_multiresource_token(
+            &self,
+            request: tonic::Request<super::ExchangeUserTokenForMultiresourceTokenRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ExchangeUserTokenForMultiresourceTokenResponse>,
+            tonic::Status,
+        >;
+        /// For permission checks
+        async fn check_user_permission(
+            &self,
+            request: tonic::Request<super::CheckUserPermissionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CheckUserPermissionResponse>,
+            tonic::Status,
+        >;
+        async fn lookup_user_permissions(
+            &self,
+            request: tonic::Request<super::LookupUserPermissionsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::LookupUserPermissionsResponse>,
+            tonic::Status,
+        >;
+        /// User metadata
+        async fn get_user_info(
+            &self,
+            request: tonic::Request<super::GetUserInfoRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetUserInfoResponse>,
+            tonic::Status,
+        >;
+        async fn get_user_id(
+            &self,
+            request: tonic::Request<super::GetUserIdRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetUserIdResponse>,
+            tonic::Status,
+        >;
+        async fn get_provider_user_id(
+            &self,
+            request: tonic::Request<super::GetProviderUserIdRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetProviderUserIdResponse>,
+            tonic::Status,
+        >;
+    }
+    #[derive(Debug)]
+    pub struct UrcAuthApiServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> UrcAuthApiServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for UrcAuthApiServer<T>
+    where
+        T: UrcAuthApi,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/epic_urc.UrcAuthApi/HealthCheck" => {
+                    #[allow(non_camel_case_types)]
+                    struct HealthCheckSvc<T: UrcAuthApi>(pub Arc<T>);
+                    impl<
+                        T: UrcAuthApi,
+                    > tonic::server::UnaryService<super::HealthCheckRequest>
+                    for HealthCheckSvc<T> {
+                        type Response = super::HealthCheckResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::HealthCheckRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as UrcAuthApi>::health_check(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = HealthCheckSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/epic_urc.UrcAuthApi/StartAuthSession" => {
+                    #[allow(non_camel_case_types)]
+                    struct StartAuthSessionSvc<T: UrcAuthApi>(pub Arc<T>);
+                    impl<
+                        T: UrcAuthApi,
+                    > tonic::server::UnaryService<super::StartAuthSessionRequest>
+                    for StartAuthSessionSvc<T> {
+                        type Response = super::StartAuthSessionResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::StartAuthSessionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as UrcAuthApi>::start_auth_session(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = StartAuthSessionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/epic_urc.UrcAuthApi/GetAuthSession" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetAuthSessionSvc<T: UrcAuthApi>(pub Arc<T>);
+                    impl<
+                        T: UrcAuthApi,
+                    > tonic::server::UnaryService<super::GetAuthSessionRequest>
+                    for GetAuthSessionSvc<T> {
+                        type Response = super::GetAuthSessionResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetAuthSessionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as UrcAuthApi>::get_auth_session(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetAuthSessionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/epic_urc.UrcAuthApi/RefreshAuthSession" => {
+                    #[allow(non_camel_case_types)]
+                    struct RefreshAuthSessionSvc<T: UrcAuthApi>(pub Arc<T>);
+                    impl<
+                        T: UrcAuthApi,
+                    > tonic::server::UnaryService<super::RefreshAuthSessionRequest>
+                    for RefreshAuthSessionSvc<T> {
+                        type Response = super::RefreshAuthSessionResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RefreshAuthSessionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as UrcAuthApi>::refresh_auth_session(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RefreshAuthSessionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/epic_urc.UrcAuthApi/VerifyUser" => {
+                    #[allow(non_camel_case_types)]
+                    struct VerifyUserSvc<T: UrcAuthApi>(pub Arc<T>);
+                    impl<
+                        T: UrcAuthApi,
+                    > tonic::server::UnaryService<super::VerifyUserRequest>
+                    for VerifyUserSvc<T> {
+                        type Response = super::VerifyUserResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::VerifyUserRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as UrcAuthApi>::verify_user(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = VerifyUserSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/epic_urc.UrcAuthApi/ExchangeExternalTokenForUserToken" => {
+                    #[allow(non_camel_case_types)]
+                    struct ExchangeExternalTokenForUserTokenSvc<T: UrcAuthApi>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: UrcAuthApi,
+                    > tonic::server::UnaryService<
+                        super::ExchangeExternalTokenForUserTokenRequest,
+                    > for ExchangeExternalTokenForUserTokenSvc<T> {
+                        type Response = super::ExchangeExternalTokenForUserTokenResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::ExchangeExternalTokenForUserTokenRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as UrcAuthApi>::exchange_external_token_for_user_token(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ExchangeExternalTokenForUserTokenSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/epic_urc.UrcAuthApi/ExchangeAPIKeyForUserToken" => {
+                    #[allow(non_camel_case_types)]
+                    struct ExchangeAPIKeyForUserTokenSvc<T: UrcAuthApi>(pub Arc<T>);
+                    impl<
+                        T: UrcAuthApi,
+                    > tonic::server::UnaryService<
+                        super::ExchangeApiKeyForUserTokenRequest,
+                    > for ExchangeAPIKeyForUserTokenSvc<T> {
+                        type Response = super::ExchangeApiKeyForUserTokenResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::ExchangeApiKeyForUserTokenRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as UrcAuthApi>::exchange_api_key_for_user_token(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ExchangeAPIKeyForUserTokenSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/epic_urc.UrcAuthApi/ExchangeUserTokenForMultiresourceToken" => {
+                    #[allow(non_camel_case_types)]
+                    struct ExchangeUserTokenForMultiresourceTokenSvc<T: UrcAuthApi>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: UrcAuthApi,
+                    > tonic::server::UnaryService<
+                        super::ExchangeUserTokenForMultiresourceTokenRequest,
+                    > for ExchangeUserTokenForMultiresourceTokenSvc<T> {
+                        type Response = super::ExchangeUserTokenForMultiresourceTokenResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::ExchangeUserTokenForMultiresourceTokenRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as UrcAuthApi>::exchange_user_token_for_multiresource_token(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ExchangeUserTokenForMultiresourceTokenSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/epic_urc.UrcAuthApi/CheckUserPermission" => {
+                    #[allow(non_camel_case_types)]
+                    struct CheckUserPermissionSvc<T: UrcAuthApi>(pub Arc<T>);
+                    impl<
+                        T: UrcAuthApi,
+                    > tonic::server::UnaryService<super::CheckUserPermissionRequest>
+                    for CheckUserPermissionSvc<T> {
+                        type Response = super::CheckUserPermissionResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CheckUserPermissionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as UrcAuthApi>::check_user_permission(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CheckUserPermissionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/epic_urc.UrcAuthApi/LookupUserPermissions" => {
+                    #[allow(non_camel_case_types)]
+                    struct LookupUserPermissionsSvc<T: UrcAuthApi>(pub Arc<T>);
+                    impl<
+                        T: UrcAuthApi,
+                    > tonic::server::UnaryService<super::LookupUserPermissionsRequest>
+                    for LookupUserPermissionsSvc<T> {
+                        type Response = super::LookupUserPermissionsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::LookupUserPermissionsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as UrcAuthApi>::lookup_user_permissions(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = LookupUserPermissionsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/epic_urc.UrcAuthApi/GetUserInfo" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetUserInfoSvc<T: UrcAuthApi>(pub Arc<T>);
+                    impl<
+                        T: UrcAuthApi,
+                    > tonic::server::UnaryService<super::GetUserInfoRequest>
+                    for GetUserInfoSvc<T> {
+                        type Response = super::GetUserInfoResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetUserInfoRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as UrcAuthApi>::get_user_info(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetUserInfoSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/epic_urc.UrcAuthApi/GetUserId" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetUserIdSvc<T: UrcAuthApi>(pub Arc<T>);
+                    impl<
+                        T: UrcAuthApi,
+                    > tonic::server::UnaryService<super::GetUserIdRequest>
+                    for GetUserIdSvc<T> {
+                        type Response = super::GetUserIdResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetUserIdRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as UrcAuthApi>::get_user_id(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetUserIdSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/epic_urc.UrcAuthApi/GetProviderUserId" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetProviderUserIdSvc<T: UrcAuthApi>(pub Arc<T>);
+                    impl<
+                        T: UrcAuthApi,
+                    > tonic::server::UnaryService<super::GetProviderUserIdRequest>
+                    for GetProviderUserIdSvc<T> {
+                        type Response = super::GetProviderUserIdResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetProviderUserIdRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as UrcAuthApi>::get_provider_user_id(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetProviderUserIdSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(
+                            tonic::body::Body::default(),
+                        );
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
+            }
+        }
+    }
+    impl<T> Clone for UrcAuthApiServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "epic_urc.UrcAuthApi";
+    impl<T> tonic::server::NamedService for UrcAuthApiServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}

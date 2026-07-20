@@ -275,6 +275,7 @@ mod tests {
                     jwt_verifier: None,
                     max_file_size: 100,
                     presign_config: Some(test_presign_config()),
+                    local_auth: None,
                 };
                 let repo_hex = format!("{repository}");
                 let settings = LoreHttpServerSettings::default();

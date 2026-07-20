@@ -55,6 +55,8 @@ pub struct ServerState {
     pub jwt_verifier: Option<JwtVerifier>,
     pub max_file_size: u64,
     pub presign_config: Option<PresignConfig>,
+    /// Server-local auth; enables the unauthenticated login callback routes.
+    pub local_auth: Option<Arc<crate::auth::local_auth::LocalAuth>>,
 }
 
 pub struct ServerHealth {
@@ -135,6 +137,12 @@ pub fn create_router(
     let mut router = Router::new()
         .merge(unauthenticated_router)
         .nest("/v1", authenticated_router);
+
+    // Server-local auth: the browser login callback endpoints (the login
+    // door — unauthenticated by design).
+    if let Some(local_auth) = shared_state.local_auth.clone() {
+        router = router.merge(crate::http::auth_login::create_router(local_auth));
+    }
 
     if shared_state.presign_config.is_some() {
         router = router.nest(
@@ -221,6 +229,7 @@ impl LoreHttpServer {
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         jwt_verifier: Option<JwtVerifier>,
+        local_auth: Option<Arc<crate::auth::local_auth::LocalAuth>>,
         signal: impl Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
         let addr = SocketAddr::from_str(format!("{}:{}", settings.host, settings.port).as_str())
@@ -260,6 +269,7 @@ impl LoreHttpServer {
             jwt_verifier,
             max_file_size: settings.max_file_size,
             presign_config,
+            local_auth,
         };
 
         let app = create_router(shared_state, health, &settings);

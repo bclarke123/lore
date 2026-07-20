@@ -48,6 +48,7 @@ tokio-stream = { workspace = true }
 toml = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
+url = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true, features = ["timeout", "trace"] }
 tracing = { workspace = true }
@@ -80,6 +81,8 @@ vergen = { workspace = true }
 
 [dev-dependencies]
 ctor = { workspace = true }
+lore-credential = { workspace = true }
+tempfile = "3"
 axum-test = "18.1.0"
 http-body = "1.0.1"
 http-body-util = "0.1.3"

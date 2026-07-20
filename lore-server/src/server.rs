@@ -64,6 +64,7 @@ use tracing::warn;
 
 use crate::auth::jwk::JwkServiceImpl;
 use crate::auth::jwt::JwtVerifier;
+use crate::auth::local_auth::LocalAuth;
 use crate::grpc::GrpcInternalServerBuilder;
 use crate::grpc::GrpcServerBuilder;
 use crate::grpc::forwarded_requests::ForwardedRequests;
@@ -414,6 +415,7 @@ async fn launch_grpc_server(
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
     jwt_verifier: Option<JwtVerifier>,
+    local_auth: Option<Arc<LocalAuth>>,
     settings: Settings,
     notification_sender: Arc<dyn NotificationSender>,
     notification_service: Option<NotificationService>,
@@ -493,7 +495,7 @@ async fn launch_grpc_server(
             user_agent_filter,
             forwarded_requests,
         )
-        .with_jwt_verifier(jwt_verifier)?
+        .with_jwt_verifier(jwt_verifier, local_auth)?
         .serve(addr, async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
         })
@@ -615,6 +617,7 @@ async fn launch_http_server(
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     jwt_verifier: Option<JwtVerifier>,
+    local_auth: Option<Arc<LocalAuth>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     LoreHttpServer::serve(
@@ -622,6 +625,7 @@ async fn launch_http_server(
         immutable_store,
         mutable_store,
         jwt_verifier,
+        local_auth,
         async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
         },
@@ -1736,23 +1740,31 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         false
     };
 
-    let jwt_verifier = match settings.server.auth.as_ref() {
-        Some(auth) => match auth.jwk.as_ref() {
-            Some(jwk) => {
-                let jwk_service = JwkServiceImpl::new(jwk.clone());
-                jwk_service
-                    .fetch_new_keys(None /* fetch all keys */)
-                    .await?;
-                let jwt_verifier = JwtVerifier {
-                    jwk_service: Arc::new(jwk_service),
-                    jwt_issuer: auth.jwt_issuer.clone(),
-                    jwt_audience: auth.jwt_audience.clone(),
-                };
-                Some(jwt_verifier)
-            }
+    // Server-local auth (provider + token minting), when configured.
+    let local_auth = LocalAuth::from_settings(settings.server.auth.as_ref())?.map(Arc::new);
+
+    let jwt_verifier = if let Some(local_auth) = local_auth.as_ref() {
+        // Self-minted tokens verify against the local signing key.
+        Some(local_auth.verifier.clone())
+    } else {
+        match settings.server.auth.as_ref() {
+            Some(auth) => match auth.jwk.as_ref() {
+                Some(jwk) => {
+                    let jwk_service = JwkServiceImpl::new(jwk.clone());
+                    jwk_service
+                        .fetch_new_keys(None /* fetch all keys */)
+                        .await?;
+                    let jwt_verifier = JwtVerifier {
+                        jwk_service: Arc::new(jwk_service),
+                        jwt_issuer: auth.jwt_issuer.clone(),
+                        jwt_audience: auth.jwt_audience.clone(),
+                    };
+                    Some(jwt_verifier)
+                }
+                None => None,
+            },
             None => None,
-        },
-        None => None,
+        }
     };
 
     let forwarded_requests: Option<Arc<dyn ForwardedRequests>> = if let Some(grpc_public_services) =
@@ -1807,6 +1819,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let mutable_store = mutable_store.clone();
             let lock_store = lock_store.clone();
             let jwt_verifier = jwt_verifier.clone();
+            let local_auth = local_auth.clone();
             let settings = settings.clone();
             let notification = notification.clone();
             let user_agent_filter = user_agent_filter.clone();
@@ -1824,6 +1837,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 mutable_store,
                 lock_store,
                 jwt_verifier,
+                local_auth,
                 settings,
                 notification,
                 notification_service,
@@ -2024,6 +2038,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     immutable_store,
                     mutable_store,
                     jwt_verifier,
+                    local_auth,
                     shutdown_rx,
                 )
             );

@@ -11,11 +11,13 @@ use anyhow::Result;
 use anyhow::anyhow;
 use lore_proto::AdminServiceServer;
 use lore_proto::LockServiceServer;
+use lore_proto::auth::urc_auth_api_server::UrcAuthApiServer;
 use lore_proto::lore::environment::v1::environment_service_server as environment_v1_server;
 use lore_proto::lore::repository::v1::repository_service_server as repository_v1_server;
 use lore_proto::lore::revision::v1::revision_service_server as revision_v1_server;
 use lore_proto::lore::storage::v1::storage_service_server as storage_service_v1_server;
 use lore_proto::lore::thin_client::v1::thin_client_service_server as thin_client_v1_server;
+use lore_proto::rebac::rebac_api_server::RebacApiServer;
 use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
 use lore_revision::environment::EnvironmentConfig;
 use lore_revision::lock::LockStore;
@@ -40,11 +42,14 @@ use super::lock_service::LoreLockService;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt_interceptor::JWTAuthnInterceptor;
 use crate::auth::jwt_interceptor::JWTInterceptor;
+use crate::auth::local_auth::LocalAuth;
 use crate::correlation::layer::CorrelationIdLayer;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::correlation::layer::TraceLayerConfig;
 use crate::correlation::span::MakeCorrelationIdSpan;
 use crate::grpc::admin_service::LoreAdminService;
+use crate::grpc::auth_service::LoreAuthService;
+use crate::grpc::auth_service::LoreRebacService;
 use crate::grpc::environment::LoreEnvironmentV1Service;
 use crate::grpc::environment_service::LoreEnvironmentService;
 use crate::grpc::forwarded_requests::ForwardedRequests;
@@ -499,6 +504,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
     pub fn with_jwt_verifier(
         self,
         jwt_verifier: Option<JwtVerifier>,
+        local_auth: Option<Arc<LocalAuth>>,
     ) -> Result<GrpcServerBuilder<WantsAddress>> {
         let storage_svc = LoreStorageService::new(
             self.0.immutable_store.clone(),
@@ -599,6 +605,17 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             .layer(GrpcResponseTraceLayer {});
 
         let mut router = router.add_service(AdminServiceServer::new(admin_svc));
+
+        // Server-local auth: serve the login/exchange protocol ourselves.
+        // Registered without an interceptor — it is the login door.
+        if let Some(local_auth) = local_auth {
+            info!("Enabling server-local auth service");
+            router = router
+                .add_service(UrcAuthApiServer::new(LoreAuthService::new(
+                    local_auth.clone(),
+                )))
+                .add_service(RebacApiServer::new(LoreRebacService::new(local_auth)));
+        }
 
         if let Some(jwt_verifier) = jwt_verifier.as_ref() {
             let jwt_interceptor = JWTInterceptor::new(jwt_verifier);

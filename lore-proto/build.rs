@@ -172,10 +172,11 @@ fn main() -> Result<()> {
     // Use Bytes for buffers instead of Vec
     config.bytes(["."]);
 
+    // Server stubs are generated as well: `loreserver` implements the
+    // `UrcAuthApi` service itself when a local auth provider is configured.
     tonic_prost_build::configure()
         .out_dir(&output_dir)
         .protoc_arg("--experimental_allow_proto3_optional")
-        .build_server(false)
         .compile_with_config(
             config,
             &["./proto/auth_api.proto", "./proto/rebac_api.proto"],

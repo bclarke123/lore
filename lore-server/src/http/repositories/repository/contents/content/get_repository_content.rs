@@ -205,6 +205,7 @@ mod tests {
                     jwt_verifier: None,
                     max_file_size: 100,
                     presign_config: None,
+                    local_auth: None,
                 };
 
                 let settings = LoreHttpServerSettings::default();
@@ -231,6 +232,7 @@ mod tests {
                     jwt_verifier: None,
                     max_file_size: 100,
                     presign_config: None,
+                    local_auth: None,
                 };
                 let settings = LoreHttpServerSettings::default();
                 let app = create_router(test_shared_state, test_health, &settings);
@@ -258,6 +260,7 @@ mod tests {
                     jwt_verifier: None,
                     max_file_size: 100,
                     presign_config: None,
+                    local_auth: None,
                 };
                 let settings = LoreHttpServerSettings::default();
                 let app = create_router(test_shared_state, test_health, &settings);
@@ -302,6 +305,7 @@ mod tests {
                     jwt_verifier: None,
                     max_file_size: 100,
                     presign_config: None,
+                    local_auth: None,
                 };
                 let settings = LoreHttpServerSettings::default();
                 let app = create_router(test_shared_state, test_health, &settings);
@@ -345,6 +349,7 @@ mod tests {
                     jwt_verifier: None,
                     max_file_size: 100,
                     presign_config: None,
+                    local_auth: None,
                 };
                 let settings = LoreHttpServerSettings::default();
                 let app = create_router(test_shared_state, test_health, &settings);
@@ -405,6 +410,7 @@ mod tests {
                     jwt_verifier: None,
                     max_file_size: 100,
                     presign_config: None,
+                    local_auth: None,
                 };
                 let settings = LoreHttpServerSettings::default();
                 let app = create_router(test_shared_state, test_health, &settings);

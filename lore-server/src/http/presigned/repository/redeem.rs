@@ -259,6 +259,7 @@ mod tests {
                     jwt_verifier: None,
                     max_file_size: 100,
                     presign_config: Some(config),
+                    local_auth: None,
                 };
                 let settings = LoreHttpServerSettings::default();
                 let app = create_router(state, test_health, &settings);
@@ -305,6 +306,7 @@ mod tests {
                     jwt_verifier: None,
                     max_file_size: 100,
                     presign_config: Some(config),
+                    local_auth: None,
                 };
                 let settings = LoreHttpServerSettings::default();
                 let app = create_router(state, test_health, &settings);
@@ -353,6 +355,7 @@ mod tests {
                     jwt_verifier: None,
                     max_file_size: 100,
                     presign_config: Some(config),
+                    local_auth: None,
                 };
                 let settings = LoreHttpServerSettings::default();
                 let app = create_router(state, test_health, &settings);
@@ -388,6 +391,7 @@ mod tests {
                     jwt_verifier: None,
                     max_file_size: 100,
                     presign_config: Some(config),
+                    local_auth: None,
                 };
                 let settings = LoreHttpServerSettings::default();
                 let app = create_router(state, test_health, &settings);

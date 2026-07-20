@@ -221,9 +221,17 @@ fn trace_config_error_to_config(err: TraceConfigError) -> config::ConfigError {
 #[derive(Clone, Debug, Deserialize)]
 //#[serde(deny_unknown_fields)]
 pub struct AuthSettings {
+    /// External JWKS endpoint for verifying tokens issued by a remote auth
+    /// service. Mutually exclusive with `token` (server-local minting).
     pub jwk: Option<JWKServiceSettings>,
     pub jwt_audience: Option<Vec<String>>,
     pub jwt_issuer: Option<String>,
+    /// Server-local token minting; when set the server issues and verifies
+    /// its own tokens.
+    pub token: Option<crate::auth::minting::TokenMintingSettings>,
+    /// Identity provider backing server-local login (`static`, and OIDC
+    /// providers in follow-up work). Requires `token`.
+    pub provider: Option<crate::auth::local_auth::AuthProviderSettings>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

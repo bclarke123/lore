@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use futures::FutureExt;
+pub mod access_service;
 pub mod admin_service;
 pub mod auth_service;
 pub mod environment;

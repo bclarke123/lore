@@ -58,6 +58,7 @@ mod tests {
             audience: vec!["lore.example.com".to_string()],
             user_token_ttl_seconds: 3600,
             authz_token_ttl_seconds: 900,
+            refresh_token_ttl_seconds: 3600,
             env: "test".to_string(),
         };
         TokenMinter::from_settings(&settings).expect("minter")
@@ -190,6 +191,7 @@ mod tests {
             audience: vec!["lore.example.com".to_string(), "localhost".to_string()],
             user_token_ttl_seconds: 3600,
             authz_token_ttl_seconds: 900,
+            refresh_token_ttl_seconds: 3600,
             env: "test".to_string(),
         };
         let minter = TokenMinter::from_settings(&settings).expect("minter");

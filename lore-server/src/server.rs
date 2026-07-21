@@ -1764,6 +1764,19 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             local_auth.verifier.clone(),
             server_admins,
         )));
+
+        let refresh_ttl_seconds = settings
+            .server
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.token.as_ref())
+            .map(|token| token.refresh_token_ttl_seconds)
+            .unwrap_or_default();
+        crate::auth::refresh::install(Arc::new(crate::auth::refresh::RefreshTokenStore::new(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            refresh_ttl_seconds,
+        )));
     }
 
     let jwt_verifier = if let Some(local_auth) = local_auth.as_ref() {

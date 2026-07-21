@@ -39,6 +39,9 @@ PROJECT2 = "urc-f6ca55437aa34198ba0f0fdc33154d51"
 AUTH_CONFIG_TEMPLATE = """
 
 # Appended by test_access_control.py: server-local auth + access control.
+[environment.endpoint]
+auth_url = "ucs-auth://localhost:{grpc_port}"
+
 [server.auth]
 server_admins = ["root@example.com"]
 
@@ -91,6 +94,7 @@ def access_server(request, tmp_path_factory):
             AUTH_CONFIG_TEMPLATE.format(
                 signing_key_path=(server_root / "signing-key.pem").as_posix(),
                 http_port=ports["http"],
+                grpc_port=ports["grpc"],
             )
         )
 
@@ -220,3 +224,137 @@ def test_lookup_lists_only_real_granted_repositories(access_server, tokens):
     assert lookup_user_permissions(access_server["grpc"], tokens["alice"]) == {}
     # ...and nothing for the server admin either, for the same reason.
     assert lookup_user_permissions(access_server["grpc"], tokens["root"]) == {}
+
+
+def lore_cli(lore_executable_path, auth_dir, *args):
+    """Run the lore CLI with an isolated auth store."""
+    import os
+    import subprocess
+
+    return subprocess.run(
+        [lore_executable_path, *args],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={
+            **os.environ,
+            "LORE_AUTH_PATH": str(auth_dir),
+            "LORE_AUTH_STORE": "fallback",
+        },
+    )
+
+
+def test_cli_grant_revoke_list(
+    access_server, tokens, lore_executable_path, tmp_path_factory
+):
+    remote = f"grpc://localhost:{access_server['grpc'].split(':')[1]}"
+    auth_url = f"ucs-auth://localhost:{access_server['grpc'].split(':')[1]}"
+    repo_id = PROJECT1.removeprefix("urc-")
+
+    # alice becomes admin of the repository and logs the CLI in.
+    rebac_create_resource(access_server["grpc"], tokens["alice"], PROJECT1, "project1")
+    alice_dir = tmp_path_factory.mktemp("alice-auth")
+    login = lore_cli(
+        lore_executable_path,
+        alice_dir,
+        "auth",
+        "login",
+        "--token-type",
+        "lore",
+        "--token",
+        tokens["alice"],
+        "--auth-url",
+        auth_url,
+    )
+    assert login.returncode == 0, login.stderr
+
+    # Grant bob read access via the CLI.
+    grant = lore_cli(
+        lore_executable_path,
+        alice_dir,
+        "access",
+        "grant",
+        "static:bob",
+        "read",
+        repo_id,
+        "--remote-url",
+        remote,
+    )
+    assert grant.returncode == 0, grant.stderr + grant.stdout
+
+    # bob can now exchange for the repository (read-only verbs).
+    authz = exchange_for_resources(access_server["grpc"], tokens["bob"], [PROJECT1])
+    claims = decode_jwt_claims(authz.user_token)
+    assert claims["resources"][0]["permission"] == ["read"]
+
+    # The listing shows both grants.
+    listing = lore_cli(
+        lore_executable_path,
+        alice_dir,
+        "access",
+        "list",
+        repo_id,
+        "--remote-url",
+        remote,
+        "--json",
+    )
+    assert listing.returncode == 0, listing.stderr + listing.stdout
+    grants = {
+        entry["principal"]: entry["role"] for entry in json.loads(listing.stdout)
+    }
+    assert grants["static:bob"] == "read"
+    assert grants["static:alice"] == "admin"
+
+    # bob (read role) may not grant.
+    bob_dir = tmp_path_factory.mktemp("bob-auth")
+    login = lore_cli(
+        lore_executable_path,
+        bob_dir,
+        "auth",
+        "login",
+        "--token-type",
+        "lore",
+        "--token",
+        tokens["bob"],
+        "--auth-url",
+        auth_url,
+    )
+    assert login.returncode == 0, login.stderr
+    denied = lore_cli(
+        lore_executable_path,
+        bob_dir,
+        "access",
+        "grant",
+        "static:mallory",
+        "admin",
+        repo_id,
+        "--remote-url",
+        remote,
+    )
+    assert denied.returncode != 0
+
+    # Revoke bob; a second revoke reports no grant.
+    revoke = lore_cli(
+        lore_executable_path,
+        alice_dir,
+        "access",
+        "revoke",
+        "static:bob",
+        repo_id,
+        "--remote-url",
+        remote,
+    )
+    assert revoke.returncode == 0, revoke.stderr + revoke.stdout
+    assert "Revoked" in revoke.stdout
+    again = lore_cli(
+        lore_executable_path,
+        alice_dir,
+        "access",
+        "revoke",
+        "static:bob",
+        repo_id,
+        "--remote-url",
+        remote,
+    )
+    assert again.returncode == 0
+    assert "No grant existed" in again.stdout

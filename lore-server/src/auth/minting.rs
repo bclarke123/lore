@@ -37,6 +37,10 @@ fn default_authz_token_ttl() -> u64 {
     900
 }
 
+fn default_refresh_token_ttl() -> u64 {
+    30 * 24 * 3600
+}
+
 fn default_env() -> String {
     "lore".to_string()
 }
@@ -60,6 +64,9 @@ pub struct TokenMintingSettings {
     pub user_token_ttl_seconds: u64,
     #[serde(default = "default_authz_token_ttl")]
     pub authz_token_ttl_seconds: u64,
+    /// Lifetime of refresh tokens (rotated on every use).
+    #[serde(default = "default_refresh_token_ttl")]
+    pub refresh_token_ttl_seconds: u64,
     /// `env` claim of minted tokens.
     #[serde(default = "default_env")]
     pub env: String,
@@ -224,6 +231,20 @@ impl TokenMinter {
         DecodingKey::from_ed_der(&self.public_key)
     }
 
+    /// The public signing key as a JWK (RFC 8037 Ed25519 OKP), for
+    /// publication at `/auth/.well-known/jwks.json` so external services
+    /// can verify Lore-minted tokens.
+    pub fn public_jwk(&self) -> serde_json::Value {
+        serde_json::json!({
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&self.public_key),
+            "kid": self.kid,
+            "alg": "EdDSA",
+            "use": "sig",
+        })
+    }
+
     fn sign(&self, claims: &AuthorizationToken) -> Result<String, MintingError> {
         let mut header = Header::new(Algorithm::EdDSA);
         header.kid = Some(self.kid.clone());
@@ -313,6 +334,7 @@ mod tests {
             audience: vec!["lore.example.com".to_string()],
             user_token_ttl_seconds: 3600,
             authz_token_ttl_seconds: 900,
+            refresh_token_ttl_seconds: 3600,
             env: "test".to_string(),
         }
     }

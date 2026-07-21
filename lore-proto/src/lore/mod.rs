@@ -4,6 +4,7 @@
 #[path = "../grpc/lore.notification.rs"]
 pub mod notification;
 
+pub mod access;
 pub mod environment;
 pub mod model;
 pub mod repository;

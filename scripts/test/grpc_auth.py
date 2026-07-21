@@ -90,6 +90,7 @@ class UserToken:
     expires_at: int
     user_id: str
     user_name: str
+    refresh_token: str = ""
 
 
 def _parse_user_token(data: bytes) -> UserToken:
@@ -100,6 +101,7 @@ def _parse_user_token(data: bytes) -> UserToken:
         expires_at=expires if isinstance(expires, int) else 0,
         user_id=_first_string(fields, 3),
         user_name=_first_string(fields, 4),
+        refresh_token=_first_string(fields, 5),
     )
 
 
@@ -233,3 +235,19 @@ def rebac_create_resource(
 def rebac_delete_resource(grpc_target: str, user_token: str, resource_id: str) -> None:
     request = _encode_string_field(1, resource_id)
     _authed_call(grpc_target, _REBAC_DELETE, request, user_token)
+
+
+_REFRESH_AUTH_SESSION = "/epic_urc.UrcAuthApi/RefreshAuthSession"
+
+
+def refresh_auth_session(
+    grpc_target: str, refresh_token: str, timeout: float = 10.0
+) -> UserToken:
+    """Redeem a refresh token (the bearer credential) for a new user token."""
+    fields = _parse_fields(
+        _authed_call(grpc_target, _REFRESH_AUTH_SESSION, b"", refresh_token, timeout)
+    )
+    token_bytes = fields.get(1)
+    if not token_bytes:
+        raise ValueError("refresh response missing token")
+    return _parse_user_token(token_bytes[0])

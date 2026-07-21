@@ -37,8 +37,8 @@ use crate::settings::AuthSettings;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AuthProviderSettings {
-    /// Which provider to use: `google`, `oidc` (generic), or `static`
-    /// (development/CI).
+    /// Which provider to use: `google`, `cognito`, `oidc` (generic), or
+    /// `static` (development/CI).
     pub mode: String,
     /// Externally reachable base URL of the server's HTTP endpoint; login
     /// callback URLs are built under it, e.g.
@@ -151,17 +151,21 @@ impl LocalAuth {
                     &settings.callback_base_url,
                 )?))
             }
-            mode @ ("google" | "oidc") => {
+            mode @ ("google" | "oidc" | "cognito") => {
                 let oidc_settings = settings
                     .oidc
                     .as_ref()
                     .ok_or_else(|| LocalAuthError::MissingOidcSettings(mode.to_string()))?;
                 let callback_url = Self::callback_url(&settings.callback_base_url)?;
                 let backend = Arc::new(ReqwestOidcBackend);
-                let provider = if mode == "google" {
-                    google_provider(oidc_settings, &callback_url, backend)?
-                } else {
-                    generic_oidc_provider(oidc_settings, &callback_url, backend)?
+                let provider = match mode {
+                    "google" => google_provider(oidc_settings, &callback_url, backend)?,
+                    "cognito" => crate::auth::provider::cognito::cognito_provider(
+                        oidc_settings,
+                        &callback_url,
+                        backend,
+                    )?,
+                    _ => generic_oidc_provider(oidc_settings, &callback_url, backend)?,
                 };
                 Ok(Arc::new(provider))
             }
@@ -195,7 +199,17 @@ impl LocalAuth {
 
         match self.provider.complete_login(&session, &params).await {
             Ok(identity) => {
-                let minted = self.minter.mint_user_token(&identity)?;
+                let mut minted = self.minter.mint_user_token(&identity)?;
+                // Long-lived sessions: hand out a rotating refresh token
+                // alongside the short-lived user token.
+                if let Some(refresh) = crate::auth::refresh::installed() {
+                    match refresh.issue(&identity).await {
+                        Ok(token) => minted.refresh_token = Some(token),
+                        Err(error) => {
+                            warn!(%error, "Failed to issue refresh token; continuing without")
+                        }
+                    }
+                }
                 info!(user_id = minted.user_id, "Login completed");
                 self.sessions.complete_by_state(&state, Ok(minted))?;
                 Ok(())
@@ -246,6 +260,7 @@ pub(crate) mod tests {
                 audience: vec!["lore.example.com".to_string()],
                 user_token_ttl_seconds: 3600,
                 authz_token_ttl_seconds: 900,
+                refresh_token_ttl_seconds: 3600,
                 env: "test".to_string(),
             }),
             provider: Some(AuthProviderSettings {
@@ -367,6 +382,8 @@ pub(crate) mod tests {
             discovery_url: None,
             extra_scopes: vec![],
             hosted_domain: None,
+            region: None,
+            user_pool_id: None,
         });
 
         let auth = LocalAuth::from_settings(Some(&settings))

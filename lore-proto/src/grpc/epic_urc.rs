@@ -116,6 +116,10 @@ pub struct UserToken {
     /// Display name
     #[prost(string, tag = "4")]
     pub user_name: ::prost::alloc::string::String,
+    /// Opaque refresh token, when the auth service issues them. Presented as
+    /// the bearer credential on RefreshAuthSession; rotates on every use.
+    #[prost(string, optional, tag = "5")]
+    pub refresh_token: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ResourcePermission {

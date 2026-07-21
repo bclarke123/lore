@@ -128,11 +128,23 @@ pub async fn dev_login(Query(params): Query<HashMap<String, String>>) -> Respons
     .into_response()
 }
 
+/// `GET /auth/.well-known/jwks.json` — the server's token-verification
+/// keys, for external services validating Lore-minted tokens.
+pub async fn jwks(State(auth): State<Arc<LocalAuth>>) -> Response {
+    let body = serde_json::json!({ "keys": [auth.minter.public_jwk()] });
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
 /// Router for the unauthenticated login endpoints.
 pub fn create_router(auth: Arc<LocalAuth>) -> axum::Router {
     axum::Router::new()
         .route("/auth/callback", axum::routing::get(callback))
         .route("/auth/dev-login", axum::routing::get(dev_login))
+        .route("/auth/.well-known/jwks.json", axum::routing::get(jwks))
         .with_state(auth)
 }
 
@@ -250,6 +262,21 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn jwks_endpoint_serves_the_signing_key() {
+        let (auth, _dir) = auth().await;
+        let router = create_router(auth.clone());
+        let (status, body) = get(&router, "/auth/.well-known/jwks.json").await;
+        assert_eq!(status, StatusCode::OK);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
+        let key = &parsed["keys"][0];
+        assert_eq!(key["kty"], "OKP");
+        assert_eq!(key["crv"], "Ed25519");
+        assert_eq!(key["alg"], "EdDSA");
+        assert_eq!(key["kid"], auth.minter.kid());
+        assert!(!key["x"].as_str().unwrap_or_default().is_empty());
     }
 
     #[tokio::test]

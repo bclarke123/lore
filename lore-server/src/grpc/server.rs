@@ -12,6 +12,7 @@ use anyhow::anyhow;
 use lore_proto::AdminServiceServer;
 use lore_proto::LockServiceServer;
 use lore_proto::auth::urc_auth_api_server::UrcAuthApiServer;
+use lore_proto::lore::access::v1::access_service_server::AccessServiceServer;
 use lore_proto::lore::environment::v1::environment_service_server as environment_v1_server;
 use lore_proto::lore::repository::v1::repository_service_server as repository_v1_server;
 use lore_proto::lore::revision::v1::revision_service_server as revision_v1_server;
@@ -47,6 +48,7 @@ use crate::correlation::layer::CorrelationIdLayer;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::correlation::layer::TraceLayerConfig;
 use crate::correlation::span::MakeCorrelationIdSpan;
+use crate::grpc::access_service::LoreAccessService;
 use crate::grpc::admin_service::LoreAdminService;
 use crate::grpc::auth_service::LoreAuthService;
 use crate::grpc::auth_service::LoreRebacService;
@@ -616,6 +618,13 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
                 )))
                 .add_service(RebacApiServer::new(LoreRebacService::new(local_auth)));
         }
+
+        // Grant administration. Authenticates callers itself; answers
+        // FailedPrecondition when access control is not installed.
+        router = router.add_service(AccessServiceServer::new(LoreAccessService::new(
+            self.0.immutable_store.clone(),
+            self.0.mutable_store.clone(),
+        )));
 
         if let Some(jwt_verifier) = jwt_verifier.as_ref() {
             let jwt_interceptor = JWTInterceptor::new(jwt_verifier);

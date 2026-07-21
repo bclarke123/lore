@@ -8,6 +8,7 @@
 //! is provider-independent, so adding an identity provider never requires
 //! protocol or client changes.
 
+pub mod cognito;
 pub mod google;
 pub mod oidc;
 pub mod static_provider;

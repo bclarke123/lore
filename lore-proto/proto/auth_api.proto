@@ -95,6 +95,9 @@ message UserToken {
   int64 expires_at = 2; // Epoch
   string user_id = 3;   // URC user ID
   string user_name = 4; // Display name
+  // Opaque refresh token, when the auth service issues them. Presented as
+  // the bearer credential on RefreshAuthSession; rotates on every use.
+  optional string refresh_token = 5;
 }
 
 message ResourcePermission {

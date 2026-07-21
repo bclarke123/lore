@@ -203,6 +203,8 @@ pub enum LoreCommands {
     /// File commands
     File(file::FileArgs),
 
+    /// Access-control administration (grants on repositories)
+    Access(access::AccessArgs),
     /// Authentication commands
     Auth(auth::AuthArgs),
 
@@ -302,6 +304,7 @@ pub enum LoreCommands {
 
 pub fn handle_lore_commands(cmd: &LoreCommands, globals: LoreGlobalArgs) -> u8 {
     match cmd {
+        LoreCommands::Access(sub_cmd) => access::handle_access_commands(&sub_cmd.command, globals),
         LoreCommands::Repository(sub_cmd) => {
             repository::handle_repository_commands(&sub_cmd.command, globals)
         }

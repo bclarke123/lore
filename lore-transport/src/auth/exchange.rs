@@ -423,13 +423,47 @@ pub async fn auth_exchange(
     (String::new(), String::new(), String::new())
 }
 
+/// Redeem the identity's stored refresh token for a new authentication
+/// token, persisting both the new token and the rotated refresh token.
+/// Returns `None` when no refresh token is stored, the server does not
+/// support refresh, or the refresh is rejected.
+async fn refresh_authentication_token(auth_url: &str, identity: &str) -> Option<String> {
+    let refresh_token = token_store::load_refresh_token(auth_url, identity)
+        .await
+        .ok()?;
+    let auth_impl = authentication::find(auth_url).ok()?;
+    let correlation_id = String::default();
+
+    let refreshed = auth_impl
+        .refresh_authentication(auth_url, &refresh_token, &correlation_id)
+        .await
+        .inspect_err(|err| lore_debug!("Refresh failed for {identity}: {err}"))
+        .ok()?;
+
+    let decoded = lore_credential::insecure_decode_token(&refreshed.token).ok()?;
+    let _ = token_store::store_user_token(
+        auth_url,
+        identity,
+        &refreshed.token,
+        decoded.claims.acceptable_root_domains(),
+    )
+    .await
+    .inspect_err(|err| lore_debug!("Failed to store refreshed token: {err}"));
+    if let Some(rotated) = refreshed.refresh_token.as_deref() {
+        let _ = token_store::store_refresh_token(auth_url, identity, rotated)
+            .await
+            .inspect_err(|err| lore_debug!("Failed to store rotated refresh token: {err}"));
+    }
+    Some(refreshed.token)
+}
+
 async fn auth_exchange_for_identity(
     auth_url: &str,
     remote_domain: &str,
     identity: &str,
     repository: RepositoryId,
 ) -> (String, String, String) {
-    let Ok(authentication_token) = token_store::load_user_token(
+    let Ok(mut authentication_token) = token_store::load_user_token(
         auth_url,
         identity,
         tokens_only_for_recipient_domain(remote_domain.to_string()),
@@ -440,12 +474,22 @@ async fn auth_exchange_for_identity(
         return (String::new(), String::new(), String::new());
     };
 
-    // Reject expired authn tokens
+    // Expired authn token: attempt a refresh before giving up on the
+    // identity. Servers without refresh support (or without a stored
+    // refresh token) fall through to the previous behavior.
     if let Some(info) = lore_credential::user_info_from_token(authentication_token.clone())
         && is_expired(info.expires)
     {
-        lore_debug!("Skipping identity {identity}, authn token is expired");
-        return (String::new(), String::new(), String::new());
+        match refresh_authentication_token(auth_url, identity).await {
+            Some(refreshed) => {
+                lore_debug!("Refreshed expired authn token for {identity}");
+                authentication_token = refreshed;
+            }
+            None => {
+                lore_debug!("Skipping identity {identity}, authn token is expired");
+                return (String::new(), String::new(), String::new());
+            }
+        }
     }
 
     // This will return the cached authz token if it is still valid,

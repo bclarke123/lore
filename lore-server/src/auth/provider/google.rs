@@ -31,6 +31,10 @@ pub struct OidcProviderSettings {
     pub extra_scopes: Vec<String>,
     /// Google Workspace hosted domain restriction (`hd`).
     pub hosted_domain: Option<String>,
+    /// AWS region of the Cognito user pool (mode `cognito`).
+    pub region: Option<String>,
+    /// Cognito user pool id (mode `cognito`).
+    pub user_pool_id: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -44,9 +48,13 @@ pub enum OidcSettingsError {
     EmptySecret(String),
     #[error("auth.provider.oidc.discovery_url is required for mode 'oidc'")]
     MissingDiscoveryUrl,
+    #[error(
+        "auth.provider.oidc.region and user_pool_id (or discovery_url) are required for mode 'cognito'"
+    )]
+    MissingCognitoPool,
 }
 
-fn read_client_secret(path: &str) -> Result<String, OidcSettingsError> {
+pub(super) fn read_client_secret(path: &str) -> Result<String, OidcSettingsError> {
     let secret = std::fs::read_to_string(path)
         .map_err(|source| OidcSettingsError::ReadSecret {
             path: path.to_string(),
@@ -60,7 +68,7 @@ fn read_client_secret(path: &str) -> Result<String, OidcSettingsError> {
     Ok(secret)
 }
 
-fn scopes(settings: &OidcProviderSettings) -> Vec<String> {
+pub(super) fn scopes(settings: &OidcProviderSettings) -> Vec<String> {
     let mut scopes = vec![
         "openid".to_string(),
         "email".to_string(),
@@ -145,6 +153,8 @@ mod tests {
             discovery_url: None,
             extra_scopes: vec![],
             hosted_domain: None,
+            region: None,
+            user_pool_id: None,
         }
     }
 

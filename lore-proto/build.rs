@@ -154,6 +154,20 @@ fn main() -> Result<()> {
             &["./proto"],
         )?;
 
+    // lore.access.v1 — access-control administration service. Self-contained.
+    let mut config = tonic_prost_build::Config::new();
+    config.enable_type_names();
+    config.bytes(["."]);
+
+    tonic_prost_build::configure()
+        .out_dir(&output_dir)
+        .protoc_arg("--experimental_allow_proto3_optional")
+        .compile_with_config(
+            config,
+            &["./proto/lore/access/v1/access.proto"],
+            &["./proto"],
+        )?;
+
     // lore.environment.v1 — server-side environment discovery service. Self-contained — declares its own messages
     let mut config = tonic_prost_build::Config::new();
     config.enable_type_names();

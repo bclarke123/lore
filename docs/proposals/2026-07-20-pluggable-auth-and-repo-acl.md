@@ -176,7 +176,7 @@ A server with no `[server.auth]` section behaves exactly as today: no verifier, 
 
 ## Compatibility
 
-- **Wire format** — N/A. No serialization, framing, or byte-layout changes; tokens remain opaque strings in existing metadata fields and the existing QUIC `AuthorizeStart` payload.
+- **Wire format** — One additive change: `UserToken` gains an `optional string refresh_token` field (proto3 optional, field 5). Old peers ignore it; new peers treat its absence as "no refresh support". Tokens otherwise remain opaque strings in existing metadata fields and the existing QUIC `AuthorizeStart` payload.
 - **Client/server protocols** — No changed RPCs. The server newly *implements* the existing `epic_urc.UrcAuthApi` service that clients already call, and adds one new service (`lore.access.v1.AccessService`). An old client against a new server logs in unchanged (same `ucs-auth` flow) and never sees the new service. A new client against an old server sees exactly today's behavior; the refresh path degrades to current behavior when the server returns `Unimplemented`. Two new unauthenticated HTTP routes are added (`/auth/callback`, `/auth/.well-known/jwks.json`).
 - **On-disk format** — Client side: none. Server side: one new mutable-store key type for access-control pointers plus grant blobs in the immutable store, written only when auth is enabled. A downgraded server ignores the unknown keys; repositories remain fully readable.
 - **CLI and public API** — Adds the `lore access` subcommand family. No existing subcommand, exit code, or output format changes. `lore-capi` surface is unchanged (login already flows through existing entry points).
@@ -267,6 +267,6 @@ Require operators to deploy a broker that normalizes IdPs and issues Lore-compat
 ## Unresolved Questions
 
 - Should the auth surface move to a clean `lore.auth.v1` package immediately (adding a client-side scheme implementation to the scope) rather than reusing `epic_urc.UrcAuthApi` with a follow-up migration?
-- Signing algorithm default: ES256 (broadest JWT ecosystem support) or EdDSA (simpler, modern)? Any downstream verifier constraints?
+- Signing algorithm: the implementation ships Ed25519 (EdDSA) — the simplest correct choice with the in-tree `ring` backend, published as an RFC 8037 OKP JWK. Should ES256 be offered as an alternative for verifiers without EdDSA support?
 - Should `enforce_permission_verbs` eventually default on in external-JWKS mode after a deprecation window, and what telemetry gates that?
 - Grant-propagation latency: is a short-TTL access-store cache (bounded by the 60-second exchange cadence) acceptable, or must revocation be immediate (cache-bypass on revoke)?

@@ -1,0 +1,59 @@
+// SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-License-Identifier: MIT
+syntax = "proto3";
+
+package lore.access.v1;
+
+// Administration of per-repository access-control grants.
+//
+// Served only by servers running server-local authentication (access
+// control installed); other configurations answer FAILED_PRECONDITION.
+// Callers must hold the admin role on the target repository (or be server
+// administrators). Granting on the all-zero repository id manages
+// server-level grants: an admin grant there confers server administrator.
+service AccessService {
+  // Create or replace a principal's grant on a repository.
+  rpc AccessGrant(AccessGrantRequest) returns (AccessGrantResponse) {};
+  // Remove a principal's grant from a repository.
+  rpc AccessRevoke(AccessRevokeRequest) returns (AccessRevokeResponse) {};
+  // List the grants on a repository.
+  rpc AccessList(AccessListRequest) returns (AccessListResponse) {};
+}
+
+// A repository addressed by id or by name.
+message RepositoryRef {
+  oneof ref {
+    bytes id = 1;
+    string name = 2;
+  }
+}
+
+// A principal's role on a repository. `principal` is a canonical user id
+// (`<idp>:<subject>`) or an email alias; `role` is `read`, `write`, or
+// `admin`.
+message AccessGrantRecord {
+  string principal = 1;
+  string role = 2;
+}
+
+message AccessGrantRequest {
+  RepositoryRef repository = 1;
+  string principal = 2;
+  string role = 3;
+}
+
+message AccessGrantResponse {}
+
+message AccessRevokeRequest {
+  RepositoryRef repository = 1;
+  string principal = 2;
+}
+
+message AccessRevokeResponse {
+  // Whether a grant for the principal existed.
+  bool existed = 1;
+}
+
+message AccessListRequest { RepositoryRef repository = 1; }
+
+message AccessListResponse { repeated AccessGrantRecord grants = 1; }

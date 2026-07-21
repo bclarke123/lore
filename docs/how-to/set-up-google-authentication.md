@@ -58,7 +58,7 @@ auth_url = "ucs-auth://lore.example.com:41337"
 
 Restart `loreserver`. The startup log reports `Server-local authentication enabled` with `provider=google`, and the gRPC log line shows `Auth: enabled`.
 
-> **Note:** With authentication enabled, every authenticated user currently receives read/write access to all repositories. Per-repository grants (`lore access`) are tracked in the [pluggable auth LEP](../proposals/2026-07-20-pluggable-auth-and-repo-acl.md) and land in a follow-up.
+Access is deny-by-default: a signed-in user sees only repositories they hold a grant on. Repository creators receive an automatic admin grant; add teammates with `lore access grant <user> <role> <repository>`, and list grants with `lore access list <repository>`. Configure server administrators (who see everything) via `server_admins` under `[server.auth]`.
 
 ## Log in
 

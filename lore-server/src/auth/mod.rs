@@ -8,4 +8,5 @@ pub mod local_auth;
 pub mod local_jwk;
 pub mod minting;
 pub mod provider;
+pub mod refresh;
 pub mod session;

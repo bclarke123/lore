@@ -81,6 +81,7 @@ fn user_token_proto(minted: crate::auth::session::MintedLogin) -> lore_proto::au
         expires_at: minted.expires_at_ms,
         user_id: minted.user_id,
         user_name: minted.user_name,
+        refresh_token: minted.refresh_token,
     }
 }
 
@@ -153,12 +154,34 @@ impl UrcAuthApi for LoreAuthService {
         }
     }
 
+    /// Redeem a refresh token (presented as the bearer credential) for a
+    /// fresh user token plus a rotated successor refresh token.
     #[instrument(name = "UrcAuthApi::RefreshAuthSession", skip_all)]
     async fn refresh_auth_session(
         &self,
-        _request: Request<lore_proto::auth::RefreshAuthSessionRequest>,
+        request: Request<lore_proto::auth::RefreshAuthSessionRequest>,
     ) -> Result<Response<lore_proto::auth::RefreshAuthSessionResponse>, Status> {
-        Err(Status::unimplemented("refresh is not supported yet"))
+        let Some(refresh) = crate::auth::refresh::installed() else {
+            return Err(Status::unimplemented("refresh is not supported"));
+        };
+        let token = extract_bearer_token(request.metadata())
+            .ok_or_else(|| Status::unauthenticated("missing refresh token"))?;
+
+        let (identity, successor) = refresh.refresh(&token).await.map_err(|error| match error {
+            crate::auth::refresh::RefreshError::Store(message) => Status::internal(message),
+            denied => Status::unauthenticated(denied.to_string()),
+        })?;
+        let mut minted = self
+            .auth
+            .minter
+            .mint_user_token(&identity)
+            .map_err(|e| Status::internal(format!("failed to mint token: {e}")))?;
+        minted.refresh_token = Some(successor);
+        Ok(Response::new(
+            lore_proto::auth::RefreshAuthSessionResponse {
+                user_token: Some(user_token_proto(minted)),
+            },
+        ))
     }
 
     #[instrument(name = "UrcAuthApi::VerifyUser", skip_all)]

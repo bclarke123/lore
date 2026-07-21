@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: MIT
 
 # Builds the `lore` CLI and `loreserver` binaries for Linux and macOS and
-# uploads them as workflow artifacts. Uses the `release` profile (the fast
-# incremental profile this workspace uses for day-to-day builds); switch
-# `--profile release-lto` in the build step for fully optimized
-# distribution binaries at the cost of much longer builds.
+# uploads them as workflow artifacts. Uses the `release-lto` profile — the
+# fully optimized distribution build (fat LTO, no debug assertions).
+# Linux binaries are stripped of the embedded DWARF (macOS splits it into
+# a .dSYM automatically); full symbols stay reproducible from the tag.
 
 name: Build binaries
 
@@ -56,14 +56,18 @@ jobs:
             build-${{ matrix.name }}-
 
       - name: Build lore and loreserver
-        run: cargo build --release -p lore-client -p lore-server
+        run: cargo build --profile release-lto -p lore-client -p lore-server
+
+      - name: Strip Linux binaries
+        if: runner.os == 'Linux'
+        run: strip target/release-lto/lore target/release-lto/loreserver
 
       - name: Upload binaries
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: lore-${{ matrix.name }}
           path: |
-            target/release/lore
-            target/release/loreserver
+            target/release-lto/lore
+            target/release-lto/loreserver
           if-no-files-found: error
           retention-days: 14

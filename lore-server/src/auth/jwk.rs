@@ -86,7 +86,9 @@ impl JwkServiceImpl {
         let mut cache = self.cached_set.write().await;
 
         // Check to see if the desired key was fetched while we waited for the lock.
-        if desired.map(|d| cache.get(d)).is_some() {
+        // (Must check that the lookup actually HIT: `map(...).is_some()` was
+        // previously true for any desired kid, so a cache miss never fetched.)
+        if desired.is_some_and(|d| cache.contains_key(d)) {
             return Ok(());
         }
 
@@ -187,5 +189,63 @@ impl JWKService for JwkServiceImpl {
 impl InstrumentProvider for JwkServiceImpl {
     fn namespace(&self) -> &'static str {
         "urc.auth.jwk_service"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn service(endpoint: &str) -> JwkServiceImpl {
+        JwkServiceImpl::new(JWKServiceSettings {
+            endpoint: endpoint.to_string(),
+        })
+    }
+
+    /// Regression test: a cache miss for a desired kid must actually attempt
+    /// the JWKS fetch. The previous `desired.map(...).is_some()` check
+    /// short-circuited for ANY desired kid, so lazily-populated services
+    /// (the OIDC provider path) never fetched at all and every lookup
+    /// failed with `NotFound`.
+    #[tokio::test]
+    async fn cache_miss_with_desired_kid_attempts_the_fetch() {
+        // Unresolvable endpoint: reaching the network proves the fetch was
+        // attempted (an InternalError), where the old code returned Ok(())
+        // without fetching.
+        let service = service("http://jwks.invalid./keys");
+        let result = service.fetch_new_keys(Some("some-kid")).await;
+        assert!(
+            matches!(result, Err(JWKServiceError::InternalError)),
+            "expected a fetch attempt (network failure), got {result:?}"
+        );
+
+        // And the subsequent lookup misses cleanly.
+        assert!(matches!(
+            service.get_key("some-kid").await,
+            Err(JWKServiceError::InternalError | JWKServiceError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cached_kid_short_circuits_without_network() {
+        let service = service("http://jwks.invalid./keys");
+        service.cached_set.write().await.insert(
+            "cached-kid".to_string(),
+            JWKServiceKey {
+                jwk: serde_json::from_value(serde_json::json!({
+                    "kty": "oct", "kid": "cached-kid", "alg": "HS256", "k": "c2VjcmV0"
+                }))
+                .expect("test jwk"),
+                decoding_key: DecodingKey::from_secret(b"secret"),
+                algorithm: jsonwebtoken::Algorithm::HS256,
+            },
+        );
+
+        // Present in cache: returns without touching the bogus endpoint.
+        service
+            .fetch_new_keys(Some("cached-kid"))
+            .await
+            .expect("cached kid must not refetch");
+        service.get_key("cached-kid").await.expect("cached key");
     }
 }

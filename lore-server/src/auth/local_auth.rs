@@ -382,6 +382,7 @@ pub(crate) mod tests {
             discovery_url: None,
             extra_scopes: vec![],
             hosted_domain: None,
+            trusted_external_audiences: vec![],
             region: None,
             user_pool_id: None,
         });

@@ -34,6 +34,9 @@ pub enum AuthProviderError {
     /// an unexpected response.
     #[error("Identity provider error: {0}")]
     Upstream(String),
+    /// The operation is not supported by this provider (or not configured).
+    #[error("Not supported: {0}")]
+    Unsupported(String),
     #[error("Internal auth provider error: {0}")]
     Internal(String),
 }
@@ -94,4 +97,17 @@ pub trait AuthProvider: Send + Sync {
         session: &PendingSession,
         params: &CallbackParams,
     ) -> Result<ExternalIdentity, AuthProviderError>;
+
+    /// Verify an *externally obtained* ID token (e.g. presented by a web
+    /// hub through `ExchangeExternalTokenForUserToken`) and return the
+    /// verified identity. Providers without such a notion inherit the
+    /// default: not supported.
+    async fn verify_external_id_token(
+        &self,
+        _id_token: &str,
+    ) -> Result<ExternalIdentity, AuthProviderError> {
+        Err(AuthProviderError::Unsupported(
+            "external token exchange is not supported by this provider".to_string(),
+        ))
+    }
 }

@@ -50,6 +50,7 @@ pub fn cognito_provider(
             // Cognito sets `email_verified` on verified pool accounts.
             require_verified_email: true,
             hosted_domain: None,
+            trusted_external_audiences: settings.trusted_external_audiences.clone(),
         },
         backend,
     ))
@@ -70,6 +71,7 @@ mod tests {
             discovery_url: None,
             extra_scopes: vec![],
             hosted_domain: None,
+            trusted_external_audiences: vec![],
             region: Some("us-east-1".to_string()),
             user_pool_id: Some("us-east-1_AbCdEfGhI".to_string()),
         }

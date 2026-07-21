@@ -31,6 +31,11 @@ pub struct OidcProviderSettings {
     pub extra_scopes: Vec<String>,
     /// Google Workspace hosted domain restriction (`hd`).
     pub hosted_domain: Option<String>,
+    /// `aud` values trusted on externally obtained ID tokens presented to
+    /// `ExchangeExternalTokenForUserToken` (e.g. a web hub's own OAuth
+    /// client id). Empty = external exchange disabled.
+    #[serde(default)]
+    pub trusted_external_audiences: Vec<String>,
     /// AWS region of the Cognito user pool (mode `cognito`).
     pub region: Option<String>,
     /// Cognito user pool id (mode `cognito`).
@@ -108,6 +113,7 @@ pub fn google_provider(
             extra_auth_params,
             require_verified_email: true,
             hosted_domain: settings.hosted_domain.clone(),
+            trusted_external_audiences: settings.trusted_external_audiences.clone(),
         },
         backend,
     ))
@@ -133,6 +139,7 @@ pub fn generic_oidc_provider(
             extra_auth_params: Vec::new(),
             require_verified_email: false,
             hosted_domain: None,
+            trusted_external_audiences: settings.trusted_external_audiences.clone(),
         },
         backend,
     ))
@@ -153,6 +160,7 @@ mod tests {
             discovery_url: None,
             extra_scopes: vec![],
             hosted_domain: None,
+            trusted_external_audiences: vec![],
             region: None,
             user_pool_id: None,
         }

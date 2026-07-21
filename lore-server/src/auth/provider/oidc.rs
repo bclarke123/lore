@@ -145,6 +145,10 @@ pub struct OidcConfig {
     pub require_verified_email: bool,
     /// Refuse identities whose `hd` (hosted domain) claim differs.
     pub hosted_domain: Option<String>,
+    /// Additional `aud` values accepted on *externally obtained* ID tokens
+    /// presented to `ExchangeExternalTokenForUserToken` (e.g. a web hub's
+    /// own OAuth client id). Empty = external exchange disabled.
+    pub trusted_external_audiences: Vec<String>,
 }
 
 /// ID-token claims this provider validates or maps to [`ExternalIdentity`].
@@ -195,14 +199,15 @@ impl OidcProvider {
             .await
     }
 
-    /// Validate the ID token: signature (via JWKS), `iss`, `aud`, `exp`,
-    /// and the session `nonce`.
-    async fn validate_id_token(
+    /// Decode an ID token and validate signature (via JWKS), `iss`, `exp`,
+    /// and membership of `aud` in `audiences`. Nonce handling is the
+    /// caller's concern.
+    async fn decode_id_token(
         &self,
         id_token: &str,
         issuer: &str,
         jwks: &Arc<dyn JWKService>,
-        session: &PendingSession,
+        audiences: &[&str],
     ) -> Result<IdTokenClaims, AuthProviderError> {
         let header = jsonwebtoken::decode_header(id_token)
             .map_err(|e| AuthProviderError::Denied(format!("invalid ID token header: {e}")))?;
@@ -216,20 +221,35 @@ impl OidcProvider {
 
         let mut validation = jsonwebtoken::Validation::new(algorithm);
         validation.set_issuer(&[issuer]);
-        validation.set_audience(&[&self.config.client_id]);
+        validation.set_audience(audiences);
         validation.validate_exp = true;
 
         let token = jsonwebtoken::decode::<IdTokenClaims>(id_token, &key, &validation)
             .map_err(|e| AuthProviderError::Denied(format!("ID token validation failed: {e}")))?;
+        Ok(token.claims)
+    }
+
+    /// Validate the ID token: signature (via JWKS), `iss`, `aud`, `exp`,
+    /// and the session `nonce`.
+    async fn validate_id_token(
+        &self,
+        id_token: &str,
+        issuer: &str,
+        jwks: &Arc<dyn JWKService>,
+        session: &PendingSession,
+    ) -> Result<IdTokenClaims, AuthProviderError> {
+        let claims = self
+            .decode_id_token(id_token, issuer, jwks, &[self.config.client_id.as_str()])
+            .await?;
 
         // Replay protection: the token must carry the nonce minted for this
         // login session.
-        if token.claims.nonce.as_deref() != Some(session.nonce.as_str()) {
+        if claims.nonce.as_deref() != Some(session.nonce.as_str()) {
             return Err(AuthProviderError::Denied(
                 "ID token nonce does not match the login session".to_string(),
             ));
         }
-        Ok(token.claims)
+        Ok(claims)
     }
 
     fn check_identity_policy(&self, claims: &IdTokenClaims) -> Result<(), AuthProviderError> {
@@ -311,6 +331,39 @@ impl AuthProvider for OidcProvider {
 
         let claims = self
             .validate_id_token(&response.id_token, &discovery.issuer, jwks, session)
+            .await?;
+        self.check_identity_policy(&claims)?;
+
+        Ok(ExternalIdentity {
+            subject: claims.sub,
+            email: claims.email,
+            display_name: claims.name,
+            idp: self.config.idp.to_string(),
+        })
+    }
+
+    /// Verify an *externally obtained* ID token (no login session, so no
+    /// nonce): signature via the provider's JWKS, `iss`, `exp`, and `aud`
+    /// restricted to the explicitly trusted external audiences. Disabled
+    /// (Unsupported) unless `trusted_external_audiences` is configured.
+    async fn verify_external_id_token(
+        &self,
+        id_token: &str,
+    ) -> Result<ExternalIdentity, AuthProviderError> {
+        if self.config.trusted_external_audiences.is_empty() {
+            return Err(AuthProviderError::Unsupported(
+                "no trusted external audiences configured".to_string(),
+            ));
+        }
+        let (discovery, jwks) = self.discovery().await?;
+        let audiences: Vec<&str> = self
+            .config
+            .trusted_external_audiences
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let claims = self
+            .decode_id_token(id_token, &discovery.issuer, jwks, &audiences)
             .await?;
         self.check_identity_policy(&claims)?;
 
@@ -462,6 +515,7 @@ pub(crate) mod test_support {
             extra_auth_params: vec![],
             require_verified_email: true,
             hosted_domain: None,
+            trusted_external_audiences: vec![],
         }
     }
 }
@@ -717,5 +771,128 @@ mod tests {
     fn pkce_verifier_length_meets_rfc_7636() {
         let session = session();
         assert!((43..=128).contains(&session.pkce_verifier.len()));
+    }
+
+    mod external_id_token {
+        use super::*;
+
+        const HUB_CLIENT_ID: &str = "lorehub-client-id";
+
+        fn provider_trusting_hub() -> OidcProvider {
+            let mut config = config();
+            config.trusted_external_audiences = vec![HUB_CLIENT_ID.to_string()];
+            provider_with(Arc::new(MockBackend::new()), config)
+        }
+
+        /// Claims as a hub-obtained Google ID token would carry: the hub's
+        /// client id as `aud`, and no nonce.
+        fn hub_claims() -> serde_json::Value {
+            let mut claims = valid_claims("unused-nonce");
+            claims["aud"] = HUB_CLIENT_ID.into();
+            claims.as_object_mut().expect("object").remove("nonce");
+            claims
+        }
+
+        #[tokio::test]
+        async fn trusted_audience_token_yields_identity() {
+            let provider = provider_trusting_hub();
+            let identity = provider
+                .verify_external_id_token(&id_token(&hub_claims()))
+                .await
+                .expect("verify");
+            assert_eq!(identity.subject, "google-subject-1");
+            assert_eq!(identity.email.as_deref(), Some("alice@example.com"));
+            assert_eq!(identity.idp, "test-oidc");
+        }
+
+        #[tokio::test]
+        async fn disabled_without_trusted_audiences() {
+            let provider = provider_with(Arc::new(MockBackend::new()), config());
+            let err = provider
+                .verify_external_id_token(&id_token(&hub_claims()))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AuthProviderError::Unsupported(_)));
+        }
+
+        #[tokio::test]
+        async fn untrusted_audience_is_denied() {
+            let provider = provider_trusting_hub();
+            let mut claims = hub_claims();
+            claims["aud"] = "some-other-app".into();
+            let err = provider
+                .verify_external_id_token(&id_token(&claims))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AuthProviderError::Denied(_)));
+
+            // The provider's own login client id is NOT implicitly trusted
+            // for external exchange.
+            let mut own = hub_claims();
+            own["aud"] = CLIENT_ID.into();
+            let err = provider
+                .verify_external_id_token(&id_token(&own))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AuthProviderError::Denied(_)));
+        }
+
+        #[tokio::test]
+        async fn expired_or_wrong_issuer_is_denied() {
+            let provider = provider_trusting_hub();
+            let mut expired = hub_claims();
+            expired["exp"] = 1000.into();
+            assert!(matches!(
+                provider
+                    .verify_external_id_token(&id_token(&expired))
+                    .await
+                    .unwrap_err(),
+                AuthProviderError::Denied(_)
+            ));
+
+            let mut wrong_iss = hub_claims();
+            wrong_iss["iss"] = "https://evil.example.com".into();
+            assert!(matches!(
+                provider
+                    .verify_external_id_token(&id_token(&wrong_iss))
+                    .await
+                    .unwrap_err(),
+                AuthProviderError::Denied(_)
+            ));
+        }
+
+        #[tokio::test]
+        async fn bad_signature_is_denied() {
+            let provider = provider_trusting_hub();
+            let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+            header.kid = Some(KID.to_string());
+            let forged = jsonwebtoken::encode(
+                &header,
+                &hub_claims(),
+                &jsonwebtoken::EncodingKey::from_secret(b"attacker-secret"),
+            )
+            .expect("encode");
+            assert!(matches!(
+                provider
+                    .verify_external_id_token(&forged)
+                    .await
+                    .unwrap_err(),
+                AuthProviderError::Denied(_)
+            ));
+        }
+
+        #[tokio::test]
+        async fn identity_policy_still_applies() {
+            let provider = provider_trusting_hub();
+            let mut unverified = hub_claims();
+            unverified["email_verified"] = false.into();
+            assert!(matches!(
+                provider
+                    .verify_external_id_token(&id_token(&unverified))
+                    .await
+                    .unwrap_err(),
+                AuthProviderError::Denied(_)
+            ));
+        }
     }
 }

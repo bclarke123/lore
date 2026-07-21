@@ -25,6 +25,7 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 use tracing::debug;
+use tracing::info;
 use tracing::instrument;
 
 use crate::auth::jwt::AuthorizationToken;
@@ -194,13 +195,63 @@ impl UrcAuthApi for LoreAuthService {
         ))
     }
 
+    /// Exchange an externally obtained OIDC ID token (e.g. from a web hub
+    /// running its own OAuth flow against the same identity provider) for a
+    /// Lore user token. The provider validates signature/issuer/expiry and
+    /// requires the token's `aud` to be explicitly configured in
+    /// `trusted_external_audiences`; providers without OIDC backing (the
+    /// static dev provider) answer Unimplemented.
     #[instrument(name = "UrcAuthApi::ExchangeExternalTokenForUserToken", skip_all)]
     async fn exchange_external_token_for_user_token(
         &self,
-        _request: Request<lore_proto::auth::ExchangeExternalTokenForUserTokenRequest>,
+        request: Request<lore_proto::auth::ExchangeExternalTokenForUserTokenRequest>,
     ) -> Result<Response<lore_proto::auth::ExchangeExternalTokenForUserTokenResponse>, Status> {
-        Err(Status::unimplemented(
-            "external token exchange is not supported by server-local auth; use `lore auth login`",
+        let req = request.into_inner();
+        match req.token_type.as_str() {
+            "google-id-token" | "oidc-id-token" => {}
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unsupported token_type '{other}' (expected google-id-token or oidc-id-token)"
+                )));
+            }
+        }
+        if req.external_token.is_empty() {
+            return Err(Status::invalid_argument("external_token must not be empty"));
+        }
+
+        let identity = self
+            .auth
+            .provider
+            .verify_external_id_token(&req.external_token)
+            .await
+            .map_err(|error| {
+                use crate::auth::provider::AuthProviderError;
+                match error {
+                    AuthProviderError::Unsupported(message) => Status::unimplemented(message),
+                    AuthProviderError::Denied(message) => Status::unauthenticated(message),
+                    AuthProviderError::Upstream(message) => Status::unavailable(message),
+                    other => Status::internal(other.to_string()),
+                }
+            })?;
+
+        let mut minted = self
+            .auth
+            .minter
+            .mint_user_token(&identity)
+            .map_err(|e| Status::internal(format!("failed to mint token: {e}")))?;
+        if let Some(refresh) = crate::auth::refresh::installed() {
+            match refresh.issue(&identity).await {
+                Ok(token) => minted.refresh_token = Some(token),
+                Err(error) => {
+                    debug!(%error, "Failed to issue refresh token on exchange; continuing")
+                }
+            }
+        }
+        info!(user_id = minted.user_id, "External token exchanged");
+        Ok(Response::new(
+            lore_proto::auth::ExchangeExternalTokenForUserTokenResponse {
+                user_token: Some(user_token_proto(minted)),
+            },
         ))
     }
 
@@ -781,6 +832,100 @@ mod tests {
             .into_inner();
         assert_eq!(info.user_info[0].display_name, "Alice");
         assert_eq!(info.user_info[1].display_name, "static:bob");
+    }
+
+    #[tokio::test]
+    async fn external_exchange_gating() {
+        let (service, _auth, _dir) = service().await;
+
+        // Static provider: inherits the trait default → Unimplemented.
+        let err = service
+            .exchange_external_token_for_user_token(Request::new(
+                lore_proto::auth::ExchangeExternalTokenForUserTokenRequest {
+                    external_token: "some-token".to_string(),
+                    token_type: "google-id-token".to_string(),
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+
+        // Unknown token type refused before touching the provider.
+        let err = service
+            .exchange_external_token_for_user_token(Request::new(
+                lore_proto::auth::ExchangeExternalTokenForUserTokenRequest {
+                    external_token: "some-token".to_string(),
+                    token_type: "eg1".to_string(),
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // Empty token refused.
+        let err = service
+            .exchange_external_token_for_user_token(Request::new(
+                lore_proto::auth::ExchangeExternalTokenForUserTokenRequest {
+                    external_token: String::new(),
+                    token_type: "google-id-token".to_string(),
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn external_exchange_mints_verifiable_token() {
+        use crate::auth::provider::oidc::test_support;
+
+        // LocalAuth wired to an OIDC provider (mock backend) that trusts
+        // the hub's client id for external exchange.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = crate::auth::local_auth::tests::test_auth_settings(dir.path());
+        let base = LocalAuth::from_settings(Some(&settings))
+            .expect("build")
+            .expect("enabled");
+        let mut config = test_support::config();
+        config.trusted_external_audiences = vec!["lorehub-client-id".to_string()];
+        let auth = Arc::new(LocalAuth {
+            provider: Arc::new(crate::auth::provider::oidc::OidcProvider::new(
+                config,
+                Arc::new(test_support::MockBackend::new()),
+            )),
+            minter: base.minter.clone(),
+            sessions: base.sessions.clone(),
+            verifier: base.verifier.clone(),
+        });
+        let service = LoreAuthService::new(auth.clone());
+
+        // A hub-obtained ID token: aud = hub client id, no nonce.
+        let mut claims = test_support::valid_claims("unused");
+        claims["aud"] = "lorehub-client-id".into();
+        claims.as_object_mut().expect("object").remove("nonce");
+
+        let response = service
+            .exchange_external_token_for_user_token(Request::new(
+                lore_proto::auth::ExchangeExternalTokenForUserTokenRequest {
+                    external_token: test_support::id_token(&claims),
+                    token_type: "google-id-token".to_string(),
+                },
+            ))
+            .await
+            .expect("exchange")
+            .into_inner()
+            .user_token
+            .expect("token");
+
+        assert_eq!(response.user_id, "test-oidc:google-subject-1");
+        let verified = auth
+            .verifier
+            .verify_token(&response.user_token)
+            .await
+            .expect("verify minted token");
+        assert_eq!(verified.user_id, "test-oidc:google-subject-1");
+        assert_eq!(verified.idp, "test-oidc");
+        assert_eq!(verified.resources, None);
     }
 
     #[tokio::test]

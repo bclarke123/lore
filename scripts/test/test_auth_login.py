@@ -41,6 +41,9 @@ DISPLAY_NAME = "Alice Example"
 AUTH_CONFIG_TEMPLATE = """
 
 # Appended by test_auth_login.py: server-local auth with the static provider.
+[environment.endpoint]
+auth_url = "ucs-auth-insecure://localhost:{grpc_port}"
+
 [server.auth.token]
 generate_signing_key = true
 signing_key_path = "{signing_key_path}"
@@ -82,6 +85,7 @@ def auth_server(request, tmp_path_factory):
             AUTH_CONFIG_TEMPLATE.format(
                 signing_key_path=signing_key_path,
                 http_port=ports["http"],
+                grpc_port=ports["grpc"],
                 user=USER,
                 secret=SECRET,
                 display_name=DISPLAY_NAME,
@@ -95,6 +99,7 @@ def auth_server(request, tmp_path_factory):
         "grpc": f"127.0.0.1:{ports['grpc']}",
         "http": f"http://localhost:{ports['http']}",
         "auth_url": f"ucs-auth://localhost:{ports['grpc']}",
+        "remote": f"grpc://localhost:{ports['grpc']}",
     }
     _kill_server_by_pid(server_proc.pid, server_log_path, label="auth server")
     server_log_fd.close()
@@ -252,6 +257,73 @@ def test_cli_stores_minted_token(auth_server, lore_executable_path, tmp_path):
         text=True,
         env={**os.environ, **auth_env},
         timeout=60,
+    )
+    assert listing.returncode == 0, listing.stderr
+    assert f"static:{USER}" in listing.stdout
+
+
+def test_cli_interactive_login_end_to_end(auth_server, lore_executable_path, tmp_path):
+    """The full stock-client browser flow: `lore auth login --no-browser`
+    prints the login URL, "the browser" (this test) completes it, and the
+    polling CLI stores the minted token. This is exactly the Google flow
+    with the static dev provider standing in for the IdP."""
+    process = subprocess.Popen(
+        [
+            lore_executable_path,
+            "auth",
+            "login",
+            auth_server["remote"],
+            "--no-browser",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env={
+            **os.environ,
+            "LORE_AUTH_PATH": str(tmp_path),
+            "LORE_AUTH_STORE": "fallback",
+        },
+    )
+    try:
+        # The CLI prints the login URL and then polls for completion.
+        login_url = None
+        for _ in range(100):
+            line = process.stdout.readline()
+            if not line:
+                break
+            if "Login at:" in line:
+                login_url = line.split("Login at:")[1].strip()
+                # Strip ANSI styling.
+                login_url = "".join(
+                    part for part in login_url.split("\x1b") if "http" in part
+                )
+                login_url = login_url[login_url.index("http") :]
+                break
+        assert login_url, "CLI did not print a login URL"
+
+        # Complete "the browser" step against the dev-login callback.
+        state = login_url.split("state=")[1]
+        status, _ = http_get(
+            f"{auth_server['http']}/auth/callback?state={state}&user={USER}&secret={SECRET}"
+        )
+        assert status == 200
+
+        assert process.wait(timeout=60) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.stdout.close()
+
+    listing = subprocess.run(
+        [lore_executable_path, "auth", "list"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={
+            **os.environ,
+            "LORE_AUTH_PATH": str(tmp_path),
+            "LORE_AUTH_STORE": "fallback",
+        },
     )
     assert listing.returncode == 0, listing.stderr
     assert f"static:{USER}" in listing.stdout

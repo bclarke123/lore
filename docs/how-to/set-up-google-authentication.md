@@ -74,6 +74,64 @@ lore auth list
 
 The identity is reported as `google:<subject>` with your Google display name.
 
+## Test the whole flow locally
+
+The full flow — Google consent screen included — runs on a laptop with no TLS. Two differences from the production setup: the redirect URI uses plain `http://localhost` (which Google permits), and the advertised auth endpoint uses the `ucs-auth-insecure://` scheme so the client contacts the auth service without TLS. Never use that scheme outside local development — tokens would travel in the clear.
+
+1. Register the OAuth client as above, with the redirect URI `http://localhost:41339/auth/callback`.
+
+2. Create a sandbox directory for the server:
+
+   ```sh
+   mkdir -p ~/lore-dev/lore-server/config && cd ~/lore-dev
+   cp <lore-checkout>/lore-server/config/default.toml lore-server/config/
+
+   # Self-signed certificate for the QUIC endpoint
+   openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
+     -days 30 -nodes -subj "/CN=localhost"
+
+   echo 'GOCSPX-…' > google-client-secret
+   ```
+
+3. Write `lore-server/config/local.toml` (`local` is the default environment, so it loads automatically):
+
+   ```toml
+   [environment.endpoint]
+   auth_url = "ucs-auth-insecure://localhost:41337"
+
+   [server.auth]
+   server_admins = ["you@example.com"]
+
+   [server.auth.token]
+   generate_signing_key = true
+   signing_key_path = "signing-key.pem"
+   issuer = "http://localhost"
+   audience = ["localhost"]
+
+   [server.auth.provider]
+   mode = "google"
+   callback_base_url = "http://localhost:41339"
+
+   [server.auth.provider.oidc]
+   client_id = "1234-abc.apps.googleusercontent.com"
+   client_secret_path = "google-client-secret"
+   ```
+
+4. Start the server from the sandbox directory and log in:
+
+   ```sh
+   cd ~/lore-dev && loreserver          # look for: Server-local authentication enabled
+   lore auth login grpc://localhost:41337
+   lore auth list                       # identity appears as google:<subject>
+   ```
+
+Because your account is in `server_admins`, you hold the admin role everywhere; a second Google account is denied until you grant it:
+
+```sh
+lore access grant teammate@gmail.com read myrepo --remote-url grpc://localhost:41337
+lore access list myrepo --remote-url grpc://localhost:41337
+```
+
 ## Troubleshooting
 
 - **`redirect_uri_mismatch` in the browser** — the `callback_base_url` (plus `/auth/callback`) doesn't exactly match the redirect URI registered with Google, including scheme and port.

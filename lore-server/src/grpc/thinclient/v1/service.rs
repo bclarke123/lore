@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use lore_proto::lore::thin_client::v1::ContentDiffRequest;
 use lore_proto::lore::thin_client::v1::ContentDiffResponse;
+use lore_proto::lore::thin_client::v1::ReadContentRequest;
+use lore_proto::lore::thin_client::v1::ReadContentResponse;
 use lore_proto::lore::thin_client::v1::RevisionDiffRequest;
 use lore_proto::lore::thin_client::v1::RevisionDiffResponse;
 use lore_proto::lore::thin_client::v1::RevisionInfoRequest;
@@ -19,6 +21,7 @@ use tonic::Response;
 use tonic::Status;
 use tonic::codegen::tokio_stream::Stream;
 
+use super::read_content;
 use super::revision_diff;
 use super::revision_info;
 use super::revision_tree;
@@ -30,6 +33,8 @@ type RevisionDiffStream =
     Pin<Box<dyn Stream<Item = Result<RevisionDiffResponse, Status>> + Send + 'static>>;
 type RevisionTreeStream =
     Pin<Box<dyn Stream<Item = Result<RevisionTreeResponse, Status>> + Send + 'static>>;
+type ReadContentStream =
+    Pin<Box<dyn Stream<Item = Result<ReadContentResponse, Status>> + Send + 'static>>;
 
 /// Zero-sized `InstrumentProvider` carrying the v1 thin-client service's
 /// metric namespace. Standalone so the constructor can mint instruments
@@ -137,6 +142,15 @@ impl ThinClientService for LoreThinClientV1Service {
             self.mutable_store.clone(),
         )
         .await
+    }
+
+    type ReadContentStream = ReadContentStream;
+
+    async fn read_content(
+        &self,
+        request: Request<ReadContentRequest>,
+    ) -> Result<Response<Self::ReadContentStream>, Status> {
+        read_content::handler(request, self.immutable_store.clone()).await
     }
 }
 

@@ -242,6 +242,47 @@ impl ::prost::Name for RepositoryMetadataSetRequest {
         "/lore.repository.v1.RepositoryMetadataSetRequest".into()
     }
 }
+/// Request to set (or re-point) a resolvable name alias for a repository.
+/// Setting a name that already resolves to a different repository fails
+/// with ALREADY_EXISTS; re-issuing the same name → id pair is an idempotent
+/// success. Rename and transfer flows pass the outgoing alias in
+/// `remove_name` so the old name stops resolving in the same call.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RepositoryAliasSetRequest {
+    /// Alias to set. Must satisfy `lore-revision::repository::is_valid_name`
+    /// (which permits `/`, enabling owner-scoped paths like "owner/repo").
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Repository id the alias resolves to.
+    #[prost(bytes = "bytes", tag = "2")]
+    pub id: ::prost::bytes::Bytes,
+    /// Optional previous alias to delete after `name` is set.
+    #[prost(string, optional, tag = "3")]
+    pub remove_name: ::core::option::Option<::prost::alloc::string::String>,
+}
+impl ::prost::Name for RepositoryAliasSetRequest {
+    const NAME: &'static str = "RepositoryAliasSetRequest";
+    const PACKAGE: &'static str = "lore.repository.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.repository.v1.RepositoryAliasSetRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.repository.v1.RepositoryAliasSetRequest".into()
+    }
+}
+/// Empty acknowledgement; failures surface as non-OK gRPC statuses.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RepositoryAliasSetResponse {}
+impl ::prost::Name for RepositoryAliasSetResponse {
+    const NAME: &'static str = "RepositoryAliasSetResponse";
+    const PACKAGE: &'static str = "lore.repository.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.repository.v1.RepositoryAliasSetResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.repository.v1.RepositoryAliasSetResponse".into()
+    }
+}
 /// Response always returned with gRPC OK regardless of CAS hit or miss. On
 /// a successful CAS, response.metadata == request.updated. On a CAS miss,
 /// response.metadata reflects the unchanged prior value; the caller compares
@@ -544,6 +585,41 @@ pub mod repository_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Point a resolvable name alias at a repository id (and optionally drop
+        /// an old alias in the same call). Aliases live in the server-wide mutable
+        /// name → id table used by name lookup and clone-URL resolution; they are
+        /// independent of the immutable metadata `name`. Restricted to server
+        /// administrators: the alias namespace is global, so arbitrary repository
+        /// admins must not be able to claim names.
+        pub async fn repository_alias_set(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RepositoryAliasSetRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryAliasSetResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.repository.v1.RepositoryService/RepositoryAliasSet",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.repository.v1.RepositoryService",
+                        "RepositoryAliasSet",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -617,6 +693,19 @@ pub mod repository_service_server {
             request: tonic::Request<super::RepositoryMetadataSetRequest>,
         ) -> std::result::Result<
             tonic::Response<super::RepositoryMetadataSetResponse>,
+            tonic::Status,
+        >;
+        /// Point a resolvable name alias at a repository id (and optionally drop
+        /// an old alias in the same call). Aliases live in the server-wide mutable
+        /// name → id table used by name lookup and clone-URL resolution; they are
+        /// independent of the immutable metadata `name`. Restricted to server
+        /// administrators: the alias namespace is global, so arbitrary repository
+        /// admins must not be able to claim names.
+        async fn repository_alias_set(
+            &self,
+            request: tonic::Request<super::RepositoryAliasSetRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryAliasSetResponse>,
             tonic::Status,
         >;
     }
@@ -969,6 +1058,55 @@ pub mod repository_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = RepositoryMetadataSetSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.repository.v1.RepositoryService/RepositoryAliasSet" => {
+                    #[allow(non_camel_case_types)]
+                    struct RepositoryAliasSetSvc<T: RepositoryService>(pub Arc<T>);
+                    impl<
+                        T: RepositoryService,
+                    > tonic::server::UnaryService<super::RepositoryAliasSetRequest>
+                    for RepositoryAliasSetSvc<T> {
+                        type Response = super::RepositoryAliasSetResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RepositoryAliasSetRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RepositoryService>::repository_alias_set(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RepositoryAliasSetSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

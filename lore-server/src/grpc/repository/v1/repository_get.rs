@@ -156,9 +156,9 @@ pub(super) async fn repository_load_id(
 }
 
 /// Resolve a repository by name. Falls through to id lookup when the
-/// caller passed a parseable `RepositoryId` as the name. Self-heals a
-/// stale name → id mapping by deleting it when the metadata's name
-/// disagrees.
+/// caller passed a parseable `RepositoryId` as the name. Names that
+/// resolve but differ from the metadata name are aliases
+/// (`RepositoryAliasSet`) and are returned as-is.
 #[allow(clippy::map_err_ignore)]
 pub(super) async fn repository_load_name(
     repository: Arc<RepositoryContext>,
@@ -194,17 +194,16 @@ pub(super) async fn repository_load_name(
         .await
         .forward_with::<RepositoryError, _>(|| format!("Repository {name} metadata not found"))?;
 
+    // The queried name may legitimately differ from the immutable metadata
+    // name: aliases (RepositoryAliasSet) intentionally point additional
+    // resolvable names at a repository. A resolved mapping is authoritative;
+    // do not treat the mismatch as stale (the old self-heal deleted every
+    // alias on first resolve).
     if metadata.name != name {
-        warn!(
-            "Stale name -> ID mapping: {} maps to {} but metadata name is {}, deleting mapping",
-            name, id, metadata.name
+        info!(
+            "Repository {} resolved as alias of {} ({})",
+            name, metadata.name, id
         );
-        let _ = repository::delete_name_to_id(repository.clone(), name)
-            .await
-            .inspect_err(|err| warn!("Failed to delete stale name -> ID mapping: {err}"));
-        return Err(RepositoryError::from(RepositoryNotFound {
-            repository: name.to_string(),
-        }));
     }
 
     Ok((id, metadata, metadata_hash))

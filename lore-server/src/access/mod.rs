@@ -329,6 +329,24 @@ impl AccessControl {
             Err(e) => Err(tonic::Status::internal(format!("Access check failed: {e}"))),
         }
     }
+
+    /// Authorization check requiring server-administrator standing
+    /// (repository creation, alias management — operations reserved for the
+    /// hub / trusted control plane).
+    pub async fn check_server_admin(
+        &self,
+        authorization: Option<&str>,
+    ) -> Result<AuthorizationToken, tonic::Status> {
+        let claims = self.claims_from_header(authorization).await?;
+        let principals = Principals::from_claims(&claims);
+        match self.is_server_admin(&principals).await {
+            Ok(true) => Ok(claims),
+            Ok(false) => Err(tonic::Status::permission_denied(
+                "Server administrator role required",
+            )),
+            Err(e) => Err(tonic::Status::internal(format!("Access check failed: {e}"))),
+        }
+    }
 }
 
 #[cfg(test)]

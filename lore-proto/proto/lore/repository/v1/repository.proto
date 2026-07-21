@@ -28,6 +28,13 @@ service RepositoryService {
   // Compare-and-swap update of a repository's metadata pointer. CAS miss is
   // signalled in-band via the response, never as a non-OK gRPC status.
   rpc RepositoryMetadataSet(RepositoryMetadataSetRequest) returns (RepositoryMetadataSetResponse);
+  // Point a resolvable name alias at a repository id (and optionally drop
+  // an old alias in the same call). Aliases live in the server-wide mutable
+  // name → id table used by name lookup and clone-URL resolution; they are
+  // independent of the immutable metadata `name`. Restricted to server
+  // administrators: the alias namespace is global, so arbitrary repository
+  // admins must not be able to claim names.
+  rpc RepositoryAliasSet    (RepositoryAliasSetRequest)   returns (RepositoryAliasSetResponse);
 }
 
 // Request to create a new repository. The caller pre-generates `id` and
@@ -135,6 +142,25 @@ message RepositoryMetadataSetRequest {
   bytes expected = 2;
   // The metadata hash to install if the CAS succeeds.
   bytes updated = 3;
+}
+
+// Request to set (or re-point) a resolvable name alias for a repository.
+// Setting a name that already resolves to a different repository fails
+// with ALREADY_EXISTS; re-issuing the same name → id pair is an idempotent
+// success. Rename and transfer flows pass the outgoing alias in
+// `remove_name` so the old name stops resolving in the same call.
+message RepositoryAliasSetRequest {
+  // Alias to set. Must satisfy `lore-revision::repository::is_valid_name`
+  // (which permits `/`, enabling owner-scoped paths like "owner/repo").
+  string name = 1;
+  // Repository id the alias resolves to.
+  bytes id = 2;
+  // Optional previous alias to delete after `name` is set.
+  optional string remove_name = 3;
+}
+
+// Empty acknowledgement; failures surface as non-OK gRPC statuses.
+message RepositoryAliasSetResponse {
 }
 
 // Response always returned with gRPC OK regardless of CAS hit or miss. On

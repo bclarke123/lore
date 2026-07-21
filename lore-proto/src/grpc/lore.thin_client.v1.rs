@@ -750,6 +750,50 @@ impl ::prost::Name for RevisionTreeResponse {
         "/lore.thin_client.v1.RevisionTreeResponse".into()
     }
 }
+/// Request a file's content bytes by CAS address.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReadContentRequest {
+    /// Content address of the FILE/LINK node (from TreeNode.address).
+    #[prost(message, optional, tag = "1")]
+    pub address: ::core::option::Option<crate::lore::model::v1::Address>,
+    /// Refuse to read if the content exceeds this many bytes (guards against
+    /// huge blobs). Unset = no cap.
+    #[prost(uint64, optional, tag = "2")]
+    pub max_bytes: ::core::option::Option<u64>,
+}
+impl ::prost::Name for ReadContentRequest {
+    const NAME: &'static str = "ReadContentRequest";
+    const PACKAGE: &'static str = "lore.thin_client.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.thin_client.v1.ReadContentRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.thin_client.v1.ReadContentRequest".into()
+    }
+}
+/// A chunk of reassembled, decompressed file content. The first message
+/// carries the total content size; every message (including the first)
+/// carries a `chunk` (possibly empty on the header-only first message for
+/// an empty file).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReadContentResponse {
+    /// Total decompressed content size, set on the first streamed message.
+    #[prost(uint64, tag = "1")]
+    pub size_content: u64,
+    /// A contiguous chunk of content bytes, in order.
+    #[prost(bytes = "bytes", tag = "2")]
+    pub chunk: ::prost::bytes::Bytes,
+}
+impl ::prost::Name for ReadContentResponse {
+    const NAME: &'static str = "ReadContentResponse";
+    const PACKAGE: &'static str = "lore.thin_client.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.thin_client.v1.ReadContentResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.thin_client.v1.ReadContentResponse".into()
+    }
+}
 /// Generated client implementations.
 pub mod thin_client_service_client {
     #![allow(
@@ -968,6 +1012,38 @@ pub mod thin_client_service_client {
                 );
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Stream a file's fully reassembled, decompressed content bytes for a
+        /// CAS address (from a TreeNode). A presentation helper so thin clients
+        /// (web UIs, SDKs) need not reimplement fragment reassembly / codecs.
+        pub async fn read_content(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ReadContentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::ReadContentResponse>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.thin_client.v1.ThinClientService/ReadContent",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.thin_client.v1.ThinClientService",
+                        "ReadContent",
+                    ),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1034,6 +1110,22 @@ pub mod thin_client_service_server {
             request: tonic::Request<super::RevisionTreeRequest>,
         ) -> std::result::Result<
             tonic::Response<Self::RevisionTreeStream>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the ReadContent method.
+        type ReadContentStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::ReadContentResponse, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Stream a file's fully reassembled, decompressed content bytes for a
+        /// CAS address (from a TreeNode). A presentation helper so thin clients
+        /// (web UIs, SDKs) need not reimplement fragment reassembly / codecs.
+        async fn read_content(
+            &self,
+            request: tonic::Request<super::ReadContentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::ReadContentStream>,
             tonic::Status,
         >;
     }
@@ -1289,6 +1381,53 @@ pub mod thin_client_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = RevisionTreeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.thin_client.v1.ThinClientService/ReadContent" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReadContentSvc<T: ThinClientService>(pub Arc<T>);
+                    impl<
+                        T: ThinClientService,
+                    > tonic::server::ServerStreamingService<super::ReadContentRequest>
+                    for ReadContentSvc<T> {
+                        type Response = super::ReadContentResponse;
+                        type ResponseStream = T::ReadContentStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ReadContentRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ThinClientService>::read_content(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReadContentSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

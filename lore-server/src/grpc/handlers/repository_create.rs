@@ -239,9 +239,11 @@ async fn repository_create(
     }
 
     if let Some(access) = crate::access::installed() {
-        // Server-local access control: the creator receives an automatic
-        // admin grant on the new repository.
-        let claims = access.claims_from_header(authorization.as_deref()).await?;
+        // Server-local access control: repository creation is reserved for
+        // server administrators (the hub control plane), which enforces the
+        // naming scheme and grants the human owner separately. The creating
+        // principal receives an automatic admin grant on the new repository.
+        let claims = access.check_server_admin(authorization.as_deref()).await?;
         access
             .on_repository_created(repository.id, &claims.user_id)
             .await

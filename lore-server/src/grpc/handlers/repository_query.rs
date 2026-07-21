@@ -185,21 +185,20 @@ pub async fn repository_query_name(
         .await
         .forward_with::<RepositoryError, _>(|| format!("Repository {name} metadata not found"))?;
 
-    // Verify the metadata name matches the queried name — if not, the name -> ID mapping is stale
+    // The queried name may legitimately differ from the immutable metadata
+    // name: aliases (RepositoryAliasSet) intentionally point additional
+    // resolvable names at a repository. A resolved mapping is authoritative,
+    // so return the repository as-is rather than treating the mismatch as a
+    // stale mapping to delete (the old self-heal would have destroyed every
+    // alias on first resolve).
     if metadata.name != name {
-        warn!(
-            "Stale name -> ID mapping: {} maps to {} but metadata name is {}, deleting mapping",
-            name, id, metadata.name
+        info!(
+            "Repository query name {} resolved as alias of {} ({})",
+            name, metadata.name, id
         );
-        let _ = repository::delete_name_to_id(repository.clone(), name)
-            .await
-            .inspect_err(|err| warn!("Failed to delete stale name -> ID mapping: {err}"));
-        return Err(RepositoryError::from(RepositoryNotFound {
-            repository: name.to_string(),
-        }));
+    } else {
+        info!("Repository query name {name} found {metadata:?}");
     }
-
-    info!("Repository query name {name} found {metadata:?}");
     Ok(RepositoryData {
         id,
         name: metadata.name,

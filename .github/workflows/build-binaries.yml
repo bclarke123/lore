@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+
+# Builds the `lore` CLI and `loreserver` binaries for Linux and macOS and
+# uploads them as workflow artifacts. Uses the `release` profile (the fast
+# incremental profile this workspace uses for day-to-day builds); switch
+# `--profile release-lto` in the build step for fully optimized
+# distribution binaries at the cost of much longer builds.
+
+name: Build binaries
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: build-binaries-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-latest
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - name: macos-aarch64
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: build-${{ matrix.name }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            build-${{ matrix.name }}-
+
+      - name: Build lore and loreserver
+        run: cargo build --release -p lore-client -p lore-server
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lore-${{ matrix.name }}
+          path: |
+            target/release/lore
+            target/release/loreserver
+          if-no-files-found: error
+          retention-days: 14

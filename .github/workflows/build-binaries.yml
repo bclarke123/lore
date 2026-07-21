@@ -1,16 +1,32 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
 
-# Builds the `lore` CLI and `loreserver` binaries for Linux and macOS and
-# uploads them as workflow artifacts. Uses the `release-lto` profile — the
-# fully optimized distribution build (fat LTO, no debug assertions).
-# Linux binaries are stripped of the embedded DWARF (macOS splits it into
-# a .dSYM automatically); full symbols stay reproducible from the tag.
+# Builds the `lore` CLI and `loreserver` binaries for Linux and macOS,
+# packaged the way Lore releases are shipped:
+#   - `release-lto` profile (the actual release build per Cargo.toml)
+#   - one tarball per binary, named `<binary>-v<version>-<rust-triple>.tar.gz`
+#     (the exact shape scripts/install.sh matches)
+#   - the aarch64-linux build carries the repo's Graviton3 codegen flags, so
+#     its tarball gets the `.neoverse-512tvb` micro-arch suffix install.sh
+#     expects for non-generic builds
+#   - Linux debug info is split out at packaging time (objcopy + debuglink,
+#     mirroring the release packaging); macOS emits .dSYM bundles at build
+#     time. Symbols upload as a separate artifact.
 
 name: Build binaries
 
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: Which architecture(s) to build
+        type: choice
+        default: all
+        options:
+          - all
+          - linux-x86_64
+          - linux-aarch64
+          - macos-aarch64
   push:
     branches: [main]
 
@@ -21,21 +37,44 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Selects which matrix entries to build: pushes build everything, manual
+  # dispatches honor the target dropdown. (A separate job because `matrix`
+  # is not available in job-level `if` expressions.)
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - name: Select targets
+        id: select
+        env:
+          TARGET: ${{ inputs.target || 'all' }}
+        run: |
+          set -euo pipefail
+          all='[
+            {"name": "linux-x86_64", "runner": "ubuntu-latest", "asset-suffix": ""},
+            {"name": "linux-aarch64", "runner": "ubuntu-24.04-arm", "asset-suffix": ".neoverse-512tvb"},
+            {"name": "macos-aarch64", "runner": "macos-latest", "asset-suffix": ""}
+          ]'
+          if [ "$TARGET" = "all" ]; then
+            selected=$(printf '%s' "$all" | jq -c '.')
+          else
+            selected=$(printf '%s' "$all" | jq -c --arg t "$TARGET" 'map(select(.name == $t))')
+          fi
+          echo "matrix=$selected" >> "$GITHUB_OUTPUT"
+          echo "Building: $(printf '%s' "$selected" | jq -r 'map(.name) | join(", ")')"
+
   build:
     name: build (${{ matrix.name }})
+    needs: plan
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: linux-x86_64
-            runner: ubuntu-latest
-          - name: linux-aarch64
-            runner: ubuntu-24.04-arm
-          - name: macos-aarch64
-            runner: macos-latest
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -55,19 +94,62 @@ jobs:
           restore-keys: |
             build-${{ matrix.name }}-
 
-      - name: Build lore and loreserver
-        run: cargo build --profile release-lto -p lore-client -p lore-server
-
-      - name: Strip Linux binaries
+      # Fat-LTO links are memory-hungry; the hosted runners (especially ARM)
+      # can OOM-kill the linker (exit 143). Give the build headroom.
+      - name: Add swap space
         if: runner.os == 'Linux'
-        run: strip target/release-lto/lore target/release-lto/loreserver
+        run: |
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      # Build the two binaries sequentially so their final LTO links never
+      # run concurrently (each link alone can use most of the runner's RAM).
+      - name: Build lore and loreserver
+        run: |
+          cargo build --profile release-lto -p lore-client
+          cargo build --profile release-lto -p lore-server
+
+      - name: Package release tarballs
+        env:
+          ASSET_SUFFIX: ${{ matrix.asset-suffix }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          triple=$(rustc -vV | sed -n 's/^host: //p')
+          mkdir -p dist/symbols
+          cd target/release-lto
+          for bin in lore loreserver; do
+            if [ "$RUNNER_OS" = "Linux" ]; then
+              # Split the embedded DWARF the way release packaging does:
+              # symbols to a .debug file, stripped binary with a debuglink.
+              objcopy --only-keep-debug "$bin" "$bin.debug"
+              objcopy --strip-debug --add-gnu-debuglink="$bin.debug" "$bin"
+              mv "$bin.debug" "$GITHUB_WORKSPACE/dist/symbols/"
+            elif [ -d "$bin.dSYM" ]; then
+              # macOS: split-debuginfo=packed already emitted the bundle.
+              tar czf "$GITHUB_WORKSPACE/dist/symbols/$bin.dSYM.tar.gz" "$bin.dSYM"
+            fi
+            tar czf \
+              "$GITHUB_WORKSPACE/dist/$bin-v$version-$triple$ASSET_SUFFIX.tar.gz" \
+              "$bin"
+          done
+          ls -la "$GITHUB_WORKSPACE/dist"
 
       - name: Upload binaries
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: lore-${{ matrix.name }}
-          path: |
-            target/release-lto/lore
-            target/release-lto/loreserver
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload debug symbols
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lore-${{ matrix.name }}-symbols
+          path: dist/symbols/
           if-no-files-found: error
           retention-days: 14

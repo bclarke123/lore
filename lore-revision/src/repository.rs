@@ -2799,6 +2799,21 @@ pub async fn branch_switch(
             branch::store_last_sync(repository.clone(), branch.id, branch_latest_local).await;
         }
 
+        // Restore the name-to-id mapping for the branch to ensure it shows up in the local branch list.
+        let mapped = branch::load_name_to_id_local(repository.clone(), branch_name)
+            .await
+            .unwrap_or_default();
+        if mapped != Context::default() && mapped != branch.id && !global.force() {
+            return Err(RepositoryError::internal(
+                "Given branch's name is already used by another branch",
+            ));
+        }
+        if mapped == Context::default() || global.force() {
+            branch::store_name_to_id(repository.clone(), branch.id, &branch_name)
+                .await
+                .forward::<RepositoryError>("restoring name-to-id mapping")?;
+        }
+
         if !options.bare {
             // Switch layers to follow the main branch
             layer_branch_switch(

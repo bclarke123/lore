@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -167,6 +168,19 @@ def global_dir_name(tmp_path_factory):
     yield path
 
 
+def _service_unreachable(output):
+    """Whether a probe failed because it could not reach the service.
+
+    On Windows the failure also carries WinSock error 10022, which is kept as a
+    separate marker rather than relying on the wrapping context alone. It is
+    scoped to Windows so that a repository path echoed back in the output cannot
+    match it by accident on the other platforms.
+    """
+    if "connecting to local socket" in output:
+        return True
+    return platform.system() == "Windows" and "10022" in output
+
+
 def _wait_for_service_ready(lore_executable_path, service_process, attempts=30):
     """Block until the background service answers a probe."""
     probe_env = os.environ.copy()
@@ -178,16 +192,45 @@ def _wait_for_service_ready(lore_executable_path, service_process, attempts=30):
                 f"{service_process.returncode}"
             )
         probe = subprocess.run(
-            [lore_executable_path, "repository", "list"],
+            [lore_executable_path, "status"],
             capture_output=True,
             text=True,
             env=probe_env,
         )
         out = probe.stdout + probe.stderr
-        if "connecting to local socket" not in out and "10022" not in out:
+        if not _service_unreachable(out):
             return
         sleep(1)
     pytest.fail("Timed out waiting for Lore background service to accept connections")
+
+
+@pytest.fixture(scope="function")
+def lore_service_in_directory(lore_executable_path, global_dir_name):
+    """Starts the service in a chosen directory, for tests that need the
+    service's own working directory to differ from the caller's. The service
+    shares the test's isolated global config so shared stores it creates land
+    where the client looks for them."""
+    processes = []
+
+    def start(directory):
+        env = os.environ.copy()
+        env["LORE_GLOBAL_PATH"] = global_dir_name
+        service_process = subprocess.Popen(
+            [lore_executable_path, "service", "run"], cwd=str(directory), env=env
+        )
+        processes.append(service_process)
+        _wait_for_service_ready(lore_executable_path, service_process)
+        return service_process
+
+    yield start
+
+    for service_process in processes:
+        service_process.terminate()
+        try:
+            service_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            logger.warning("Lore service did not exit on terminate, killing it")
+            service_process.kill()
 
 
 @pytest.fixture(scope="function")
@@ -200,7 +243,12 @@ def background_lore_service(lore_executable_path):
 
     yield service_process
 
-    service_process.kill()
+    service_process.terminate()
+    try:
+        service_process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        logger.warning("Lore service did not exit on terminate, killing it")
+        service_process.kill()
 
 
 @pytest.fixture(scope="session")
@@ -253,6 +301,30 @@ def lore_server_executable_path(request):
             )
 
     return executable_path
+
+
+@pytest.fixture(scope="session")
+def lore_library(request):
+    """
+    Loads the public Lore C API library (`liblore`) for tests that need to
+    observe API-level behavior the CLI does not surface. Skips if the library
+    was not built alongside the client binary.
+    """
+    from lore_ffi import LoreLibrary, library_filename
+
+    library_path = os.getenv("LORE_LIBRARY_PATH")
+    if not library_path:
+        binary = request.config.getoption("--lore-client-binary")
+        build = binary if binary in ("release", "debug") else "release"
+        library_path = str(Path.cwd() / "target" / build / library_filename())
+    library_path = str(Path(library_path).resolve())
+    if not os.path.exists(library_path):
+        pytest.skip(
+            f"Lore library not found at {library_path}; "
+            "set LORE_LIBRARY_PATH to run C API tests"
+        )
+
+    return LoreLibrary(library_path)
 
 
 @pytest.fixture(scope="session")

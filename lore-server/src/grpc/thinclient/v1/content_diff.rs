@@ -329,8 +329,13 @@ async fn load_table_entry(
 /// Greedy with a monotonically advancing from-cursor: each to-side chunk
 /// pairs with the nearest same-hash from-side chunk at or after the
 /// cursor, keeping runs ordered and handling repeated chunks (zero-fill
-/// etc.) without pathological cross-matching. Returns the runs and
-/// whether the list was capped.
+/// etc.) without pathological cross-matching. A second, order-free pass
+/// then pairs leftovers whose hashes are unique among the unmatched on
+/// both sides — this is what detects relocated sections (content moved
+/// *earlier* relative to matched order, e.g. a block cut from the middle
+/// and appended at the end), which the monotonic cursor cannot reach; the
+/// uniqueness requirement keeps repeated chunks from cross-matching.
+/// Returns the runs (ascending to-offset) and whether the list was capped.
 fn match_tables(from: &[Chunk], to: &[Chunk]) -> (Vec<MatchedRun>, bool) {
     use std::collections::HashMap;
 
@@ -342,15 +347,19 @@ fn match_tables(from: &[Chunk], to: &[Chunk]) -> (Vec<MatchedRun>, bool) {
     let mut runs: Vec<MatchedRun> = Vec::new();
     let mut truncated = false;
     let mut cursor = 0usize;
-    for chunk in to {
-        let Some(indices) = by_hash.get(chunk.hash.as_ref()) else {
-            continue;
-        };
-        let Some(&idx) = indices.iter().find(|&&i| i >= cursor) else {
+    let mut from_matched = vec![false; from.len()];
+    let mut to_unmatched: Vec<usize> = Vec::new();
+    for (to_idx, chunk) in to.iter().enumerate() {
+        let idx = by_hash
+            .get(chunk.hash.as_ref())
+            .and_then(|indices| indices.iter().find(|&&i| i >= cursor).copied());
+        let Some(idx) = idx else {
+            to_unmatched.push(to_idx);
             continue;
         };
         let matched = &from[idx];
         cursor = idx + 1;
+        from_matched[idx] = true;
 
         if let Some(last) = runs.last_mut()
             && last.offset_from + last.length == matched.offset
@@ -369,6 +378,56 @@ fn match_tables(from: &[Chunk], to: &[Chunk]) -> (Vec<MatchedRun>, bool) {
             length: chunk.len,
         });
     }
+
+    // Relocation pass: pair unmatched to-chunks with unmatched from-chunks
+    // when the hash is unique among the leftovers on both sides.
+    if !truncated && !to_unmatched.is_empty() {
+        let mut leftover_from: HashMap<&[u8], Option<usize>> = HashMap::new();
+        for (i, matched) in from_matched.iter().enumerate() {
+            if !matched {
+                // Duplicate leftover hashes are ambiguous: mark as None.
+                leftover_from
+                    .entry(from[i].hash.as_ref())
+                    .and_modify(|entry| *entry = None)
+                    .or_insert(Some(i));
+            }
+        }
+        let mut moved: Vec<MatchedRun> = Vec::new();
+        let mut seen_to: HashMap<&[u8], u32> = HashMap::new();
+        for &to_idx in &to_unmatched {
+            *seen_to.entry(to[to_idx].hash.as_ref()).or_default() += 1;
+        }
+        for &to_idx in &to_unmatched {
+            let chunk = &to[to_idx];
+            // Unique among unmatched on the to side too.
+            if seen_to.get(chunk.hash.as_ref()) != Some(&1) {
+                continue;
+            }
+            let Some(&Some(from_idx)) = leftover_from.get(chunk.hash.as_ref()) else {
+                continue;
+            };
+            let matched = &from[from_idx];
+            if let Some(last) = moved.last_mut()
+                && last.offset_from + last.length == matched.offset
+                && last.offset_to + last.length == chunk.offset
+            {
+                last.length += chunk.len;
+                continue;
+            }
+            if runs.len() + moved.len() >= MAX_MATCHED_RUNS {
+                truncated = true;
+                break;
+            }
+            moved.push(MatchedRun {
+                offset_from: matched.offset,
+                offset_to: chunk.offset,
+                length: chunk.len,
+            });
+        }
+        runs.extend(moved);
+        runs.sort_by_key(|r| r.offset_to);
+    }
+
     (runs, truncated)
 }
 
@@ -677,6 +736,62 @@ mod tests {
                     .iter()
                     .map(|r| (r.offset_from, r.offset_to, r.length))
                     .collect::<Vec<_>>()
+            );
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn binary_section_move_to_end_is_detected() {
+        let (store, _mutable, execution) = test_store_create().await.expect("test stores");
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let partition = lore_base::types::Partition::default();
+            const SIZE: usize = 2 * 1024 * 1024;
+            let v1 = binary_buffer(SIZE, 21);
+            // Cut 256 KiB from the middle and append it at the end — the
+            // moved section sits EARLIER in from-order than the tail, so
+            // only the relocation pass can pair it.
+            const CUT_AT: usize = 800_000;
+            const CUT_LEN: usize = 256 * 1024;
+            let mut v2 = Vec::with_capacity(SIZE);
+            v2.extend_from_slice(&v1[..CUT_AT]);
+            v2.extend_from_slice(&v1[CUT_AT + CUT_LEN..]);
+            v2.extend_from_slice(&v1[CUT_AT..CUT_AT + CUT_LEN]);
+
+            let a1 = write_blob(&store, partition, &v1).await;
+            let a2 = write_blob(&store, partition, &v2).await;
+            let (header, _) = run_diff(store.clone(), partition, a1, a2, None).await;
+            assert!(header.binary);
+            // A run must land near the end of the to side while pointing
+            // back into the middle of the from side: the moved section.
+            let moved = header
+                .matched_runs
+                .iter()
+                .find(|r| {
+                    r.offset_to > (SIZE - CUT_LEN - 100_000) as u64 && r.offset_from < r.offset_to
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "expected relocated run near the end; runs: {:?}",
+                        header
+                            .matched_runs
+                            .iter()
+                            .map(|r| (r.offset_from, r.offset_to, r.length))
+                            .collect::<Vec<_>>()
+                    )
+                });
+            // It must cover most of the moved section (splice-boundary
+            // chunks legitimately re-chunk).
+            assert!(
+                moved.length > (CUT_LEN / 2) as u64,
+                "moved run too small: {}",
+                moved.length
+            );
+            // And point back to roughly where the section used to live.
+            assert!(
+                (moved.offset_from as i64 - CUT_AT as i64).unsigned_abs() < 200_000,
+                "moved run origin {} not near cut point {CUT_AT}",
+                moved.offset_from
             );
         }))
         .await;

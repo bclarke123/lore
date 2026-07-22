@@ -10,6 +10,7 @@ use lore_proto::lore::thin_client::v1::ContentDiffChunkResponse;
 use lore_proto::lore::thin_client::v1::ContentDiffHeader;
 use lore_proto::lore::thin_client::v1::ContentDiffRequest;
 use lore_proto::lore::thin_client::v1::ContentDiffResponse;
+use lore_proto::lore::thin_client::v1::MatchedRun;
 use lore_proto::lore::thin_client::v1::content_diff_response::Payload;
 use lore_revision::file::diff::DEFAULT_CONTEXT_LINES;
 use lore_revision::file::diff::DiffOptions;
@@ -17,6 +18,7 @@ use lore_revision::file::diff::build_unified_patch;
 use lore_revision::infer::infer_is_diffable_by_slice;
 use lore_revision::util::encoding::decode_text_for_display;
 use lore_storage::ReadOptions;
+use lore_storage::TypedBytes;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
@@ -88,41 +90,60 @@ pub async fn handler(
 
             let header;
             let mut text = String::new();
-            match (from, to) {
-                (Side::Oversized, _) | (_, Side::Oversized) => {
+            {
+                // Sniff on whatever bytes each side has: full content for
+                // in-cap reads, an 8 KiB prefix for oversized ones. Empty
+                // sides (add/delete) are trivially diffable; the binary
+                // sniffer treats an empty slice as non-diffable. Prefix
+                // sniffing is a heuristic (a binary file with a clean-text
+                // first 8 KiB reads as text), matching how the mime probes
+                // work on leading bytes.
+                let binary = |bytes: &[u8]| !bytes.is_empty() && !infer_is_diffable_by_slice(bytes);
+                let any_oversized =
+                    matches!(from, Side::Oversized { .. }) || matches!(to, Side::Oversized { .. });
+                if binary(from.sniff_bytes()) || binary(to.sniff_bytes()) {
+                    // Binary: no text diff, but the FastCDC chunk tables
+                    // give byte-range change metadata for free — load
+                    // each side's fragment table (metadata only, never
+                    // content) and report the runs both sides share. Works
+                    // regardless of content size, since content is never
+                    // read.
+                    let table_from =
+                        chunk_table(&immutable_store, repository_id, &req.address_from).await?;
+                    let table_to =
+                        chunk_table(&immutable_store, repository_id, &req.address_to).await?;
+                    let (matched_runs, runs_truncated) =
+                        match_tables(&table_from.chunks, &table_to.chunks);
+                    header = ContentDiffHeader {
+                        binary: true,
+                        size_from: table_from.size_content,
+                        size_to: table_to.size_content,
+                        matched_runs,
+                        runs_truncated,
+                        ..Default::default()
+                    };
+                } else if any_oversized {
+                    // Text (as far as the prefix shows) but too large to
+                    // diff: stats-free truncation, as before.
                     header = ContentDiffHeader {
                         truncated: true,
                         ..Default::default()
                     };
-                }
-                (from, to) => {
-                    let from_bytes = from.bytes();
-                    let to_bytes = to.bytes();
-                    // Empty sides (add/delete) are trivially diffable; the
-                    // binary sniffer treats an empty slice as non-diffable.
-                    let binary =
-                        |bytes: &[u8]| !bytes.is_empty() && !infer_is_diffable_by_slice(bytes);
-                    if binary(from_bytes) || binary(to_bytes) {
-                        header = ContentDiffHeader {
-                            binary: true,
-                            ..Default::default()
-                        };
-                    } else {
-                        let old = decode_text_for_display(from_bytes);
-                        let new = decode_text_for_display(to_bytes);
-                        let patch = build_unified_patch(&old, &new, "from", "to", options)
-                            .unwrap_or_default();
-                        let (added, deleted) = count_changes(&patch);
-                        let truncated = max_diff_size.is_some_and(|max| patch.len() as u64 > max);
-                        header = ContentDiffHeader {
-                            lines_added: added,
-                            lines_deleted: deleted,
-                            truncated,
-                            ..Default::default()
-                        };
-                        if !truncated {
-                            text = patch;
-                        }
+                } else {
+                    let old = decode_text_for_display(from.sniff_bytes());
+                    let new = decode_text_for_display(to.sniff_bytes());
+                    let patch =
+                        build_unified_patch(&old, &new, "from", "to", options).unwrap_or_default();
+                    let (added, deleted) = count_changes(&patch);
+                    let truncated = max_diff_size.is_some_and(|max| patch.len() as u64 > max);
+                    header = ContentDiffHeader {
+                        lines_added: added,
+                        lines_deleted: deleted,
+                        truncated,
+                        ..Default::default()
+                    };
+                    if !truncated {
+                        text = patch;
                     }
                 }
             }
@@ -164,17 +185,215 @@ pub async fn handler(
         .await
 }
 
+/// Cap on emitted matched runs; a change so fragmented it exceeds this is
+/// summarised with `runs_truncated = true`.
+const MAX_MATCHED_RUNS: usize = 2048;
+
+/// Recursion guard for multi-level fragment tables (mirrors the
+/// defragment path's `MAX_FRAGMENT_TREE_DEPTH`).
+const MAX_TABLE_DEPTH: usize = 8;
+
+/// One leaf chunk of a side's content: FastCDC chunk hash plus its byte
+/// placement.
+#[derive(Clone, Copy)]
+struct Chunk {
+    hash: Hash,
+    offset: u64,
+    len: u64,
+}
+
+/// A side's chunk table: total content size plus flat leaf chunks.
+struct ChunkTable {
+    size_content: u64,
+    chunks: Vec<Chunk>,
+}
+
+/// Load a side's FastCDC chunk table by content hash — metadata only, the
+/// chunk payloads are never read. Non-fragmented content is a single
+/// pseudo-chunk. The reference list is stored raw (not compressed, not a
+/// content-hash target), so decompress/verify are disabled, mirroring the
+/// chunk-reuse path in `lore-storage`'s write pipeline.
+async fn chunk_table(
+    immutable_store: &Arc<dyn lore_storage::ImmutableStore>,
+    repository_id: lore_base::types::Partition,
+    hash_bytes: &[u8],
+) -> Result<ChunkTable, Status> {
+    let empty = ChunkTable {
+        size_content: 0,
+        chunks: Vec::new(),
+    };
+    if hash_bytes.is_empty() {
+        return Ok(empty);
+    }
+    let root_hash = Hash::from(hash_bytes);
+    if root_hash.is_zero() {
+        return Ok(empty);
+    }
+
+    let options = ReadOptions::default()
+        .no_isolation()
+        .no_decompress()
+        .no_verify();
+
+    // Worklist of (hash, absolute offset, length, depth) still to resolve
+    // into leaves. Lengths above the fragmentation threshold may be
+    // intermediate nodes whose payload is another reference list.
+    let root = load_table_entry(immutable_store, repository_id, root_hash, options).await?;
+    let size_content = root.0.size_content;
+    let mut work: Vec<(Hash, u64, u64, usize)> = vec![(root_hash, 0, size_content, 0)];
+    let mut chunks = Vec::new();
+
+    while let Some((hash, offset, len, depth)) = work.pop() {
+        if depth > MAX_TABLE_DEPTH {
+            return Err(Status::internal("fragment table recursion depth exceeded"));
+        }
+        // Anything at or below the threshold is a leaf by construction.
+        if depth > 0 && len <= lore_base::types::FRAGMENT_SIZE_THRESHOLD as u64 {
+            chunks.push(Chunk { hash, offset, len });
+            continue;
+        }
+        let (fragment, payload) =
+            load_table_entry(immutable_store, repository_id, hash, options).await?;
+        if fragment.flags & lore_base::types::FragmentFlags::PayloadFragmented.bits() == 0 {
+            // Unfragmented content (small file, or an oversized-but-unsplit
+            // chunk): one leaf.
+            chunks.push(Chunk { hash, offset, len });
+            continue;
+        }
+
+        let refs_bytes = payload.to_aligned::<lore_storage::FragmentReference>();
+        let stride = std::mem::size_of::<lore_storage::FragmentReference>();
+        if refs_bytes.len() < stride || refs_bytes.len() % stride != 0 {
+            return Err(Status::internal("malformed fragment reference list"));
+        }
+        let refs = refs_bytes.as_type_slice::<lore_storage::FragmentReference>();
+        // Per-chunk size = offset delta to the next entry; the tail closes
+        // against this node's content end. Offsets are absolute within the
+        // full content; the node's own (offset, len) bound them.
+        let base = refs[0].offset_content;
+        let end = base
+            .checked_add(fragment.size_content)
+            .ok_or_else(|| Status::internal("fragment table offset overflow"))?;
+        for (i, r) in refs.iter().enumerate() {
+            let next = if i + 1 < refs.len() {
+                refs[i + 1].offset_content
+            } else {
+                end
+            };
+            let child_len = next
+                .checked_sub(r.offset_content)
+                .ok_or_else(|| Status::internal("fragment table offsets not increasing"))?;
+            if child_len == 0 {
+                continue;
+            }
+            // Rebase against this node's absolute placement.
+            let child_offset = offset + (r.offset_content - base);
+            work.push((r.hash, child_offset, child_len, depth + 1));
+        }
+    }
+
+    chunks.sort_by_key(|c| c.offset);
+    Ok(ChunkTable {
+        size_content,
+        chunks,
+    })
+}
+
+/// Load one fragment header + payload for table walking, with the same
+/// error mapping as content reads.
+async fn load_table_entry(
+    immutable_store: &Arc<dyn lore_storage::ImmutableStore>,
+    repository_id: lore_base::types::Partition,
+    hash: Hash,
+    options: ReadOptions,
+) -> Result<(lore_base::types::Fragment, bytes::Bytes), Status> {
+    let address = Address {
+        hash,
+        context: Default::default(),
+    };
+    lore_storage::load_fragment(
+        immutable_store.clone(),
+        repository_id,
+        address,
+        options,
+        None, /* server has the data locally; no remote session */
+    )
+    .await
+    .map_err(|err| match err {
+        lore_storage::StorageError::AddressNotFound(_) => Status::not_found("content not found"),
+        other => Status::internal(format!("fragment load failed: {other}")),
+    })
+}
+
+/// Match two chunk tables into coalesced byte runs present in both sides.
+/// Greedy with a monotonically advancing from-cursor: each to-side chunk
+/// pairs with the nearest same-hash from-side chunk at or after the
+/// cursor, keeping runs ordered and handling repeated chunks (zero-fill
+/// etc.) without pathological cross-matching. Returns the runs and
+/// whether the list was capped.
+fn match_tables(from: &[Chunk], to: &[Chunk]) -> (Vec<MatchedRun>, bool) {
+    use std::collections::HashMap;
+
+    let mut by_hash: HashMap<&[u8], Vec<usize>> = HashMap::new();
+    for (i, chunk) in from.iter().enumerate() {
+        by_hash.entry(chunk.hash.as_ref()).or_default().push(i);
+    }
+
+    let mut runs: Vec<MatchedRun> = Vec::new();
+    let mut truncated = false;
+    let mut cursor = 0usize;
+    for chunk in to {
+        let Some(indices) = by_hash.get(chunk.hash.as_ref()) else {
+            continue;
+        };
+        let Some(&idx) = indices.iter().find(|&&i| i >= cursor) else {
+            continue;
+        };
+        let matched = &from[idx];
+        cursor = idx + 1;
+
+        if let Some(last) = runs.last_mut()
+            && last.offset_from + last.length == matched.offset
+            && last.offset_to + last.length == chunk.offset
+        {
+            last.length += chunk.len;
+            continue;
+        }
+        if runs.len() >= MAX_MATCHED_RUNS {
+            truncated = true;
+            break;
+        }
+        runs.push(MatchedRun {
+            offset_from: matched.offset,
+            offset_to: chunk.offset,
+            length: chunk.len,
+        });
+    }
+    (runs, truncated)
+}
+
+/// Bytes read for text/binary sniffing when the content exceeds
+/// [`MAX_INPUT_BYTES`].
+const SNIFF_BYTES: usize = 8192;
+
 enum Side {
     Empty,
     Content(bytes::Bytes),
-    Oversized,
+    /// Content larger than [`MAX_INPUT_BYTES`]; carries only a leading
+    /// prefix for sniffing.
+    Oversized {
+        prefix: bytes::Bytes,
+    },
 }
 
 impl Side {
-    fn bytes(&self) -> &[u8] {
+    /// The bytes available for text/binary sniffing (and, for in-cap
+    /// content, the full body).
+    fn sniff_bytes(&self) -> &[u8] {
         match self {
             Side::Content(bytes) => bytes,
-            _ => &[],
+            Side::Oversized { prefix } => prefix,
+            Side::Empty => &[],
         }
     }
 }
@@ -217,7 +436,22 @@ async fn read_side(
     .await
     {
         Ok(bytes) => Ok(Side::Content(bytes)),
-        Err(lore_storage::StorageError::Oversized(_)) => Ok(Side::Oversized),
+        Err(lore_storage::StorageError::Oversized(_)) => {
+            // Too large to reassemble in full — fetch just a leading
+            // prefix (ranged read, no size cap) so text/binary sniffing
+            // still works; the binary path never needs the body.
+            let prefix = lore_storage::read(
+                immutable_store.clone(),
+                repository_id,
+                address,
+                Some(0..SNIFF_BYTES),
+                ReadOptions::default().no_isolation(),
+                None,
+            )
+            .await
+            .unwrap_or_default();
+            Ok(Side::Oversized { prefix })
+        }
         Err(lore_storage::StorageError::AddressNotFound(_)) => {
             Err(Status::not_found("content not found"))
         }
@@ -367,5 +601,167 @@ mod tests {
             assert_eq!(header.lines_added, 2);
         }))
         .await;
+    }
+
+    /// Deterministic pseudo-random bytes with a PNG magic prefix, so the
+    /// content both fragments (when large) and sniffs as binary.
+    fn binary_buffer(len: usize, seed: u64) -> Vec<u8> {
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut state = seed | 1;
+        while out.len() < len {
+            // xorshift64
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.extend_from_slice(&state.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    #[tokio::test]
+    async fn binary_ranges_mutation_and_shift() {
+        let (store, _mutable, execution) = test_store_create().await.expect("test stores");
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let partition = lore_base::types::Partition::default();
+            const SIZE: usize = 1024 * 1024;
+
+            let v1 = binary_buffer(SIZE, 42);
+            // Same-length mutation of a 10 KiB slice in the middle.
+            let mut v2 = v1.clone();
+            for byte in &mut v2[500_000..510_240] {
+                *byte ^= 0xA5;
+            }
+
+            let a1 = write_blob(&store, partition, &v1).await;
+            let a2 = write_blob(&store, partition, &v2).await;
+            let (header, text) = run_diff(store.clone(), partition, a1.clone(), a2, None).await;
+            assert!(header.binary);
+            assert!(text.is_empty());
+            assert_eq!(header.size_from, SIZE as u64);
+            assert_eq!(header.size_to, SIZE as u64);
+            assert!(!header.runs_truncated);
+            assert!(!header.matched_runs.is_empty(), "chunks should re-sync");
+            // Prefix run anchors at 0/0; a gap covers the mutation.
+            let first = &header.matched_runs[0];
+            assert_eq!((first.offset_from, first.offset_to), (0, 0));
+            let matched: u64 = header.matched_runs.iter().map(|r| r.length).sum();
+            assert!(matched < SIZE as u64, "mutation must leave a gap");
+            assert!(
+                matched > SIZE as u64 / 2,
+                "most content unchanged, matched only {matched}"
+            );
+            // Same-length mutation: matched runs must not drift.
+            for run in &header.matched_runs {
+                assert_eq!(run.offset_from, run.offset_to);
+            }
+
+            // Insertion: splice bytes in mid-file; suffix runs shift by the
+            // inserted length (content-defined chunking re-syncs).
+            const INSERTED: usize = 100_000;
+            let mut v3 = v1.clone();
+            let insert = binary_buffer(INSERTED, 7);
+            v3.splice(500_000..500_000, insert);
+            let a3 = write_blob(&store, partition, &v3).await;
+            let (header, _) = run_diff(store.clone(), partition, a1, a3, None).await;
+            assert_eq!(header.size_from, SIZE as u64);
+            assert_eq!(header.size_to, (SIZE + INSERTED) as u64);
+            assert!(
+                header
+                    .matched_runs
+                    .iter()
+                    .any(|r| r.offset_to - r.offset_from == INSERTED as u64),
+                "expected a run shifted by the inserted length; runs: {:?}",
+                header
+                    .matched_runs
+                    .iter()
+                    .map(|r| (r.offset_from, r.offset_to, r.length))
+                    .collect::<Vec<_>>()
+            );
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn binary_over_input_cap_still_gets_ranges() {
+        let (store, _mutable, execution) = test_store_create().await.expect("test stores");
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let partition = lore_base::types::Partition::default();
+            // Over MAX_INPUT_BYTES: full reassembly is refused, but the
+            // chunk-table path never reads content, so ranges still flow.
+            const SIZE: usize = MAX_INPUT_BYTES as usize + 1024 * 1024;
+            let v1 = binary_buffer(SIZE, 9);
+            let mut v2 = v1.clone();
+            for byte in &mut v2[1_000_000..1_050_000] {
+                *byte ^= 0x5A;
+            }
+            let a1 = write_blob(&store, partition, &v1).await;
+            let a2 = write_blob(&store, partition, &v2).await;
+            let (header, text) = run_diff(store.clone(), partition, a1, a2, None).await;
+            assert!(header.binary, "prefix sniff must classify as binary");
+            assert!(!header.truncated);
+            assert!(text.is_empty());
+            assert_eq!(header.size_from, SIZE as u64);
+            assert_eq!(header.size_to, SIZE as u64);
+            assert!(!header.matched_runs.is_empty());
+            let matched: u64 = header.matched_runs.iter().map(|r| r.length).sum();
+            assert!(matched > SIZE as u64 / 2);
+            assert!(matched < SIZE as u64);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn binary_small_files_single_chunk() {
+        let (store, _mutable, execution) = test_store_create().await.expect("test stores");
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let partition = lore_base::types::Partition::default();
+            // Below FRAGMENT_SIZE_THRESHOLD: unfragmented, one pseudo-chunk
+            // per side; differing content → no shared runs, sizes reported.
+            let a = write_blob(&store, partition, &binary_buffer(4096, 1)).await;
+            let b = write_blob(&store, partition, &binary_buffer(4096, 2)).await;
+            let (header, _) = run_diff(store.clone(), partition, a, b, None).await;
+            assert!(header.binary);
+            assert_eq!(header.size_from, 4096);
+            assert_eq!(header.size_to, 4096);
+            assert!(header.matched_runs.is_empty());
+            assert!(!header.runs_truncated);
+        }))
+        .await;
+    }
+
+    #[test]
+    fn match_tables_coalesces_and_caps() {
+        fn chunk(hash_byte: u8, offset: u64, len: u64) -> Chunk {
+            Chunk {
+                hash: Hash::from([hash_byte; 32].as_ref()),
+                offset,
+                len,
+            }
+        }
+
+        // Adjacent equal-drift matches coalesce into one run.
+        let from = vec![chunk(1, 0, 10), chunk(2, 10, 10), chunk(3, 20, 10)];
+        let to = vec![chunk(1, 5, 10), chunk(2, 15, 10), chunk(3, 25, 10)];
+        let (runs, truncated) = match_tables(&from, &to);
+        assert!(!truncated);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            (runs[0].offset_from, runs[0].offset_to, runs[0].length),
+            (0, 5, 30)
+        );
+
+        // Non-contiguous matches stay separate runs; cap flags truncation.
+        let from: Vec<Chunk> = (0..MAX_MATCHED_RUNS as u64 + 10)
+            .map(|i| chunk((i % 251) as u8, i * 100, 10))
+            .collect();
+        // Every to-chunk matches but offsets never line up contiguously
+        // (gap between runs), forcing one run per match.
+        let to: Vec<Chunk> = (0..MAX_MATCHED_RUNS as u64 + 10)
+            .map(|i| chunk((i % 251) as u8, i * 200, 10))
+            .collect();
+        let (runs, truncated) = match_tables(&from, &to);
+        assert!(truncated);
+        assert_eq!(runs.len(), MAX_MATCHED_RUNS);
     }
 }

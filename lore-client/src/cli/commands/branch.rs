@@ -1365,15 +1365,15 @@ pub fn handle_branch_list(globals: LoreGlobalArgs, args: &BranchListArgs) -> u8 
                     }
                 }
             }
-            LoreEvent::Complete(_) => {
-                if warn_on_missing_remote && !remote_seen.load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    println!(
-                        "{}Warning: Could not query remote branch list{}",
-                        LogStyles::WARNING,
-                        anstyle::Reset,
-                    );
-                }
+            LoreEvent::Complete(_)
+                if warn_on_missing_remote
+                    && !remote_seen.load(std::sync::atomic::Ordering::Relaxed) =>
+            {
+                println!(
+                    "{}Warning: Could not query remote branch list{}",
+                    LogStyles::WARNING,
+                    anstyle::Reset,
+                );
             }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);

@@ -270,14 +270,14 @@ impl ::prost::Name for ContentDiffRequest {
 /// Server-streamed response for ContentDiff. The first message MUST carry
 /// `payload.header`; subsequent messages carry `payload.chunk`. Server MUST
 /// NOT emit a ContentDiffResponse with `payload` unset.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ContentDiffResponse {
     #[prost(oneof = "content_diff_response::Payload", tags = "1, 2")]
     pub payload: ::core::option::Option<content_diff_response::Payload>,
 }
 /// Nested message and enum types in `ContentDiffResponse`.
 pub mod content_diff_response {
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Payload {
         /// Summary stats and mode flags, computed up-front and emitted first.
         #[prost(message, tag = "1")]
@@ -300,7 +300,7 @@ impl ::prost::Name for ContentDiffResponse {
 }
 /// Header for a ContentDiff stream. Reports summary stats and short-circuit
 /// flags that may end the stream after the header.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ContentDiffHeader {
     /// Number of lines added (after any whitespace preprocessing).
     #[prost(uint64, tag = "1")]
@@ -322,6 +322,26 @@ pub struct ContentDiffHeader {
     /// Number of conflict regions in the merged text (3-way only).
     #[prost(uint32, tag = "6")]
     pub conflict_count: u32,
+    /// Binary mode only: total content size of each side in bytes
+    /// (0 = no content on that side).
+    #[prost(uint64, tag = "7")]
+    pub size_from: u64,
+    #[prost(uint64, tag = "8")]
+    pub size_to: u64,
+    /// Binary mode only: byte runs whose FastCDC chunk hashes are present in
+    /// BOTH sides, coalesced and emitted in ascending to-offset order. The
+    /// gaps between runs are the changed/inserted/deleted regions on each
+    /// side; differing `offset_from`/`offset_to` deltas expose content
+    /// shifts (insertions/deletions earlier in the file). Granularity is the
+    /// storage chunk size (~64 KiB expected); files below the fragmentation
+    /// threshold compare as a single chunk. Empty when the sides share no
+    /// chunks at this granularity.
+    #[prost(message, repeated, tag = "9")]
+    pub matched_runs: ::prost::alloc::vec::Vec<MatchedRun>,
+    /// True when the matched-run list was capped (very fragmented change);
+    /// uncovered regions must be treated as unknown rather than changed.
+    #[prost(bool, tag = "10")]
+    pub runs_truncated: bool,
 }
 impl ::prost::Name for ContentDiffHeader {
     const NAME: &'static str = "ContentDiffHeader";
@@ -331,6 +351,29 @@ impl ::prost::Name for ContentDiffHeader {
     }
     fn type_url() -> ::prost::alloc::string::String {
         "/lore.thin_client.v1.ContentDiffHeader".into()
+    }
+}
+/// A byte run present in both sides of a binary ContentDiff.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MatchedRun {
+    /// Start offset of the run in the from-side content.
+    #[prost(uint64, tag = "1")]
+    pub offset_from: u64,
+    /// Start offset of the run in the to-side content.
+    #[prost(uint64, tag = "2")]
+    pub offset_to: u64,
+    /// Length of the run in bytes.
+    #[prost(uint64, tag = "3")]
+    pub length: u64,
+}
+impl ::prost::Name for MatchedRun {
+    const NAME: &'static str = "MatchedRun";
+    const PACKAGE: &'static str = "lore.thin_client.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.thin_client.v1.MatchedRun".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.thin_client.v1.MatchedRun".into()
     }
 }
 /// A single chunk of diff text. Server picks chunk boundaries on UTF-8

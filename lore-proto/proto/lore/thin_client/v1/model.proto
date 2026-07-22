@@ -223,6 +223,32 @@ message ContentDiffHeader {
   bool has_conflicts = 5;
   // Number of conflict regions in the merged text (3-way only).
   uint32 conflict_count = 6;
+  // Binary mode only: total content size of each side in bytes
+  // (0 = no content on that side).
+  uint64 size_from = 7;
+  uint64 size_to = 8;
+  // Binary mode only: byte runs whose FastCDC chunk hashes are present in
+  // BOTH sides, coalesced and emitted in ascending to-offset order. The
+  // gaps between runs are the changed/inserted/deleted regions on each
+  // side; differing `offset_from`/`offset_to` deltas expose content
+  // shifts (insertions/deletions earlier in the file). Granularity is the
+  // storage chunk size (~64 KiB expected); files below the fragmentation
+  // threshold compare as a single chunk. Empty when the sides share no
+  // chunks at this granularity.
+  repeated MatchedRun matched_runs = 9;
+  // True when the matched-run list was capped (very fragmented change);
+  // uncovered regions must be treated as unknown rather than changed.
+  bool runs_truncated = 10;
+}
+
+// A byte run present in both sides of a binary ContentDiff.
+message MatchedRun {
+  // Start offset of the run in the from-side content.
+  uint64 offset_from = 1;
+  // Start offset of the run in the to-side content.
+  uint64 offset_to = 2;
+  // Length of the run in bytes.
+  uint64 length = 3;
 }
 
 // A single chunk of diff text. Server picks chunk boundaries on UTF-8

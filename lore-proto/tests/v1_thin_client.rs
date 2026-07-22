@@ -11,6 +11,7 @@ use lore_proto::lore::thin_client::v1::ContentDiffResponse;
 use lore_proto::lore::thin_client::v1::DiffChange;
 use lore_proto::lore::thin_client::v1::DiffConflict;
 use lore_proto::lore::thin_client::v1::DiffPartition;
+use lore_proto::lore::thin_client::v1::MatchedRun;
 use lore_proto::lore::thin_client::v1::Metadata;
 use lore_proto::lore::thin_client::v1::MetadataType;
 use lore_proto::lore::thin_client::v1::NodeType;
@@ -89,7 +90,16 @@ fn v1_thin_client_field_shapes() {
         truncated: _,
         has_conflicts: _,
         conflict_count: _,
+        size_from: _,
+        size_to: _,
+        matched_runs: _,
+        runs_truncated: _,
     } = ContentDiffHeader::default();
+    let MatchedRun {
+        offset_from: _,
+        offset_to: _,
+        length: _,
+    } = MatchedRun::default();
     let ContentDiffChunkResponse { diff: _ } = ContentDiffChunkResponse::default();
 
     // Diff vocabulary + tree

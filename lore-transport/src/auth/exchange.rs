@@ -154,6 +154,24 @@ pub async fn exchange(
         lore_debug!("Not authenticated, unable to perform authz exchange");
         return Err(NotAuthenticated.into());
     };
+
+    // Expired authn token: redeem the refresh token before exchanging,
+    // instead of sending a token the server is guaranteed to reject.
+    // Mirrors `auth_exchange_for_identity`; without this, working copies
+    // with a configured identity error out once the authn TTL passes.
+    let mut authn_token = auth_service_only_token.token;
+    if is_expired(auth_service_only_token.expires) {
+        match refresh_authentication_token(&auth_url, identity).await {
+            Some(refreshed) => {
+                lore_debug!("Refreshed expired authn token for {identity}");
+                authn_token = refreshed;
+            }
+            None => {
+                lore_debug!("Authn token expired and refresh unavailable for {identity}");
+                return Err(NotAuthenticated.into());
+            }
+        }
+    }
     lore_trace!("Authorizing using endpoint: {auth_url}");
 
     let time_start = Instant::now();
@@ -167,12 +185,7 @@ pub async fn exchange(
 
     lore_trace!("Send auth exchange request");
     let authz = auth_impl
-        .exchange_for_repository(
-            &auth_url,
-            &auth_service_only_token.token,
-            repository,
-            &correlation_id,
-        )
+        .exchange_for_repository(&auth_url, &authn_token, repository, &correlation_id)
         .await
         .map_err(|err| {
             if err.is_not_authorized() {
@@ -613,11 +626,20 @@ async fn auth_exchange_custom_resource_for_identity(
         return (String::new(), String::new(), String::new());
     };
 
+    let mut authentication_token = authentication_token;
     if let Some(info) = lore_credential::user_info_from_token(authentication_token.clone())
         && is_expired(info.expires)
     {
-        lore_debug!("Skipping identity {identity}, authn token is expired");
-        return (String::new(), String::new(), String::new());
+        match refresh_authentication_token(auth_url, identity).await {
+            Some(refreshed) => {
+                lore_debug!("Refreshed expired authn token for {identity}");
+                authentication_token = refreshed;
+            }
+            None => {
+                lore_debug!("Skipping identity {identity}, authn token is expired");
+                return (String::new(), String::new(), String::new());
+            }
+        }
     }
 
     let authorization_token =

@@ -270,9 +270,19 @@ pub fn handle_list_command(globals: LoreGlobalArgs, cli_args: &AuthListArgs) -> 
             anstyle::Reset,
             data.auth_url.as_str()
         );
-        if !data.resource.is_empty() {
+        // An entry without a resource is the stored login identity; one
+        // with a resource is a short-lived per-repository authorization
+        // token minted from it. Label them so per-repo entries do not
+        // read as duplicate identities.
+        if data.resource.is_empty() {
             println!(
-                "  {}Resource:{} {}",
+                "  {}Type:{} identity token",
+                CommonStyles::HEADERS,
+                anstyle::Reset,
+            );
+        } else {
+            println!(
+                "  {}Type:{} authorization token for repository {}",
                 CommonStyles::HEADERS,
                 anstyle::Reset,
                 data.resource.as_str()
@@ -306,11 +316,17 @@ pub fn handle_list_command(globals: LoreGlobalArgs, cli_args: &AuthListArgs) -> 
         if data.expires > 0
             && let Some(time) = DateTime::from_timestamp_millis(data.expires as i64)
         {
+            let expired = if time < chrono::Utc::now() {
+                " (expired; refreshed automatically on next use)"
+            } else {
+                ""
+            };
             println!(
-                "  {}Expires:{} {}",
+                "  {}Expires:{} {}{}",
                 CommonStyles::HEADERS,
                 anstyle::Reset,
-                time.to_rfc2822()
+                time.to_rfc2822(),
+                expired
             );
         }
         if !data.token.is_empty() {

@@ -184,16 +184,30 @@ pub async fn exchange(
     let correlation_id = String::new();
 
     lore_trace!("Send auth exchange request");
-    let authz = auth_impl
+    let mut result = auth_impl
         .exchange_for_repository(&auth_url, &authn_token, repository, &correlation_id)
-        .await
-        .map_err(|err| {
-            if err.is_not_authorized() {
-                ExchangeError::from(NotAuthorized)
-            } else {
-                ExchangeError::internal_with_context(err, "Failed to exchange token")
-            }
-        })?;
+        .await;
+
+    // Server-side rejection of a locally-fresh authn token (rotated
+    // signing key, clock skew): redeem the refresh token and retry once
+    // before surfacing the failure. The local-expiry check above cannot
+    // catch these — only the server knows the token is invalid.
+    if result.is_err()
+        && let Some(refreshed) = refresh_authentication_token(&auth_url, identity).await
+        && refreshed != authn_token
+    {
+        lore_debug!("Exchange rejected; retrying once with refreshed authn token");
+        result = auth_impl
+            .exchange_for_repository(&auth_url, &refreshed, repository, &correlation_id)
+            .await;
+    }
+    let authz = result.map_err(|err| {
+        if err.is_not_authorized() {
+            ExchangeError::from(NotAuthorized)
+        } else {
+            ExchangeError::internal_with_context(err, "Failed to exchange token")
+        }
+    })?;
 
     let token = authz.token;
     if token.is_empty() {

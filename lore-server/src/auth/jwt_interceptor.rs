@@ -35,13 +35,18 @@ impl Interceptor for JWTInterceptor {
         &mut self,
         mut request: tonic::Request<()>,
     ) -> Result<tonic::Request<()>, tonic::Status> {
-        let token = extract_bearer_token(request.metadata()).ok_or(
-            tonic::Status::unauthenticated("authorization header required"),
-        )?;
-
-        let authorization =
-            task::block_in_place(|| runtime().block_on(self.jwt_verifier.verify_token(&token)))
-                .map_err(|e| tonic::Status::permission_denied(format!("Not allowed ({e:?})")))?;
+        let authorization = match extract_bearer_token(request.metadata()) {
+            Some(token) => {
+                task::block_in_place(|| runtime().block_on(self.jwt_verifier.verify_token(&token)))
+                    .map_err(|e| tonic::Status::permission_denied(format!("Not allowed ({e:?})")))?
+            }
+            // No bearer: accept only a server-injected anonymous
+            // authorization (public repository, read-only method) from the
+            // `AnonymousReadLayer`. Clients cannot forge request extensions.
+            None => anonymous_authorization(request.extensions()).ok_or(
+                tonic::Status::unauthenticated("authorization header required"),
+            )?,
+        };
         add_auth_fields_to_current_span(&authorization);
 
         let repository = get_repository(request.metadata()).unwrap_or_default();
@@ -52,6 +57,15 @@ impl Interceptor for JWTInterceptor {
 
         Ok(request)
     }
+}
+
+/// A server-injected anonymous authorization, if the `AnonymousReadLayer`
+/// admitted this request.
+fn anonymous_authorization(extensions: &tonic::Extensions) -> Option<AuthorizationToken> {
+    extensions
+        .get::<AuthorizationToken>()
+        .filter(|authorization| crate::auth::anonymous::is_anonymous(authorization))
+        .cloned()
 }
 
 #[derive(Clone)]
@@ -72,14 +86,16 @@ impl Interceptor for JWTAuthnInterceptor {
         &mut self,
         mut request: tonic::Request<()>,
     ) -> Result<tonic::Request<()>, tonic::Status> {
-        let token = extract_bearer_token(request.metadata()).ok_or(
-            tonic::Status::unauthenticated("authorization header required"),
-        )?;
-
-        // TODO(UCS-13506): Placeholder authn verifier until separate authz flow for repository service is in place
-        let authorization =
-            task::block_in_place(|| runtime().block_on(self.jwt_verifier.verify_token(&token)))
-                .map_err(|e| tonic::Status::permission_denied(format!("Not allowed ({e:?})")))?;
+        let authorization = match extract_bearer_token(request.metadata()) {
+            // TODO(UCS-13506): Placeholder authn verifier until separate authz flow for repository service is in place
+            Some(token) => {
+                task::block_in_place(|| runtime().block_on(self.jwt_verifier.verify_token(&token)))
+                    .map_err(|e| tonic::Status::permission_denied(format!("Not allowed ({e:?})")))?
+            }
+            None => anonymous_authorization(request.extensions()).ok_or(
+                tonic::Status::unauthenticated("authorization header required"),
+            )?,
+        };
         add_auth_fields_to_current_span(&authorization);
 
         request.extensions_mut().insert(authorization);

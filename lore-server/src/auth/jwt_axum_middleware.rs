@@ -50,6 +50,21 @@ pub async fn jwt_axum_verify_authorization(
                 .body(Body::empty())
                 .unwrap()
         } else {
+            // No credentials: allow read-only (GET) access to public
+            // repositories as the anonymous principal.
+            let repository: lore_revision::lore::RepositoryId =
+                Context::from_str(params.repository_id.as_str())
+                    .unwrap_or_default()
+                    .into();
+            if request.method() == axum::http::Method::GET
+                && let Some(access) = crate::access::installed()
+                && matches!(access.is_public(repository).await, Ok(true))
+            {
+                let user_info = crate::auth::anonymous::anonymous_token(repository);
+                Span::current().record(USER_ID, &user_info.user_id);
+                request.extensions_mut().insert(Some(user_info));
+                return next.run(request).await;
+            }
             Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
                 .body(Body::empty())

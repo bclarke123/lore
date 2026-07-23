@@ -44,6 +44,8 @@ pub async fn handler(
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .map(|s| s.to_string());
+    let authorization =
+        crate::auth::anonymous::effective_authorization(authorization, request.extensions());
     let req = request.into_inner();
 
     let Some(query) = req.query else {
@@ -219,14 +221,21 @@ pub(crate) async fn check_repository_query_authorization(
 
     if let Some(access) = crate::access::installed() {
         // Internal callers (create/delete existence probes) pass no
-        // authorization; real requests always carry a bearer past the
-        // interceptor.
-        if authorization.is_none() {
-            return Ok(());
-        }
-        return access
-            .check_visibility(authorization.as_deref(), repository_id)
-            .await;
+        // authorization; real requests always carry a bearer — or the
+        // anonymous sentinel — past the interceptor.
+        return match authorization.as_deref() {
+            None => Ok(()),
+            Some(crate::auth::anonymous::ANONYMOUS_AUTHORIZATION) => {
+                match access.is_public(repository_id).await {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(Status::permission_denied(
+                        "Not authorized for this repository",
+                    )),
+                    Err(e) => Err(Status::internal(format!("Access check failed: {e}"))),
+                }
+            }
+            Some(bearer) => access.check_visibility(Some(bearer), repository_id).await,
+        };
     }
     let Some(auth_url) = auth_url else {
         return Ok(());

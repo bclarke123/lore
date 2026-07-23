@@ -40,7 +40,7 @@ AUTH_CONFIG_TEMPLATE = """
 
 # Appended by test_access_control.py: server-local auth + access control.
 [environment.endpoint]
-auth_url = "ucs-auth://localhost:{grpc_port}"
+auth_url = "ucs-auth-insecure://localhost:{grpc_port}"
 
 [server.auth]
 server_admins = ["root@example.com"]
@@ -82,8 +82,11 @@ email = "root@example.com"
 def access_server(request, tmp_path_factory):
     ports = {
         "http": allocate_free_port(),
-        "grpc": allocate_free_port(),
-        "quic": allocate_free_port(),
+        # gRPC (TCP) and QUIC (UDP) share a port number, like production:
+        # `lore://host:port` reaches the environment endpoint over gRPC on
+        # the same port the QUIC data plane listens on.
+        "grpc": (shared := allocate_free_port()),
+        "quic": shared,
         "internal": allocate_free_port(),
     }
     server_root, server_env = generate_server_config(request, tmp_path_factory, ports)
@@ -104,6 +107,7 @@ def access_server(request, tmp_path_factory):
     yield {
         "grpc": f"127.0.0.1:{ports['grpc']}",
         "http": f"http://localhost:{ports['http']}",
+        "quic": str(ports["quic"]),
     }
     _kill_server_by_pid(server_proc.pid, server_log_path, label="access server")
     server_log_fd.close()
@@ -248,7 +252,7 @@ def test_cli_grant_revoke_list(
     access_server, tokens, lore_executable_path, tmp_path_factory
 ):
     remote = f"grpc://localhost:{access_server['grpc'].split(':')[1]}"
-    auth_url = f"ucs-auth://localhost:{access_server['grpc'].split(':')[1]}"
+    auth_url = f"ucs-auth-insecure://localhost:{access_server['grpc'].split(':')[1]}"
     repo_id = PROJECT1.removeprefix("urc-")
 
     # alice becomes admin of the repository and logs the CLI in.
@@ -358,3 +362,258 @@ def test_cli_grant_revoke_list(
     )
     assert again.returncode == 0
     assert "No grant existed" in again.stdout
+
+
+# --- Public repositories (the `*` grant + anonymous reads) ---------------
+
+PROJECT3 = "urc-54006a8ca619475881f7083d625a7947"
+
+_BRANCH_LIST = "/urc.rpc.RevisionService/BranchList"
+_BRANCH_PUSH = "/urc.rpc.RevisionService/BranchPush"
+
+
+def _tokenless_call(server, method: str, resource: str) -> grpc.StatusCode:
+    """Invoke a data-plane method with no credentials, returning the status
+    code (OK when the call succeeds past auth)."""
+    repo_hex = resource.removeprefix("urc-")
+    with grpc.insecure_channel(server["grpc"]) as channel:
+        callable_ = channel.unary_unary(
+            method,
+            request_serializer=lambda payload: payload,
+            response_deserializer=lambda payload: payload,
+        )
+        try:
+            callable_(
+                b"", metadata=[("urc-repository-id-bin", bytes.fromhex(repo_hex))]
+            )
+        except grpc.RpcError as error:
+            return error.code()
+    return grpc.StatusCode.OK
+
+
+def test_public_grant_allows_anonymous_reads(
+    access_server, tokens, lore_executable_path, tmp_path_factory
+):
+    remote = f"grpc://localhost:{access_server['grpc'].split(':')[1]}"
+    auth_url = f"ucs-auth-insecure://localhost:{access_server['grpc'].split(':')[1]}"
+    repo_id = PROJECT3.removeprefix("urc-")
+
+    # alice registers the repository and logs the CLI in.
+    rebac_create_resource(access_server["grpc"], tokens["alice"], PROJECT3, "project3")
+    alice_dir = tmp_path_factory.mktemp("alice-public-auth")
+    login = lore_cli(
+        lore_executable_path,
+        alice_dir,
+        "auth",
+        "login",
+        "--token-type",
+        "lore",
+        "--token",
+        tokens["alice"],
+        "--auth-url",
+        auth_url,
+    )
+    assert login.returncode == 0, login.stderr
+
+    # Private: anonymous data-plane reads are rejected at the interceptor,
+    # and bob cannot exchange.
+    assert (
+        _tokenless_call(access_server, _BRANCH_LIST, PROJECT3)
+        == grpc.StatusCode.UNAUTHENTICATED
+    )
+    with pytest.raises(grpc.RpcError):
+        exchange_for_resources(access_server["grpc"], tokens["bob"], [PROJECT3])
+
+    # The public principal only accepts the read role.
+    for role in ("write", "admin"):
+        denied = lore_cli(
+            lore_executable_path,
+            alice_dir,
+            "access",
+            "grant",
+            "*",
+            role,
+            repo_id,
+            "--remote-url",
+            remote,
+        )
+        assert denied.returncode != 0, f"public {role} grant should be refused"
+
+    # Make it public.
+    grant = lore_cli(
+        lore_executable_path,
+        alice_dir,
+        "access",
+        "grant",
+        "*",
+        "read",
+        repo_id,
+        "--remote-url",
+        remote,
+    )
+    assert grant.returncode == 0, grant.stderr + grant.stdout
+
+    # Any authenticated user may now exchange, with read-only verbs.
+    authz = exchange_for_resources(access_server["grpc"], tokens["bob"], [PROJECT3])
+    claims = decode_jwt_claims(authz.user_token)
+    assert claims["resources"][0]["permission"] == ["read"]
+
+    # Anonymous reads pass auth (the call fails later or not at all, but
+    # is no longer rejected as unauthenticated)...
+    assert _tokenless_call(access_server, _BRANCH_LIST, PROJECT3) not in (
+        grpc.StatusCode.UNAUTHENTICATED,
+        grpc.StatusCode.PERMISSION_DENIED,
+    )
+    # ...while anonymous writes stay rejected: mutating methods are not on
+    # the anonymous allowlist.
+    assert (
+        _tokenless_call(access_server, _BRANCH_PUSH, PROJECT3)
+        == grpc.StatusCode.UNAUTHENTICATED
+    )
+
+    # The listing shows the public grant.
+    listing = lore_cli(
+        lore_executable_path,
+        alice_dir,
+        "access",
+        "list",
+        repo_id,
+        "--remote-url",
+        remote,
+        "--json",
+    )
+    assert listing.returncode == 0, listing.stderr + listing.stdout
+    grants = {entry["principal"]: entry["role"] for entry in json.loads(listing.stdout)}
+    assert grants["*"] == "read"
+
+    # Revoking `*` restores deny-by-default for bob and anonymous callers.
+    revoke = lore_cli(
+        lore_executable_path,
+        alice_dir,
+        "access",
+        "revoke",
+        "*",
+        repo_id,
+        "--remote-url",
+        remote,
+    )
+    assert revoke.returncode == 0, revoke.stderr + revoke.stdout
+    with pytest.raises(grpc.RpcError) as error:
+        exchange_for_resources(access_server["grpc"], tokens["bob"], [PROJECT3])
+    assert error.value.code() == grpc.StatusCode.PERMISSION_DENIED
+    assert (
+        _tokenless_call(access_server, _BRANCH_LIST, PROJECT3)
+        == grpc.StatusCode.UNAUTHENTICATED
+    )
+
+
+def test_anonymous_clone_of_public_repo(
+    access_server, tokens, lore_executable_path, tmp_path_factory
+):
+    """End-to-end: a client that has NEVER logged in can clone a public
+    repository, and loses access when the public grant is revoked."""
+    from lore import Lore
+
+    grpc_port = access_server["grpc"].split(":")[1]
+    remote = f"grpc://localhost:{grpc_port}/"
+    remote_flag = f"grpc://localhost:{grpc_port}"
+    auth_url = f"ucs-auth-insecure://localhost:{grpc_port}"
+
+    # root (server admin) logs in and publishes a repository with content.
+    root_global = str(tmp_path_factory.mktemp("root-global"))
+    login = lore_cli(
+        lore_executable_path,
+        root_global,
+        "auth",
+        "login",
+        "--token-type",
+        "lore",
+        "--token",
+        tokens["root"],
+        "--auth-url",
+        auth_url,
+    )
+    assert login.returncode == 0, login.stderr
+
+    src = Lore(
+        lore_executable_path=lore_executable_path,
+        path=str(tmp_path_factory.mktemp("public-src") / "pubclone"),
+        name="pubclone",
+        global_dir=root_global,
+        environment_vars={"LORE_AUTH_STORE": "fallback"},
+        remote_url=remote,
+    )
+    with src.open_file("hello.txt", "w+") as f:
+        f.write("public content\n")
+    src.stage(scan=True, offline=True)
+    src.commit("Public seed", offline=True)
+    src.push()
+
+    grant = lore_cli(
+        lore_executable_path,
+        root_global,
+        "access",
+        "grant",
+        "*",
+        "read",
+        "pubclone",
+        "--remote-url",
+        remote_flag,
+    )
+    assert grant.returncode == 0, grant.stderr + grant.stdout
+
+    # A brand-new client with an empty auth store clones anonymously.
+    anon_global = str(tmp_path_factory.mktemp("anon-global"))
+    anon_seed = Lore(
+        lore_executable_path=lore_executable_path,
+        path=str(tmp_path_factory.mktemp("anon-work") / "seed"),
+        name="pubclone",
+        global_dir=anon_global,
+        environment_vars={"LORE_AUTH_STORE": "fallback"},
+        remote_url=remote,
+        remote_path=remote + "pubclone",
+        create_repo=False,
+    )
+    cloned = anon_seed.clone(name="anon-clone")
+    import os
+
+    assert os.path.isfile(os.path.join(cloned.path, "hello.txt")), (
+        "anonymous clone should materialize public content"
+    )
+
+    # The same clone over the stock `lore://` scheme (QUIC transport) —
+    # the flow a user gets from `lore clone lore://host/repo` with no login.
+    quic_remote = f"lore://localhost:{access_server['quic']}/"
+    anon_quic = Lore(
+        lore_executable_path=lore_executable_path,
+        path=str(tmp_path_factory.mktemp("anon-quic") / "seed"),
+        name="pubclone",
+        global_dir=anon_global,
+        environment_vars={"LORE_AUTH_STORE": "fallback"},
+        remote_url=quic_remote,
+        remote_path=quic_remote + "pubclone",
+        create_repo=False,
+    )
+    quic_cloned = anon_quic.clone(name="anon-quic-clone")
+    assert os.path.isfile(os.path.join(quic_cloned.path, "hello.txt")), (
+        "anonymous lore:// (QUIC) clone should materialize public content"
+    )
+
+    # Revoke the public grant: anonymous access is gone again.
+    revoke = lore_cli(
+        lore_executable_path,
+        root_global,
+        "access",
+        "revoke",
+        "*",
+        "pubclone",
+        "--remote-url",
+        remote_flag,
+    )
+    assert revoke.returncode == 0, revoke.stderr + revoke.stdout
+    denied = anon_seed.clone(name="anon-clone-denied", check=False)
+    result = denied.last_output if hasattr(denied, "last_output") else None
+    # The clone command must fail; probe by checking no content arrived.
+    assert not os.path.isfile(os.path.join(denied.path, "hello.txt")), (
+        f"clone of a private repo without credentials must fail: {result}"
+    )

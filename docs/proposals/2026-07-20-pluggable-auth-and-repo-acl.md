@@ -5,7 +5,7 @@ authors:
   - Ben Clarke
 status: Draft
 created: 2026-07-20
-updated: 2026-07-20
+updated: 2026-07-22
 discussion: <GitHub Issue link — to be filed before review>
 ---
 
@@ -14,6 +14,8 @@ discussion: <GitHub Issue link — to be filed before review>
 ## Summary
 
 This proposal makes Lore Server an authentication endpoint in its own right: it implements the auth-session gRPC service the client already speaks, delegates identity verification to a pluggable `AuthProvider` (Google and Amazon Cognito via standard OIDC, plus a static provider for development and CI), and mints its own short-lived JWTs so the rest of the system never depends on identity-provider-specific token shapes. On top of that identity foundation, it adds per-repository access control — `read`, `write`, and `admin` roles granted per user per repository, deny-by-default, persisted in the existing mutable/immutable store, and administered through a new `lore access` CLI backed by a new gRPC service. Deployments that leave auth unconfigured behave exactly as today.
+
+A complete working implementation of this design exists and has been exercised for several weeks against unmodified stock clients (interactive login, per-repo authorization, refresh, external-token exchange from a delegated web application): `<fork branch link — to be filled in when the LEP PR is opened>`. The proposal is submitted for design review ahead of splitting that implementation into reviewable PRs.
 
 ## Motivation
 
@@ -119,6 +121,12 @@ Verification of self-minted tokens reuses the existing machinery: a `LocalJwkSer
 
 Refresh: login also issues an opaque refresh token (random 256-bit value, stored server-side as a hash with rotation-on-use and reuse-detection revocation). The client already stores refresh tokens (`lore-credential/src/token_store.rs`) and the `Authentication` trait already declares `refresh_authentication`; this proposal implements the server side (`RefreshAuthSession`) and wires the dormant client seam into the token-exchange path, falling back to "please run `lore auth login`" — and to today's exact behavior when a server answers `Unimplemented`.
 
+### External token exchange (delegated web applications)
+
+Web applications built on top of a Lore server (forges, dashboards, CI portals) authenticate users with their own OAuth client and receive IdP-issued ID tokens whose `aud` is the *application's* client ID, not the server's. To let such applications obtain Lore identities without proxying the whole browser flow through the server, the server also implements the existing `ExchangeExternalTokenForUserToken` RPC: it verifies an externally-obtained OIDC ID token (signature against the provider's JWKS, issuer, expiry) and mints the same server-local user token that interactive login produces, for the same canonical `<idp>:<subject>` identity.
+
+Acceptable audiences are an explicit allow-list: a new `trusted_external_audiences` field on the provider configuration. A token whose `aud` is not listed is rejected, so operators opt in to each delegated application deliberately. `nonce` validation is skipped for exchanged tokens (the `nonce` claim belongs to the delegating application's own flow); everything downstream — minting, claims, authorization, refresh — is identical to interactive login, and the identity is the same subject regardless of which door it arrived through.
+
 ### Per-repository access control
 
 **Model.** Three roles per repository, mapped onto the permission verbs the codebase already checks (`lore-server/src/grpc/mod.rs`; system-design §17.4):
@@ -148,6 +156,20 @@ lore access list   <repo> [--json]
 ```
 
 Admins may identify users by email; the server resolves and pins the email to the canonical `<idp>:<subject>` at the user's first login.
+
+### Public repositories
+
+A repository may be marked **public** by granting the reserved principal `*` the `read` role (`lore access grant '*' read <repo>`; revoke to make it private again). The grant lives in the same per-repository grant blob as ordinary grants, so it is administered, listed, cached, and cleaned up on deletion identically. Two invariants are enforced at grant time: `*` may only hold `read`, and `*` is refused on the server-level (global) grant set.
+
+Semantics:
+
+- **Any authenticated user** implicitly holds at least `read` on a public repository: principal matching falls back to the `*` grant, so token exchange, permission checks, and repository listing all include public repositories with no further changes. An explicit stronger grant still wins.
+- **Anonymous (credential-less) callers** may read public repositories. The data-plane token gates admit requests with no bearer token when — and only when — the target repository carries the `*` grant *and* the operation is read-only:
+  - gRPC: an `AnonymousReadLayer` ahead of the JWT interceptors checks the method against an explicit read-only allowlist plus the repository id metadata, then injects a synthesized server-side authorization (principal `anonymous`, verb `read`) that the interceptors honor in place of a bearer. Repository-lookup methods (`RepositoryQuery`/`RepositoryGet`) are admitted with an authn-only anonymous token; the handlers themselves require the *resolved* repository to be public.
+  - QUIC (v4): `AuthorizeStart` with an empty token establishes an `anonymous` session on public repositories; the command dispatcher rejects every non-read command for such sessions. The v2 storage protocol stays strict (token always required).
+  - HTTP: `GET` requests on public repositories proceed as `anonymous`; everything else keeps requiring a bearer.
+  Because verb enforcement is presence-only today (see `enforce_permission_verbs` above), the read-only allowlists **are** the write-protection boundary for anonymous callers and must be curated accordingly.
+- The stock client connects without credentials when it has no stored identity for a server that advertises an `auth_url` (instead of failing up-front), so `lore clone` of a public repository works logged-out; private repositories fail with the server's authentication error.
 
 ### Configuration
 
@@ -270,3 +292,4 @@ Require operators to deploy a broker that normalizes IdPs and issues Lore-compat
 - Signing algorithm: the implementation ships Ed25519 (EdDSA) — the simplest correct choice with the in-tree `ring` backend, published as an RFC 8037 OKP JWK. Should ES256 be offered as an alternative for verifiers without EdDSA support?
 - Should `enforce_permission_verbs` eventually default on in external-JWKS mode after a deprecation window, and what telemetry gates that?
 - Grant-propagation latency: is a short-TTL access-store cache (bounded by the 60-second exchange cadence) acceptable, or must revocation be immediate (cache-bypass on revoke)?
+- Public-repository listing inflation: `authorized_repositories` now returns every public repository to every authenticated user; is that acceptable at scale, or should public repositories be paginated/segregated in lookup responses?

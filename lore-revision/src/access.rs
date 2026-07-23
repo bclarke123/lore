@@ -33,6 +33,13 @@ const GRANTS_FIELD: &str = "grants";
 /// Attempts before giving up on a compare-and-swap race.
 const CAS_ATTEMPTS: usize = 8;
 
+/// Reserved principal marking a repository as public: any caller —
+/// authenticated or anonymous — receives at least this grant's role. Public
+/// grants are restricted to [`AccessRole::Read`] and are not permitted on
+/// the server-level (default) repository id; enforcement lives in the
+/// server's `AccessControl`.
+pub const PUBLIC_PRINCIPAL: &str = "*";
+
 /// A role granted to a principal on a repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

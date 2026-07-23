@@ -178,18 +178,32 @@ impl QuicService for StorageServiceV4 {
                     })?;
 
                     if token_str.is_empty() {
-                        return Err(MessageHandleError::MissingToken);
+                        // No credentials: allow a read-only anonymous
+                        // session on public repositories; the command
+                        // dispatch below rejects mutations for it.
+                        let public = match crate::access::installed() {
+                            Some(access) => access.is_public(repository).await.map_err(|err| {
+                                MessageHandleError::AuthorizationFailure(err.to_string())
+                            })?,
+                            None => false,
+                        };
+                        if !public {
+                            return Err(MessageHandleError::MissingToken);
+                        }
+                        user_id = crate::auth::anonymous::ANONYMOUS_USER.to_string();
+                    } else {
+                        let authorization =
+                            jwt_verifier.verify_token(&token_str).await.map_err(|err| {
+                                MessageHandleError::AuthorizationFailure(err.to_string())
+                            })?;
+
+                        crate::auth::jwt::verify_authorization(&authorization, repository)
+                            .map_err(|err| {
+                                MessageHandleError::AuthorizationFailure(err.to_string())
+                            })?;
+
+                        user_id = crate::util::get_user_id_from_token(Some(authorization));
                     }
-
-                    let authorization = jwt_verifier
-                        .verify_token(&token_str)
-                        .await
-                        .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
-
-                    crate::auth::jwt::verify_authorization(&authorization, repository)
-                        .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
-
-                    user_id = crate::util::get_user_id_from_token(Some(authorization));
                 }
 
                 let session_map = self.session_map.clone();
@@ -242,6 +256,24 @@ impl QuicService for StorageServiceV4 {
                     tracing::warn!("Failed to parse v4 storage command: {err}");
                     MessageHandleError::InternalError
                 })?;
+
+                // Anonymous sessions (public repositories) are read-only;
+                // token verb enforcement is presence-only, so this gate is
+                // what keeps anonymous callers from mutating public
+                // repositories.
+                if user_id == crate::auth::anonymous::ANONYMOUS_USER
+                    && !matches!(
+                        parsed,
+                        crate::quic::storage_service::ParsedStorageRequest::Get(_)
+                            | crate::quic::storage_service::ParsedStorageRequest::GetMetadata(_)
+                            | crate::quic::storage_service::ParsedStorageRequest::Query(_)
+                            | crate::quic::storage_service::ParsedStorageRequest::MutableLoad(_)
+                    )
+                {
+                    return Err(MessageHandleError::AuthorizationFailure(
+                        "anonymous access is read-only".to_string(),
+                    ));
+                }
 
                 // Dispatch to standalone handler functions with explicit session context
                 let response = match parsed {

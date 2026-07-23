@@ -228,7 +228,12 @@ async fn connect_impl(
                 if has_identities {
                     return Err(ProtocolError::from(lore_base::error::NotAuthorized));
                 }
-                return Err(ProtocolError::from(lore_base::error::NotAuthenticated));
+                // Never logged in: proceed without credentials. Public
+                // repositories are readable anonymously; anything else is
+                // rejected by the server with a hint to `lore login`.
+                lore_debug!(
+                    "No credentials for {auth_url}; connecting to {remote_url} anonymously"
+                );
             }
         } else {
             lore_credential::token_store::load_user_token(
@@ -286,7 +291,11 @@ async fn connect_impl(
             lore_trace!("Connecting to {endpoint_description}");
 
             if !repository.is_zero() {
-                if !auth_url.is_empty() {
+                if auth_url.is_empty() || identity.is_empty() {
+                    // Open server, or anonymous connection to a public
+                    // repository: nothing to exchange.
+                    lore_debug!("No token exchange for {endpoint_description}");
+                } else {
                     lore_trace!("Token exchange for identity {identity} for {auth_url}");
                     if let Err(err) =
                         auth::exchange::exchange(&auth_url, &identity, repository, remote_domain)
@@ -300,8 +309,6 @@ async fn connect_impl(
                         connection.repository_ready.complete(Err(err));
                         return;
                     }
-                } else {
-                    lore_debug!("Unauthenticated server, no token exchange");
                 }
             }
 

@@ -76,17 +76,23 @@ use crate::legacy::rpc::storage_service_server::StorageServiceServer;
 // Copy and paste from the rust compiler for sanity
 type GrpcRouter = tonic::transport::server::Router<
     Stack<
-        GrpcResponseTraceLayer,
+        crate::auth::anonymous::AnonymousReadLayer,
         Stack<
-            ServiceBuilder<Stack<GrpcMetricsLayer, tower::layer::util::Identity>>,
+            GrpcResponseTraceLayer,
             Stack<
-                LoreTracingLayer,
+                ServiceBuilder<Stack<GrpcMetricsLayer, tower::layer::util::Identity>>,
                 Stack<
+                    LoreTracingLayer,
                     Stack<
-                        TraceLayer<SharedClassifier<GrpcErrorsAsFailures>, MakeCorrelationIdSpan>,
-                        CorrelationIdLayer,
+                        Stack<
+                            TraceLayer<
+                                SharedClassifier<GrpcErrorsAsFailures>,
+                                MakeCorrelationIdSpan,
+                            >,
+                            CorrelationIdLayer,
+                        >,
+                        tower::layer::util::Identity,
                     >,
-                    tower::layer::util::Identity,
                 >,
             >,
         >,
@@ -604,7 +610,12 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             )
             .layer(LoreTracingLayer {})
             .layer(metrics_layer)
-            .layer(GrpcResponseTraceLayer {});
+            .layer(GrpcResponseTraceLayer {})
+            // Grants anonymous read access to public repositories by
+            // injecting a synthesized authorization the JWT interceptors
+            // honor; inert for requests carrying a bearer token or when
+            // access control is not installed.
+            .layer(crate::auth::anonymous::AnonymousReadLayer);
 
         let mut router = router.add_service(AdminServiceServer::new(admin_svc));
 

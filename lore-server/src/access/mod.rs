@@ -23,6 +23,7 @@ use std::time::Instant;
 
 use lore_revision::access::AccessGrants;
 pub use lore_revision::access::AccessRole;
+pub use lore_revision::access::PUBLIC_PRINCIPAL;
 use lore_revision::lore::RepositoryId;
 use parking_lot::Mutex;
 use thiserror::Error;
@@ -56,6 +57,8 @@ pub fn installed() -> Option<Arc<AccessControl>> {
 pub enum AccessError {
     #[error("Access store operation failed: {0}")]
     Store(String),
+    #[error("Invalid grant: {0}")]
+    InvalidGrant(String),
 }
 
 /// The identities a caller may be granted under: the canonical user id
@@ -76,6 +79,9 @@ impl Principals {
         self.0
             .iter()
             .filter_map(|principal| grants.get(principal))
+            // A public grant applies to every caller; an explicit stronger
+            // grant still wins via `max`.
+            .chain(grants.get(PUBLIC_PRINCIPAL))
             .copied()
             .max()
     }
@@ -206,12 +212,32 @@ impl AccessControl {
         Ok(principals.matches(&self.grants(repository).await?))
     }
 
+    /// Whether the repository carries the public (`*`) read grant.
+    pub async fn is_public(&self, repository: RepositoryId) -> Result<bool, AccessError> {
+        Ok(self
+            .grants(repository)
+            .await?
+            .contains_key(PUBLIC_PRINCIPAL))
+    }
+
     pub async fn grant(
         &self,
         repository: RepositoryId,
         principal: &str,
         role: AccessRole,
     ) -> Result<(), AccessError> {
+        if principal == PUBLIC_PRINCIPAL {
+            if role != AccessRole::Read {
+                return Err(AccessError::InvalidGrant(format!(
+                    "the public principal '{PUBLIC_PRINCIPAL}' may only hold the read role"
+                )));
+            }
+            if repository == RepositoryId::default() {
+                return Err(AccessError::InvalidGrant(format!(
+                    "the public principal '{PUBLIC_PRINCIPAL}' cannot hold a server-level grant"
+                )));
+            }
+        }
         let principal = principal.to_string();
         Self::scoped(lore_revision::access::modify_grants(
             self.context(repository),
@@ -570,6 +596,82 @@ mod tests {
             preferred_username: email.to_string(),
             ..AuthorizationToken::default()
         }
+    }
+
+    #[tokio::test]
+    async fn public_grant_makes_repository_readable_by_anyone() {
+        let (access, execution) = access_with_admins(vec![]).await;
+        Box::pin(
+            lore_base::runtime::LORE_CONTEXT.scope(execution, async move {
+                let project = repo("0194b726b34e72b0b45550b88a967076");
+                let stranger = principals("google:stranger", "stranger@example.com");
+                let carol = principals("google:carol", "carol@example.com");
+
+                assert!(!access.is_public(project).await.expect("is_public"));
+                assert_eq!(
+                    access.role_for(&stranger, project).await.expect("role"),
+                    None
+                );
+
+                access
+                    .grant(project, PUBLIC_PRINCIPAL, AccessRole::Read)
+                    .await
+                    .expect("grant");
+                assert!(access.is_public(project).await.expect("is_public"));
+                assert_eq!(
+                    access.role_for(&stranger, project).await.expect("role"),
+                    Some(AccessRole::Read)
+                );
+
+                // An explicit stronger grant still wins over the public one.
+                access
+                    .grant(project, "google:carol", AccessRole::Write)
+                    .await
+                    .expect("grant");
+                assert_eq!(
+                    access.role_for(&carol, project).await.expect("role"),
+                    Some(AccessRole::Write)
+                );
+
+                // Revoking the public grant restores deny-by-default.
+                assert!(
+                    access
+                        .revoke(project, PUBLIC_PRINCIPAL)
+                        .await
+                        .expect("revoke")
+                );
+                assert!(!access.is_public(project).await.expect("is_public"));
+                assert_eq!(
+                    access.role_for(&stranger, project).await.expect("role"),
+                    None
+                );
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn public_grant_validation() {
+        let (access, execution) = access_with_admins(vec![]).await;
+        Box::pin(
+            lore_base::runtime::LORE_CONTEXT.scope(execution, async move {
+                let project = repo("0194b726b34e72b0b45550b88a967076");
+
+                for role in [AccessRole::Write, AccessRole::Admin] {
+                    assert!(matches!(
+                        access.grant(project, PUBLIC_PRINCIPAL, role).await,
+                        Err(AccessError::InvalidGrant(_))
+                    ));
+                }
+                assert!(matches!(
+                    access
+                        .grant(RepositoryId::default(), PUBLIC_PRINCIPAL, AccessRole::Read)
+                        .await,
+                    Err(AccessError::InvalidGrant(_))
+                ));
+            }),
+        )
+        .await;
     }
 
     #[test]

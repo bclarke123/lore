@@ -130,7 +130,12 @@ impl AccessService for LoreAccessService {
                 access
                     .grant(repository, req.principal.trim(), role)
                     .await
-                    .map_err(|e| Status::internal(format!("Failed to store grant: {e}")))?;
+                    .map_err(|e| match e {
+                        crate::access::AccessError::InvalidGrant(reason) => {
+                            Status::invalid_argument(reason)
+                        }
+                        e => Status::internal(format!("Failed to store grant: {e}")),
+                    })?;
                 Ok(Response::new(AccessGrantResponse {}))
             })
             .await

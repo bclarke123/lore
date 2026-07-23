@@ -49,6 +49,8 @@ pub async fn handler(
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .map(|s| s.to_string());
+    let authorization =
+        crate::auth::anonymous::effective_authorization(authorization, request.extensions());
     let req = request.into_inner();
 
     let Some(query) = req.query else {

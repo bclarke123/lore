@@ -72,7 +72,9 @@ impl TargetArgs {
 
 #[derive(Args)]
 pub struct AccessGrantArgs {
-    /// User to grant to: canonical id (`<idp>:<subject>`) or email.
+    /// User to grant to: canonical id (`<idp>:<subject>`) or email. The
+    /// reserved principal `*` marks the repository public: readable by
+    /// anyone, including anonymous clients (role must be `read`).
     #[clap(value_name = "user")]
     principal: String,
     /// Role to grant.
@@ -84,7 +86,8 @@ pub struct AccessGrantArgs {
 
 #[derive(Args)]
 pub struct AccessRevokeArgs {
-    /// User whose grant to remove.
+    /// User whose grant to remove (`*` to make the repository private
+    /// again).
     #[clap(value_name = "user")]
     principal: String,
     #[command(flatten)]

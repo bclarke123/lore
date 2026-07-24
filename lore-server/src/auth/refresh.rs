@@ -6,9 +6,15 @@
 //! every refresh. The server stores only a hash of each token, mapping to a
 //! record blob (identity, family, expiry) via the mutable/immutable store
 //! pattern. Tokens rotate on use: refreshing marks the presented token
-//! `rotated` and issues a successor in the same *family*. Presenting a
-//! rotated token again is treated as theft — the family's active token is
-//! revoked so neither party can continue.
+//! `rotated` and issues a successor in the same *family*.
+//!
+//! Reuse of a rotated token has two interpretations. Within a short grace
+//! window it is a *racing legitimate client* — several processes sharing
+//! one credential store (CLI + desktop app + editor plugin) can present
+//! the same token concurrently — and the replay idempotently returns the
+//! same successor so all racers converge on one token. After the window
+//! it is treated as theft: the family's active token is revoked so
+//! neither party can continue.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -70,6 +76,16 @@ struct RefreshRecord {
     /// Set when this token has been rotated away; presenting it again is
     /// reuse.
     rotated: bool,
+    /// When the rotation happened (ms since epoch; 0 = never). Old records
+    /// deserialize to 0, which reads as "grace long expired" — safe.
+    #[serde(default)]
+    rotated_at_ms: u64,
+    /// The successor issued at rotation, returned verbatim to replays
+    /// inside the grace window. A stored raw token, but a short-lived one:
+    /// it is itself rotated away on first use, so a store read leaks at
+    /// most one already-spent generation.
+    #[serde(default)]
+    successor: Option<String>,
 }
 
 impl RefreshRecord {
@@ -99,10 +115,17 @@ fn random_token() -> String {
     )
 }
 
+/// How long a rotated token keeps answering with its successor before
+/// reuse reads as theft. Long enough to cover a slow racing client's
+/// round trip, short enough that a genuinely stolen token is useless
+/// minutes later.
+const REUSE_GRACE_MS: u64 = 60_000;
+
 pub struct RefreshTokenStore {
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     ttl_ms: u64,
+    reuse_grace_ms: u64,
 }
 
 impl RefreshTokenStore {
@@ -115,7 +138,14 @@ impl RefreshTokenStore {
             immutable_store,
             mutable_store,
             ttl_ms: ttl_seconds.saturating_mul(1000),
+            reuse_grace_ms: REUSE_GRACE_MS,
         }
+    }
+
+    #[cfg(test)]
+    fn with_reuse_grace_ms(mut self, grace_ms: u64) -> Self {
+        self.reuse_grace_ms = grace_ms;
+        self
     }
 
     fn context(&self) -> Arc<lore_revision::repository::RepositoryContext> {
@@ -206,6 +236,8 @@ impl RefreshTokenStore {
             family: family.clone(),
             expires_ms: now_ms() + self.ttl_ms,
             rotated: false,
+            rotated_at_ms: 0,
+            successor: None,
         };
         let key = self.token_key(&token);
         self.store_record(key, &record).await?;
@@ -223,7 +255,20 @@ impl RefreshTokenStore {
         };
 
         if record.rotated {
-            // Reuse of a rotated token: someone replayed an old value.
+            // Within the grace window this is a racing legitimate client
+            // (several processes share one credential store); replaying
+            // idempotently returns the same successor so everyone
+            // converges on one token instead of killing the session.
+            if now_ms() < record.rotated_at_ms.saturating_add(self.reuse_grace_ms)
+                && let Some(successor) = record.successor.clone()
+            {
+                info!(
+                    idp = record.idp,
+                    "Rotated refresh token replayed within grace; returning successor"
+                );
+                return Ok((record.identity(), successor));
+            }
+            // Past the grace window someone replayed an old value.
             // Revoke the family's active token so the session dies for
             // everyone holding pieces of it.
             warn!(
@@ -271,6 +316,8 @@ impl RefreshTokenStore {
         let successor_key = self.token_key(&successor);
         let successor_record = RefreshRecord {
             rotated: false,
+            rotated_at_ms: 0,
+            successor: None,
             expires_ms: now_ms() + self.ttl_ms,
             ..record.clone()
         };
@@ -279,6 +326,8 @@ impl RefreshTokenStore {
             .await?;
         let identity = record.identity();
         record.rotated = true;
+        record.rotated_at_ms = now_ms();
+        record.successor = Some(successor.clone());
         self.store_record(key, &record).await?;
 
         info!(idp = identity.idp, "Refresh token rotated");
@@ -358,8 +407,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reuse_revokes_the_family() {
+    async fn concurrent_replay_within_grace_converges_on_one_successor() {
         let (store, execution) = store(3600).await;
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let token = store.issue(&identity()).await.expect("issue");
+            let (_, successor) = store.refresh(&token).await.expect("refresh");
+
+            // A racing process replays the same token: same successor, no
+            // revocation — both processes now hold the same live token.
+            let (_, replayed) = store.refresh(&token).await.expect("replay in grace");
+            assert_eq!(replayed, successor);
+            store
+                .refresh(&successor)
+                .await
+                .expect("family survives the race");
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reuse_revokes_the_family() {
+        // Grace 0 = every replay is past the window (the theft path).
+        let (store, execution) = store(3600).await;
+        let store = store.with_reuse_grace_ms(0);
         Box::pin(LORE_CONTEXT.scope(execution, async move {
             let token = store.issue(&identity()).await.expect("issue");
             let (_, successor) = store.refresh(&token).await.expect("refresh");
@@ -381,6 +451,7 @@ mod tests {
     #[tokio::test]
     async fn families_are_independent() {
         let (store, execution) = store(3600).await;
+        let store = store.with_reuse_grace_ms(0);
         Box::pin(LORE_CONTEXT.scope(execution, async move {
             let first_login = store.issue(&identity()).await.expect("issue");
             let second_login = store.issue(&identity()).await.expect("issue");

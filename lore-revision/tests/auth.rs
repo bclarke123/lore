@@ -95,5 +95,22 @@ mod tests {
 
             verify_jwt_usage_for_remote(&token, "lore-server.lore.example.com").unwrap();
         }
+
+        #[test]
+        fn leading_dot_aud_matches_subdomains_and_apex() {
+            let token = make_jwt_with_audience(vec![".lore.example.com".to_string()]);
+
+            // Subdomains ("*.lore.example.com") match.
+            verify_jwt_usage_for_remote(&token, "lore-server.lore.example.com").unwrap();
+            // The bare apex domain ("lore.example.com") also matches.
+            verify_jwt_usage_for_remote(&token, "lore.example.com").unwrap();
+        }
+
+        #[test]
+        fn leading_dot_aud_rejects_unrelated_domain() {
+            let token = make_jwt_with_audience(vec![".lore.example.com".to_string()]);
+
+            verify_jwt_usage_for_remote(&token, "attackerlore.example.com").unwrap_err();
+        }
     }
 }

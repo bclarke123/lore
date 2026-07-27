@@ -572,6 +572,13 @@ async fn collect_fragments_and_push(
 
     // If the revision is already pushed and the branch still exists, early out.
     // If the branch was deleted, restore it via branch_create before returning.
+    //
+    // Under --force, do NOT early out: fall through to the fragment walk so a
+    // server that lost content behind an intact branch pointer can be
+    // re-seeded from this working copy. `push_query` keeps the upload to
+    // exactly what the server is missing, so forcing against a healthy
+    // remote transfers nothing.
+    let force = execution_context().globals().force();
     if already_pushed {
         if remote_deleted && !dry_run {
             lore_debug!("Branch deleted on server with same latest, restoring via branch_create");
@@ -586,12 +593,18 @@ async fn collect_fragments_and_push(
                 .await
                 .forward::<PushError>("creating branch on remote")?;
         }
-        return Ok(());
+        if !force {
+            return Ok(());
+        }
     }
+    // Repair mode: the remote pointer is already correct, so only offer
+    // fragments — never issue BranchPush for ancestor revisions, which
+    // would transiently rewind the branch (and leave it rewound if the
+    // push aborts midway).
+    let repair_only = already_pushed && force && !remote_deleted;
 
     // If the branch diverged, early out (unless fast-forward merge is enabled,
     // in which case let the server attempt to resolve the divergence)
-    let force = execution_context().globals().force();
     if !current_branch_remote_history.is_empty()
         && !force
         && !options.fast_forward_merge
@@ -606,13 +619,27 @@ async fn collect_fragments_and_push(
         ));
     }
 
-    // If force pushing a current revision that's already pushed, add it
+    // If force pushing a current revision that's already pushed, add it —
+    // together with its whole ancestry when repairing: a server that lost
+    // content can be missing fragments behind ANY revision, not just the
+    // tip's diff against its parent.
     if full_local_history.is_empty() && !local_latest.is_zero() && force {
         lore_debug!(
             "Branch push of old revision detected, {} remote changes",
             full_remote_history.len()
         );
-        full_local_history.push(local_latest);
+        if repair_only {
+            let mut revision = local_latest;
+            while !revision.is_zero() {
+                full_local_history.push(revision);
+                revision = State::deserialize(repository.clone(), revision)
+                    .await
+                    .forward::<PushError>("deserializing history state")?
+                    .parent_self();
+            }
+        } else {
+            full_local_history.push(local_latest);
+        }
     }
 
     // If the branch was deleted on the server, restore it via branch_create
@@ -759,11 +786,21 @@ async fn collect_fragments_and_push(
             state_parent.revision(),
             state.revision()
         );
+        // Normally fragments already marked durably-stored are skipped
+        // before the server is consulted. Under --force, distrust those
+        // local flags and let `push_query` (the server's own answer) be
+        // the arbiter: the flags are not per-remote, so a fresh or
+        // damaged server would otherwise never be sent content that was
+        // ever pushed anywhere before — which makes restoring a server
+        // from an intact working copy impossible. `push_query` still
+        // filters to what the server actually lacks, so a forced push
+        // against a healthy remote uploads nothing extra.
+        let ignore_durably_stored = !execution_context().globals().force();
         let mut fragments = state::collect_new_fragments(
             repository.clone(),
             state_parent.clone(),
             state.clone(),
-            true, /* Ignore already durably stored fragments */
+            ignore_durably_stored,
         )
         .await
         .forward::<PushError>("collecting new fragments")?;
@@ -848,7 +885,7 @@ async fn collect_fragments_and_push(
         let current_number;
         let mut response_message = None;
 
-        if !dry_run && remote_latest != current_revision {
+        if !dry_run && remote_latest != current_revision && !repair_only {
             let push_result = revision_protocol
                 .branch_push(branch, current_revision, force, options.fast_forward_merge)
                 .await;

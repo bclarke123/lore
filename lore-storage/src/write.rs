@@ -486,13 +486,20 @@ fn stored_flags(query: &StoreQueryResult) -> (bool, bool) {
 
 fn is_fully_satisfied(
     query: &StoreQueryResult,
-    cache_local: bool,
+    _cache_local: bool,
     stored_local: bool,
     remote_session: &Option<Arc<StorageSession>>,
     stored_durable: bool,
 ) -> bool {
+    // A write is only satisfiable by an existing entry if that entry still
+    // physically holds the payload. An entry whose payload was evicted on
+    // the strength of a durable flag must NOT satisfy a write that is
+    // handing us the bytes: the flag can be stale (a remote that lost
+    // data), and the write is the cheapest possible moment to restore the
+    // payload. Without this, an evicted payload is unrecoverable even
+    // when the identical content is re-staged from the working tree.
     query.match_made == StoreMatch::MatchFull
-        && (!cache_local || stored_local)
+        && stored_local
         && (remote_session.is_none() || stored_durable)
 }
 
@@ -578,7 +585,11 @@ async fn leader_body(
         fragment.flags &= !FragmentFlags::PayloadStoredDurable;
     }
 
-    let payload = if !stored_durable || cache_local {
+    // Keep the payload whenever the local store doesn't already hold it —
+    // not only when caching is requested. Dropping bytes we were handed,
+    // on the strength of a durable flag that can be stale, is how evicted
+    // payloads become permanently unrecoverable (see is_fully_satisfied).
+    let payload = if !stored_durable || cache_local || !stored_local {
         Some(buffer)
     } else {
         None

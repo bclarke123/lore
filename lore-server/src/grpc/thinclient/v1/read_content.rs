@@ -64,8 +64,8 @@ pub async fn handler(
         .scope(execution, async move {
             // Read (defragment + decompress) up front so failures surface as a
             // unary Status before the stream opens.
-            let bytes = lore_storage::read(
-                immutable_store,
+            let bytes = match lore_storage::read(
+                immutable_store.clone(),
                 repository_id,
                 address,
                 None,
@@ -73,7 +73,34 @@ pub async fn handler(
                 None, /* server has the data locally; no remote session */
             )
             .await
-            .map_err(map_read_error)?;
+            {
+                // Hash-only address (no context half): fall back to the
+                // store's MatchHash lookup, the same way ContentDiff reads
+                // `DiffChange.content_from`/`content_to`. This does not
+                // widen access — the lookup stays scoped to the caller's
+                // authorized partition, and the content hash itself proves
+                // the bytes. Callers holding a full (hash, context) address
+                // never take this path.
+                Err(lore_storage::StorageError::AddressNotFound(_))
+                    if address.context.is_zero() =>
+                {
+                    let mut fallback = ReadOptions::default().no_isolation();
+                    if let Some(max) = req.max_bytes {
+                        fallback = fallback.with_max_content_size(max);
+                    }
+                    lore_storage::read(
+                        immutable_store,
+                        repository_id,
+                        address,
+                        None,
+                        fallback,
+                        None,
+                    )
+                    .await
+                    .map_err(map_read_error)?
+                }
+                other => other.map_err(map_read_error)?,
+            };
 
             let (tx, rx) = mpsc::channel(4);
             tokio::spawn(async move {

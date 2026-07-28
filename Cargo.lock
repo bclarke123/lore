@@ -2463,6 +2463,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
+ "uuid",
  "vergen",
  "windows-sys 0.61.2",
 ]
@@ -2679,6 +2680,7 @@ dependencies = [
 name = "lore-macro"
 version = "0.8.6-nightly"
 dependencies = [
+ "proc-macro2",
  "quote",
  "syn",
 ]

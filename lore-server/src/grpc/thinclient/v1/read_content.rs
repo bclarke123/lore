@@ -167,6 +167,7 @@ mod tests {
             WriteOptions::default().no_remote_write(),
             None,
             None,
+            None,
         )
         .await
         .expect("write blob");

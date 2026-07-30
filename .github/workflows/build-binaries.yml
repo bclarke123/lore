@@ -35,7 +35,7 @@ on:
         type: string
         default: ""
   push:
-    branches: [main]
+    branches: [main, pluggable-auth]
 
 permissions: {}
 
@@ -133,10 +133,13 @@ jobs:
 
       # Build the two binaries sequentially so their final LTO links never
       # run concurrently (each link alone can use most of the runner's RAM).
+      # -j2: at full parallelism the big crates' rustc jobs (fat-LTO bitcode
+      # + debug=2) collectively blow past the runner's 15 GB and thrash swap
+      # until GitHub kills the unresponsive runner (exit 143, ~30 min silent).
       - name: Build lore and loreserver
         run: |
-          cargo build --profile release-lto -p lore-client
-          cargo build --profile release-lto -p lore-server
+          cargo build -j 2 --profile release-lto -p lore-client
+          cargo build -j 2 --profile release-lto -p lore-server
 
       - name: Package release tarballs
         env:

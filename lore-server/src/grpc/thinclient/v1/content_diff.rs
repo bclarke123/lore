@@ -3,6 +3,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
+use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_base::types::Hash;
@@ -149,7 +150,7 @@ pub async fn handler(
             }
 
             let (tx, rx) = mpsc::channel(4);
-            tokio::spawn(async move {
+            lore_spawn!(async move {
                 if tx
                     .send(Ok(ContentDiffResponse {
                         payload: Some(Payload::Header(header)),

@@ -3,6 +3,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
+use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_base::types::Context;
@@ -103,7 +104,7 @@ pub async fn handler(
             };
 
             let (tx, rx) = mpsc::channel(4);
-            tokio::spawn(async move {
+            lore_spawn!(async move {
                 let size_content = bytes.len() as u64;
                 // Always emit at least one message (carries size; empty file
                 // → single empty chunk).

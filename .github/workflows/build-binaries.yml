@@ -137,9 +137,18 @@ jobs:
       # + debug=2) collectively blow past the runner's 15 GB and thrash swap
       # until GitHub kills the unresponsive runner (exit 143, ~30 min silent).
       - name: Build lore and loreserver
+        # Thin LTO + line-tables debug info: the hosted runners' 15 GB cannot
+        # reliably fit the release-lto profile's fat-LTO + debug=2 link even
+        # with swap and sequential -j2 builds (the link thrashes until the
+        # runner is killed, exit 143). Thin LTO costs ~1-3% runtime; line
+        # tables keep file:line backtraces. The Cargo.toml profile is
+        # untouched — full-fat release builds stay possible off-runner or on
+        # a larger runner via the `runner` input.
         run: |
-          cargo build -j 2 --profile release-lto -p lore-client
-          cargo build -j 2 --profile release-lto -p lore-server
+          config=(--config 'profile.release-lto.lto="thin"'
+                  --config 'profile.release-lto.debug="line-tables-only"')
+          cargo build -j 2 --profile release-lto "${config[@]}" -p lore-client
+          cargo build -j 2 --profile release-lto "${config[@]}" -p lore-server
 
       - name: Package release tarballs
         env:

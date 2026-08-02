@@ -3463,6 +3463,8 @@ pub struct TreePath {
     pub path: RelativePath,
     pub address: Option<Address>,
     pub flags: NodeFlags,
+    /// Content size in bytes for files/links; 0 for directories.
+    pub size: u64,
 }
 
 pub type CanReadRepository = Arc<dyn Fn(RepositoryId) -> bool + Send + Sync>;
@@ -3626,6 +3628,7 @@ async fn gather_tree_paths_node(
         path: node_path.clone(),
         address,
         flags,
+        size: if node.is_directory() { 0 } else { node.size },
     });
 
     let depth_remaining = max_depth == 0 || depth + 1 < max_depth;

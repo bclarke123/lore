@@ -113,6 +113,8 @@ message TreeNode {
   NodeType node_type = 2;
   // Content address for FILE / LINK entries; unused for DIRECTORY.
   lore.model.v1.Address address = 3;
+  // Content size in bytes for FILE / LINK entries; 0 for DIRECTORY.
+  uint64 size = 4;
 }
 
 // Self-describing revision record. Carries the resolved RevisionIdentifier

@@ -181,4 +181,9 @@ message ReadContentResponse {
   uint64 size_content = 1;
   // A contiguous chunk of content bytes, in order.
   bytes chunk = 2;
+  // Total decompressed size of the whole content, set on the first
+  // streamed message. Equal to `size_content` for full reads; for ranged
+  // reads this is what lets callers express "bytes X-Y of Z" (e.g. HTTP
+  // Content-Range) without a second round-trip.
+  uint64 total_size_content = 3;
 }

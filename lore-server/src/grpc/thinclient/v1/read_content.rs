@@ -91,8 +91,11 @@ pub async fn handler(
     LORE_CONTEXT
         .scope(execution, async move {
             // Read (defragment + decompress) up front so failures surface as a
-            // unary Status before the stream opens.
-            let bytes = match lore_storage::read(
+            // unary Status before the stream opens. `read_with_info` also
+            // yields the root fragment, whose `size_content` is the total
+            // content size — reported alongside ranged reads so callers can
+            // say "bytes X-Y of Z" without a second round-trip.
+            let (fragment, bytes) = match lore_storage::read_with_info(
                 immutable_store.clone(),
                 repository_id,
                 address,
@@ -118,7 +121,7 @@ pub async fn handler(
                     {
                         fallback = fallback.with_max_content_size(max);
                     }
-                    lore_storage::read(
+                    lore_storage::read_with_info(
                         immutable_store,
                         repository_id,
                         address,
@@ -140,6 +143,7 @@ pub async fn handler(
                 return Err(Status::failed_precondition("file too large"));
             }
 
+            let total_size_content = fragment.size_content;
             let (tx, rx) = mpsc::channel(4);
             lore_spawn!(async move {
                 let size_content = bytes.len() as u64;
@@ -152,6 +156,7 @@ pub async fn handler(
                     let chunk = bytes.slice(offset..end);
                     let response = ReadContentResponse {
                         size_content: if first { size_content } else { 0 },
+                        total_size_content: if first { total_size_content } else { 0 },
                         chunk,
                     };
                     if tx.send(Ok(response)).await.is_err() {
@@ -294,6 +299,40 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ranged_read_reports_total_size() {
+        let (store, _mut, execution) = test_store_create().await.expect("stores");
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let partition = Partition::default();
+            let content = vec![5u8; 40_000];
+            let address = put_blob(&store, partition, &content).await;
+            let mut request = Request::new(ReadContentRequest {
+                address: Some(lore_proto::lore::model::v1::Address {
+                    hash: address.hash.data().to_vec().into(),
+                    context: address.context.data().to_vec().into(),
+                }),
+                max_bytes: None,
+                offset: Some(100),
+                length: Some(64),
+            });
+            request.metadata_mut().insert_bin(
+                crate::grpc::REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(partition.data()),
+            );
+            let response = handler(request, store).await.expect("handler");
+            use tokio_stream::StreamExt;
+            let first = response
+                .into_inner()
+                .next()
+                .await
+                .expect("first message")
+                .expect("ok");
+            assert_eq!(first.size_content, 64);
+            assert_eq!(first.total_size_content, 40_000);
         }))
         .await;
     }

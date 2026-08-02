@@ -839,6 +839,12 @@ pub struct ReadContentResponse {
     /// A contiguous chunk of content bytes, in order.
     #[prost(bytes = "bytes", tag = "2")]
     pub chunk: ::prost::bytes::Bytes,
+    /// Total decompressed size of the whole content, set on the first
+    /// streamed message. Equal to `size_content` for full reads; for ranged
+    /// reads this is what lets callers express "bytes X-Y of Z" (e.g. HTTP
+    /// Content-Range) without a second round-trip.
+    #[prost(uint64, tag = "3")]
+    pub total_size_content: u64,
 }
 impl ::prost::Name for ReadContentResponse {
     const NAME: &'static str = "ReadContentResponse";

@@ -394,6 +394,23 @@ pub async fn read(
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
 ) -> Result<Bytes, StorageError> {
+    read_with_info(store, partition, address, range, options, remote_session)
+        .await
+        .map(|(_, bytes)| bytes)
+}
+
+/// Like [`read`], but also returns the root [`Fragment`] metadata. Ranged
+/// callers need `Fragment::size_content` (the full content size) to
+/// describe the slice they got — e.g. an HTTP `Content-Range` total —
+/// without a second store round-trip.
+pub async fn read_with_info(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    range: Option<Range<usize>>,
+    options: ReadOptions,
+    remote_session: Option<Arc<StorageSession>>,
+) -> Result<(Fragment, Bytes), StorageError> {
     let options = options.with_decompress();
     let (fragment, buffer) = load_fragment(
         store.clone(),
@@ -423,7 +440,7 @@ pub async fn read(
         None => 0..fragment.size_content as usize,
     };
     if range.is_empty() {
-        return Ok(Bytes::default());
+        return Ok((fragment, Bytes::default()));
     }
 
     if (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented {
@@ -454,9 +471,10 @@ pub async fn read(
         unsafe {
             target_buffer.set_len(target_size);
         }
-        Ok(target_buffer.freeze())
+        Ok((fragment, target_buffer.freeze()))
     } else {
-        Ok(buffer.slice(range))
+        let bytes = buffer.slice(range);
+        Ok((fragment, bytes))
     }
 }
 

@@ -54,8 +54,35 @@ pub async fn handler(
         return Err(Status::invalid_argument("Cannot read a zeroed address"));
     }
 
+    // A requested byte range bounds the defragment allocation by itself, so
+    // the storage-level whole-content cap is only applied to full reads —
+    // ranged reads of arbitrarily large content are the point of the range.
+    // `max_bytes` then caps the range: a bounded range larger than the cap
+    // is rejected up front; an open-ended range is read to `max + 1` bytes
+    // so overflow is detected after the (bounded) read.
+    let range: Option<std::ops::Range<usize>> = match (req.offset, req.length) {
+        (None, None) => None,
+        (offset, length) => {
+            let start = offset.unwrap_or(0);
+            if let (Some(len), Some(max)) = (length, req.max_bytes)
+                && len > max
+            {
+                return Err(Status::failed_precondition("file too large"));
+            }
+            let end = match (length, req.max_bytes) {
+                (Some(len), _) => start.saturating_add(len),
+                (None, Some(max)) => start.saturating_add(max).saturating_add(1),
+                (None, None) => u64::MAX,
+            };
+            let clamp = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
+            Some(clamp(start)..clamp(end))
+        }
+    };
+
     let mut options = ReadOptions::default();
-    if let Some(max) = req.max_bytes {
+    if range.is_none()
+        && let Some(max) = req.max_bytes
+    {
         options = options.with_max_content_size(max);
     }
 
@@ -69,7 +96,7 @@ pub async fn handler(
                 immutable_store.clone(),
                 repository_id,
                 address,
-                None,
+                range.clone(),
                 options,
                 None, /* server has the data locally; no remote session */
             )
@@ -86,14 +113,16 @@ pub async fn handler(
                     if address.context.is_zero() =>
                 {
                     let mut fallback = ReadOptions::default().no_isolation();
-                    if let Some(max) = req.max_bytes {
+                    if range.is_none()
+                        && let Some(max) = req.max_bytes
+                    {
                         fallback = fallback.with_max_content_size(max);
                     }
                     lore_storage::read(
                         immutable_store,
                         repository_id,
                         address,
-                        None,
+                        range.clone(),
                         fallback,
                         None,
                     )
@@ -102,6 +131,14 @@ pub async fn handler(
                 }
                 other => other.map_err(map_read_error)?,
             };
+
+            // Open-ended range: the read was bounded to `max + 1` bytes, so
+            // landing past `max` means the tail exceeds the cap.
+            if let (Some(_), Some(max)) = (&range, req.max_bytes)
+                && bytes.len() as u64 > max
+            {
+                return Err(Status::failed_precondition("file too large"));
+            }
 
             let (tx, rx) = mpsc::channel(4);
             lore_spawn!(async move {
@@ -181,12 +218,25 @@ mod tests {
         address: Address,
         max_bytes: Option<u64>,
     ) -> Result<Vec<u8>, Status> {
+        read_ranged(store, partition, address, max_bytes, None, None).await
+    }
+
+    async fn read_ranged(
+        store: Arc<dyn lore_storage::ImmutableStore>,
+        partition: Partition,
+        address: Address,
+        max_bytes: Option<u64>,
+        offset: Option<u64>,
+        length: Option<u64>,
+    ) -> Result<Vec<u8>, Status> {
         let mut request = Request::new(ReadContentRequest {
             address: Some(lore_proto::lore::model::v1::Address {
                 hash: address.hash.data().to_vec().into(),
                 context: address.context.data().to_vec().into(),
             }),
             max_bytes,
+            offset,
+            length,
         });
         request.metadata_mut().insert_bin(
             crate::grpc::REPOSITORY_ID_KEY,
@@ -241,6 +291,90 @@ mod tests {
             let content = vec![7u8; 10_000];
             let address = put_blob(&store, partition, &content).await;
             let err = read_all(store, partition, address, Some(1000))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ranged_read_returns_requested_slice() {
+        let (store, _mut, execution) = test_store_create().await.expect("stores");
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let partition = Partition::default();
+            // Fragmented content so the range crosses fragment boundaries.
+            let content: Vec<u8> = (0..300_000).map(|i| (i % 251) as u8).collect();
+            let address = put_blob(&store, partition, &content).await;
+            let got = read_ranged(store, partition, address, None, Some(65_000), Some(10_000))
+                .await
+                .expect("ranged read");
+            assert_eq!(got, &content[65_000..75_000]);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ranged_read_clamps_at_end_of_content() {
+        let (store, _mut, execution) = test_store_create().await.expect("stores");
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let partition = Partition::default();
+            let content = vec![3u8; 10_000];
+            let address = put_blob(&store, partition, &content).await;
+            // Range extending past the end returns just the tail…
+            let got = read_ranged(
+                store.clone(),
+                partition,
+                address,
+                None,
+                Some(9_000),
+                Some(5_000),
+            )
+            .await
+            .expect("tail read");
+            assert_eq!(got, &content[9_000..]);
+            // …and a range starting past the end returns nothing.
+            let got = read_ranged(store, partition, address, None, Some(50_000), Some(16))
+                .await
+                .expect("past-end read");
+            assert!(got.is_empty());
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ranged_read_ignores_total_size_cap_but_caps_range() {
+        let (store, _mut, execution) = test_store_create().await.expect("stores");
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let partition = Partition::default();
+            let content = vec![7u8; 10_000];
+            let address = put_blob(&store, partition, &content).await;
+            // Content exceeds max_bytes, but the bounded range fits: allowed.
+            let got = read_ranged(
+                store.clone(),
+                partition,
+                address,
+                Some(1_000),
+                Some(0),
+                Some(64),
+            )
+            .await
+            .expect("header read of oversized content");
+            assert_eq!(got, &content[..64]);
+            // A bounded range larger than max_bytes is rejected up front.
+            let err = read_ranged(
+                store.clone(),
+                partition,
+                address,
+                Some(1_000),
+                Some(0),
+                Some(2_000),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+            // An open-ended range whose tail exceeds max_bytes is rejected.
+            let err = read_ranged(store, partition, address, Some(1_000), Some(4), None)
                 .await
                 .unwrap_err();
             assert_eq!(err.code(), tonic::Code::FailedPrecondition);

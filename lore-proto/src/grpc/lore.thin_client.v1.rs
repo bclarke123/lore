@@ -800,9 +800,20 @@ pub struct ReadContentRequest {
     #[prost(message, optional, tag = "1")]
     pub address: ::core::option::Option<crate::lore::model::v1::Address>,
     /// Refuse to read if the content exceeds this many bytes (guards against
-    /// huge blobs). Unset = no cap.
+    /// huge blobs). Unset = no cap. When `offset`/`length` restrict the read
+    /// to a range, the cap applies to the range actually returned, not the
+    /// full content size.
     #[prost(uint64, optional, tag = "2")]
     pub max_bytes: ::core::option::Option<u64>,
+    /// Byte offset to start reading from. Reading at or past the end of the
+    /// content yields an empty stream (a single header-only message carrying
+    /// the total size). Unset = 0.
+    #[prost(uint64, optional, tag = "3")]
+    pub offset: ::core::option::Option<u64>,
+    /// Maximum number of bytes to return, measured from `offset`; truncated
+    /// at end of content. Unset = to the end.
+    #[prost(uint64, optional, tag = "4")]
+    pub length: ::core::option::Option<u64>,
 }
 impl ::prost::Name for ReadContentRequest {
     const NAME: &'static str = "ReadContentRequest";
@@ -820,7 +831,9 @@ impl ::prost::Name for ReadContentRequest {
 /// an empty file).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReadContentResponse {
-    /// Total decompressed content size, set on the first streamed message.
+    /// Decompressed size of the bytes this stream returns (the requested
+    /// range's size when `offset`/`length` were set, the full content size
+    /// otherwise), set on the first streamed message.
     #[prost(uint64, tag = "1")]
     pub size_content: u64,
     /// A contiguous chunk of content bytes, in order.

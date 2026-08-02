@@ -157,8 +157,17 @@ message ReadContentRequest {
   // Content address of the FILE/LINK node (from TreeNode.address).
   lore.model.v1.Address address = 1;
   // Refuse to read if the content exceeds this many bytes (guards against
-  // huge blobs). Unset = no cap.
+  // huge blobs). Unset = no cap. When `offset`/`length` restrict the read
+  // to a range, the cap applies to the range actually returned, not the
+  // full content size.
   optional uint64 max_bytes = 2;
+  // Byte offset to start reading from. Reading at or past the end of the
+  // content yields an empty stream (a single header-only message carrying
+  // the total size). Unset = 0.
+  optional uint64 offset = 3;
+  // Maximum number of bytes to return, measured from `offset`; truncated
+  // at end of content. Unset = to the end.
+  optional uint64 length = 4;
 }
 
 // A chunk of reassembled, decompressed file content. The first message
@@ -166,7 +175,9 @@ message ReadContentRequest {
 // carries a `chunk` (possibly empty on the header-only first message for
 // an empty file).
 message ReadContentResponse {
-  // Total decompressed content size, set on the first streamed message.
+  // Decompressed size of the bytes this stream returns (the requested
+  // range's size when `offset`/`length` were set, the full content size
+  // otherwise), set on the first streamed message.
   uint64 size_content = 1;
   // A contiguous chunk of content bytes, in order.
   bytes chunk = 2;

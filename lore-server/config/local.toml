@@ -41,13 +41,20 @@ mode = "local"
 # =============================================================================
 
 # Local immutable store settings
+#
+# NEVER point these at /tmp: macOS and most Linux distributions purge /tmp
+# periodically (and on boot), which silently destroys repository fragments —
+# discovered the hard way as unrecoverable "address not found" holes in
+# revision history. The path below is relative to the server's working
+# directory; use an absolute path on a durable volume for anything you care
+# about.
 [immutable_store.local]
-path = "/tmp/lore-server"
+path = "./lore-server-data/immutable"
 flush_delay_seconds = 10
 
 # Local mutable store settings
 [mutable_store.local]
-path = "/tmp/lore-server"
+path = "./lore-server-data/mutable"
 flush_delay_seconds = 10
 
 # =============================================================================

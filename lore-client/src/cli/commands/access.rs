@@ -11,11 +11,11 @@ use std::future::Future;
 use clap::Args;
 use clap::Subcommand;
 use clap::ValueEnum;
+use lore::LORE_CONTEXT;
+use lore::auth::access_admin;
+use lore::auth::access_admin::AccessRepositoryRef;
 use lore::interface::LoreGlobalArgs;
 use lore::runtime;
-use lore_base::runtime::LORE_CONTEXT;
-use lore_revision::auth::access_admin;
-use lore_revision::auth::access_admin::AccessRepositoryRef;
 
 use crate::println;
 use crate::styling::CommonStyles;
@@ -119,19 +119,19 @@ fn resolve_remote(globals: &LoreGlobalArgs, remote_url: &Option<String>) -> Opti
     if let Some(remote) = remote_url {
         return Some(remote.clone());
     }
-    lore_revision::repository::load_repository_config(globals.repository_path.as_str())
+    lore::repository::load_repository_config(globals.repository_path.as_str())
         .ok()
         .and_then(|config| config.remote_url)
 }
 
 fn run<T>(
     globals: LoreGlobalArgs,
-    operation: impl Future<Output = Result<T, lore_revision::auth::login::LoginError>>,
+    operation: impl Future<Output = Result<T, lore::auth::LoginError>>,
     on_success: impl FnOnce(T),
 ) -> u8 {
-    let execution = std::sync::Arc::new(lore_revision::interface::ExecutionContext::new_server(
+    let execution = std::sync::Arc::new(lore::interface::ExecutionContext::new_server(
         globals,
-        lore_revision::relay::EventDispatcher::no_dispatch(),
+        lore::interface::EventDispatcher::no_dispatch(),
         String::default(),
     ));
     match runtime().block_on(LORE_CONTEXT.scope(execution, operation)) {

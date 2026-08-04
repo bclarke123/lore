@@ -25,6 +25,7 @@ use lore_revision::repository::clone::CloneOptions;
 use lore_revision::repository::create::CreateError;
 use lore_revision::repository::create::CreateMetadata;
 use lore_revision::repository::create::CreateOptions;
+pub use lore_revision::repository::load_repository_config;
 use lore_revision::repository::status::StatusOptions;
 use lore_revision::revision;
 use lore_revision::util;

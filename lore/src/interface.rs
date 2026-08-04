@@ -28,8 +28,11 @@ pub type Context = lore_storage::Context;
 pub type Hash = lore_storage::Hash;
 pub type Fragment = lore_storage::Fragment;
 pub type FragmentFlags = lore_storage::FragmentFlags;
+pub use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 pub type LoreString = lore_revision::interface::LoreString;
 pub type LoreArray<T> = lore_revision::interface::LoreArray<T>;
+pub type ExecutionContext = lore_revision::interface::ExecutionContext;
+pub type EventDispatcher = lore_revision::relay::EventDispatcher;
 
 use crate::call_delegation::run_asynchronously;
 use crate::call_delegation::run_synchronously;

@@ -10,9 +10,9 @@
 name: Build binaries
 
 on:
+  # On this fork, main is just the upstream sync-point — no automatic
+  # build on merge (workflow_dispatch covers the odd one-off).
   workflow_dispatch:
-  push:
-    branches: [main]
 
 permissions: {}
 

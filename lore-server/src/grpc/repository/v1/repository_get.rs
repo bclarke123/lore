@@ -24,6 +24,7 @@ use tracing::info;
 use tracing::warn;
 
 use super::record::build_repository;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
 use crate::grpc::handlers::repository_query::check_repository_query_authorization;
@@ -44,11 +45,9 @@ pub async fn handler(
 ) -> Result<Response<RepositoryGetResponse>, Status> {
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-    let authorization = request
-        .metadata()
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .map(|s| s.to_string());
+    // Upstream's extraction helper, composed with the fork's anonymous
+    // sentinel (unauthenticated public-repo reads).
+    let authorization = extract_authorization_header(&request);
     let authorization =
         crate::auth::anonymous::effective_authorization(authorization, request.extensions());
     let req = request.into_inner();

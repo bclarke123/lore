@@ -162,6 +162,7 @@ async fn stream_tree(
                 context: address.context.into(),
             }),
             size: tree_path.size,
+            mode: tree_path.mode,
         };
         if tx
             .send(Ok(RevisionTreeResponse {

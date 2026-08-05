@@ -2893,6 +2893,7 @@ dependencies = [
  "libc",
  "lore-base",
  "lore-error-set",
+ "lore-io",
  "lore-telemetry",
  "lore-transport",
  "lz4-sys",

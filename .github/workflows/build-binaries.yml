@@ -16,6 +16,8 @@
 name: Build binaries
 
 on:
+  # On this fork, main is just the upstream sync-point — no automatic
+  # build on merge (workflow_dispatch covers the odd one-off).
   workflow_dispatch:
     inputs:
       target:
@@ -34,8 +36,10 @@ on:
           target's default hosted runner.
         type: string
         default: ""
+  # pluggable-auth only: lorehub's deploy bundle downloads loreserver from
+  # this workflow's runs on that branch, so those builds stay automatic.
   push:
-    branches: [main, pluggable-auth]
+    branches: [pluggable-auth]
 
 permissions: {}
 

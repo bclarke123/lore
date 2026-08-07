@@ -202,7 +202,7 @@ mod tests {
         partition: Partition,
         content: &[u8],
     ) -> Address {
-        let (address, _fragment) = lore_storage::write_content(
+        lore_storage::write_content(
             store.clone(),
             partition,
             Context::default(),
@@ -213,8 +213,7 @@ mod tests {
             None,
         )
         .await
-        .expect("write blob");
-        address
+        .expect("write blob")
     }
 
     async fn read_all(

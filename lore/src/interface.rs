@@ -7454,7 +7454,7 @@ pub type LoreRevisionTreeAddArgs = crate::revision_tree::add::LoreRevisionTreeAd
 /// existing node or onto an earlier entry, so one call builds a subtree. Every
 /// entry is checked before any node is created, so one bad entry rejects the
 /// call and creates nothing; the reason names the offending entry's batch index,
-/// which a caller leaving `id` at zero has no other way to identify. A failure
+/// which a caller leaving `entry_id` at zero has no other way to identify. A failure
 /// after those checks pass is internal and may leave part of the batch created.
 ///
 /// A link entry's target revision is not resolved here, so a link naming a
@@ -7464,8 +7464,8 @@ pub type LoreRevisionTreeAddArgs = crate::revision_tree::add::LoreRevisionTreeAd
 ///
 /// | Terminal event                            | Payload                                          | Notes                                                    |
 /// |-------------------------------------------|--------------------------------------------------|----------------------------------------------------------|
-/// | `LORE_EVENT_REVISION_TREE_ADD_COMPLETE`   | `lore_revision_tree_add_complete_event_data_t`   | One per entry created or individually rejected           |
-/// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE` | `lore_revision_tree_batch_complete_event_data_t` | Exactly one, carrying the call id and the call's outcome |
+/// | `LORE_EVENT_REVISION_TREE_ADD_COMPLETE`   | `lore_revision_tree_add_complete_event_data_t`   | One per entry, carrying its `entry_id`                    |
+/// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE` | `lore_revision_tree_batch_complete_event_data_t` | Exactly one, carrying the `batch_id` and the call's outcome |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_revision_tree_add(
     globals: &LoreGlobalArgs,
@@ -7483,4 +7483,53 @@ pub extern "C" fn lore_revision_tree_add_async(
     callback: LoreEventCallbackConfig,
 ) {
     run_asynchronously(globals, args, callback, crate::revision_tree::add::add);
+}
+
+pub type LoreRevisionTreeModifyArgs = crate::revision_tree::modify::LoreRevisionTreeModifyArgs;
+
+/// Rewrite a batch of file nodes' `mode`, `size` and `address` in a loaded
+/// revision tree. Every entry is checked before any node is rewritten, so one bad
+/// entry rejects the call and leaves every target untouched; the reason names the
+/// offending entry's batch index, which a caller leaving `entry_id` at zero has no
+/// other way to identify. A failure after those checks pass is internal and may
+/// leave part of the batch rewritten.
+///
+/// Only a file is modifiable: a directory's size and address are derived at
+/// commit and a link's address is its target. A zero `address.context` preserves
+/// the node's existing file id rather than generating one, which is the opposite
+/// of `lore_revision_tree_add` — the node already has an identity, and replacing
+/// it would record the edit as a move. Entries touch no parent or sibling chain,
+/// so the whole batch applies concurrently.
+///
+/// | Terminal event                              | Payload                                           | Notes                                                    |
+/// |---------------------------------------------|---------------------------------------------------|----------------------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_MODIFY_COMPLETE`  | `lore_revision_tree_modify_complete_event_data_t` | One per entry, carrying its `entry_id`                    |
+/// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE`   | `lore_revision_tree_batch_complete_event_data_t`  | Exactly one, carrying the `batch_id` and the call's outcome |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_modify(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeModifyArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::modify::modify,
+    )
+}
+
+/// Rewrite a batch of file nodes in a loaded revision tree (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_modify_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeModifyArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::modify::modify,
+    );
 }

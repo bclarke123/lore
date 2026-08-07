@@ -43,7 +43,6 @@ use crate::link;
 use crate::lore::Address;
 use crate::lore::BranchId;
 use crate::lore::Context;
-use crate::lore::Fragment;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
 use crate::lore::TypedBytes;
@@ -550,7 +549,7 @@ pub async fn commit_impl(
         } else {
             metadata.clone()
         };
-        let layer_signature = commit_staged_revision(
+        let layer_result = commit_staged_revision(
             layer_repository.clone(),
             token.share(),
             layer_state.state_current.clone(),
@@ -565,13 +564,49 @@ pub async fn commit_impl(
             current_branch,
             stats,
         )
-        .await?;
+        .await;
+
+        let layer_signature = match layer_result {
+            Ok(signature) => signature,
+            Err(err) if err.is_nothing_staged() => {
+                // The parent revision is already committed at this point, so a
+                // layer with nothing to commit must not fail the whole commit.
+                lore_warn!(
+                    "Layer at {} had nothing to commit, clearing its staged state",
+                    layer.target_path
+                );
+                if !dry_run {
+                    layer::store_layer_staged(
+                        repository.clone(),
+                        token,
+                        layer.target_path.as_str(),
+                        layer.repository,
+                        Hash::default(),
+                    )
+                    .await
+                    .forward::<CommitError>("Failed to clear layer staged state")?;
+                }
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         let layer_branch = layer_state
             .state_current
             .branch(layer_repository.clone())
             .await;
 
         if !dry_run {
+            // Without this `layer::latest_revision` cannot reach the new
+            // layer revision.
+            branch::store_latest(
+                layer_repository.clone(),
+                current_branch,
+                layer_signature,
+                BranchLatestStatus::Divergent,
+            )
+            .await
+            .forward::<CommitError>("Failed to store layer branch latest")?;
+
             layer::store_layer_current(
                 repository.clone(),
                 token,
@@ -709,6 +744,15 @@ async fn commit_layer_only(
         .await;
 
     if !globals.dry_run() {
+        branch::store_latest(
+            layer_state.repository.clone(),
+            parent_current_branch,
+            layer_signature,
+            BranchLatestStatus::Divergent,
+        )
+        .await
+        .forward::<CommitError>("Failed to store layer branch latest")?;
+
         layer::store_layer_current(
             repository.clone(),
             &token,
@@ -1993,7 +2037,7 @@ async fn commit_file(
                 );
             }
 
-            let (address, fragment) = immutable::write_from_file_with_tracker(
+            let (address, size_content) = immutable::write_from_file_with_tracker(
                 repository.clone(),
                 absolute_path.as_path(),
                 node.address.context,
@@ -2011,7 +2055,7 @@ async fn commit_file(
             stats
                 .complete
                 .bytes_transferred
-                .fetch_add(fragment.size_content, Ordering::Relaxed);
+                .fetch_add(size_content, Ordering::Relaxed);
 
             let Ok(metadata) = tokio::fs::metadata(absolute_path.as_path()).await else {
                 return Err(CommitError::internal(format!(
@@ -2022,7 +2066,7 @@ async fn commit_file(
 
             (
                 address,
-                fragment.size_content,
+                size_content,
                 util::fs::metadata_to_mode(&metadata, node.mode),
             )
         };
@@ -2686,7 +2730,7 @@ async fn generate_delta_block(
     };
     let delta_count = delta.count::<NodeDelta>();
 
-    let (address, _fragment) = if !delta.is_empty() {
+    let address = if !delta.is_empty() {
         immutable::write_with_tracker(
             repository.clone(),
             Context::default(),
@@ -2699,7 +2743,7 @@ async fn generate_delta_block(
         .await
         .forward::<CommitError>("Failed writing delta block to immutable store")?
     } else {
-        (Address::default(), Fragment::default())
+        Address::default()
     };
 
     state

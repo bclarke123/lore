@@ -37,6 +37,7 @@ use crate::change;
 use crate::change::FileAction;
 use crate::change::NodeChange;
 use crate::change::NodeChangeState;
+use crate::errors::InvalidArguments;
 use crate::errors::LinkNotFound;
 use crate::errors::NodeNotFound;
 use crate::errors::NotFound;
@@ -733,7 +734,7 @@ impl State {
                         if block.is_nametable_deserialized() {
                             lore_trace!("Serializing dirty node block {} name table", block_index);
                             let name_table = block.read().clone_name_table();
-                            let (name_table, _) = if !name_table.is_empty() {
+                            let name_table = if !name_table.is_empty() {
                                 immutable::write(
                                     repository.clone(),
                                     Context::default(),
@@ -745,7 +746,7 @@ impl State {
                                 .await
                                 .internal("Failed to serialize node block")?
                             } else {
-                                (Address::default(), Fragment::default())
+                                Address::default()
                             };
                             {
                                 let mut writer = block.write();
@@ -757,7 +758,7 @@ impl State {
                     node_block.flags &= !NodeBlockFlags::Dirty;
                     node_block.flags &= !NodeBlockFlags::UpgradeGeneratedNametable;
                     node_block.flags &= !NodeBlockFlags::FirstUnusedNode;
-                    let (address, _) = node_block
+                    let address = node_block
                         .write_to_immutable(
                             repository.clone(),
                             Context::default(),
@@ -802,7 +803,7 @@ impl State {
 
             // Write out the block address list
             let block_hash_bytes = block_hash_bytes.freeze();
-            let (list_address, _) = immutable::write(
+            let list_address = immutable::write(
                 repository.clone(),
                 Context::default(),
                 block_hash_bytes.clone(),
@@ -852,7 +853,7 @@ impl State {
                     // write makes the lock held of an await point
                     let mut node_block = { *block.read().node_block() };
                     node_block.flags &= !NodeBlockFlags::Dirty;
-                    let (address, _) = node_block
+                    let address = node_block
                         .write_to_immutable(
                             repository.clone(),
                             Context::default(),
@@ -897,7 +898,7 @@ impl State {
 
             // Write out the block address list
             let block_hash_bytes = block_hash_bytes.freeze();
-            let (list_address, _) = immutable::write(
+            let list_address = immutable::write(
                 repository.clone(),
                 Context::default(),
                 block_hash_bytes.clone(),
@@ -934,7 +935,7 @@ impl State {
                     Hash::default()
                 } else {
                     let bytes = Bytes::copy_from_slice(link_list.as_bytes());
-                    let (address, _fragment) = immutable::write(
+                    let address = immutable::write(
                         repository.clone(),
                         Context::default(),
                         bytes,
@@ -959,7 +960,7 @@ impl State {
         let tree = { self.runtime.read().tree.unwrap_or_default() };
         if tree.flags & TreeFlags::Dirty != 0 {
             lore_trace!("Serializing dirty tree");
-            let (address, _fragment) = tree
+            let address = tree
                 .write_to_immutable(
                     repository.clone(),
                     Context::default(),
@@ -980,7 +981,7 @@ impl State {
         }
 
         // Serialize the state
-        let (address, fragment) = {
+        let address = {
             let buffer = {
                 let mut data = self.data.write();
                 data.flags &= !StateFlags::Dirty;
@@ -1009,11 +1010,9 @@ impl State {
         }
 
         lore_trace!(
-            "Serialized state to {} in repository {}, {} -> {} bytes",
+            "Serialized state to {} in repository {}",
             address.hash,
-            repository.id,
-            fragment.size_content,
-            fragment.size_payload
+            repository.id
         );
 
         Ok(address.hash)
@@ -2099,6 +2098,68 @@ impl State {
         }
     }
 
+    /// Rewrite a file node's `mode`, `size` and `address` in place.
+    ///
+    /// A zero `address.context` preserves the node's existing file id. The node
+    /// already carries an identity, and replacing it would record the edit as a
+    /// move.
+    ///
+    /// Only a file is modifiable: a directory's size and address are derived
+    /// when the revision is committed, and a link's address is its target, so
+    /// neither holds content this can rewrite. A discarded slot is refused
+    /// under its own reason — it carries neither the file nor the link flag, so
+    /// it would otherwise read back as an ordinary directory.
+    ///
+    /// # Concurrency
+    ///
+    /// The kind check and the rewrite share one block write lock, so a node
+    /// discarded concurrently is never rewritten after the fact. Nothing here
+    /// touches a parent or sibling chain, so modifications of distinct nodes are
+    /// independent even within one block.
+    pub async fn node_modify(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node_id: NodeID,
+        mode: u16,
+        size: u64,
+        address: Address,
+    ) -> Result<(), StateError> {
+        if !node_id.is_valid_node_id() {
+            return Err(StateError::from(InvalidArguments {
+                reason: "node id does not name a modifiable node".into(),
+            }));
+        }
+        let block_index = NodeBlock::index(node_id);
+        let block = self.block(repository, block_index).await?;
+        let dirtied = {
+            let mut block_writer = block.write();
+            let node = block_writer.node(Node::index(node_id));
+            if node.is_discarded() {
+                return Err(StateError::from(InvalidArguments {
+                    reason: "cannot modify a deleted node".into(),
+                }));
+            }
+            if !node.is_file() {
+                return Err(StateError::from(InvalidArguments {
+                    reason: "only a file node carries content to modify".into(),
+                }));
+            }
+            let file_id = node.address.context;
+            node.mode = mode;
+            node.size = size;
+            node.address = address;
+            if node.address.context.is_zero() {
+                node.address.context = file_id;
+            }
+            block_writer.mark_dirty()
+        };
+        if dirtied {
+            self.block_modified(block, block_index);
+            self.mark_dirty();
+        }
+        Ok(())
+    }
+
     pub async fn node_children(
         &self,
         repository: Arc<RepositoryContext>,
@@ -3031,7 +3092,7 @@ impl State {
             bytes.extend_from_slice(entry.as_bytes());
         }
 
-        let (address, _fragment) = immutable::write(
+        let address = immutable::write(
             repository.clone(),
             Context::default(),
             Bytes::from(bytes),

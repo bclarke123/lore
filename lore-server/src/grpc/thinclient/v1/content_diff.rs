@@ -554,7 +554,7 @@ mod tests {
         // Non-default context: the handler only receives the hash half, so
         // this forces the MatchHash fallback path (a full-address match
         // misses), mirroring production DiffChange addresses.
-        let (address, _fragment) = lore_storage::write_content(
+        let address = lore_storage::write_content(
             store.clone(),
             partition,
             Context::from([7u8; 16].as_ref()),

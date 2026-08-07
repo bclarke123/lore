@@ -3,10 +3,6 @@
 use std::cmp::PartialEq;
 use std::io;
 use std::io::ErrorKind;
-use std::io::Read;
-use std::io::Write;
-#[cfg(target_family = "windows")]
-use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,7 +32,6 @@ use crate::Address;
 use crate::Hash;
 use crate::Partition;
 use crate::errors::AddressNotFound;
-use crate::fs_util;
 use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
 use crate::local::immutable_store::SerializeFailureGuard;
@@ -222,8 +217,46 @@ enum DeserializeFileError {
     Corrupt(String),
 }
 
+/// Final-destination segments for a bucket read: one vectored operation
+/// scatters the on-disk sorted-index and entry regions straight into the
+/// bucket's chunk allocations, with no staging buffer.
+struct MutableBucketSegments {
+    sorted_index: GrowVec<u32, CHUNK_SIZE_U32>,
+    entry: GrowVec<MutableStoreEntry, CHUNK_SIZE_ENTRY>,
+}
+
+impl lore_io::StableBufListMut for MutableBucketSegments {
+    fn byte_segments_mut(&mut self) -> impl Iterator<Item = &mut [u8]> {
+        self.sorted_index
+            .byte_segments_mut()
+            .chain(self.entry.byte_segments_mut())
+    }
+}
+
+/// Gather segments for a bucket write: the serialized header plus the
+/// bucket's sorted-index and entry chunks, written with one vectored
+/// operation and no staging copy. Owning the bucket's read guard keeps the
+/// chunk memory alive and unmodified for the operation's whole kernel
+/// flight, which is the stability contract vectored writes require.
+struct MutableBucketWriteSegments {
+    /// The serialized header, in a fixed-size allocation rather than a `Vec`: its length is a
+    /// compile-time constant. It stays behind a pointer because [`lore_io::StableBufList`]
+    /// requires a segment to keep its address when the value moves, and the ring backend moves
+    /// the segment list into its operation entry after taking the pointers.
+    header: Box<[u8; size_of::<MutableStoreHeader>()]>,
+    bucket: OwnedRwLockReadGuard<MutableStoreBucket, MutableStoreBucket>,
+}
+
+impl lore_io::StableBufList for MutableBucketWriteSegments {
+    fn byte_segments(&self) -> impl Iterator<Item = &[u8]> {
+        std::iter::once(self.header.as_ref().as_slice())
+            .chain(self.bucket.sorted_index.byte_segments())
+            .chain(self.bucket.entry.byte_segments())
+    }
+}
+
 impl MutableStoreBucket {
-    fn deserialize_files(
+    async fn deserialize_files(
         path: PathBuf,
         authoritative: bool,
     ) -> Result<
@@ -236,13 +269,15 @@ impl MutableStoreBucket {
     > {
         let latest_version = MutableStoreVersion::LazyFanOut as u32;
 
-        let mut file = match std::fs::File::options()
-            .read(true)
-            .write(false)
-            .create(false)
-            .open(&path)
+        let (file, metadata, head) = match lore_io::IoDriver::global()
+            .open_read_head(
+                &path,
+                &lore_io::OpenOptions::new().read(true),
+                crate::local::immutable_store::BUCKET_HEAD_READ,
+            )
+            .await
         {
-            Ok(file) => file,
+            Ok(parts) => parts,
             Err(err) => {
                 if err.kind() == ErrorKind::NotFound {
                     return Ok((GrowVec::new(), GrowVec::new(), latest_version));
@@ -254,7 +289,9 @@ impl MutableStoreBucket {
             }
         };
 
-        match Self::deserialize_files_parse(&mut file, latest_version) {
+        match Self::deserialize_file_content(&file, metadata.len() as usize, &head, latest_version)
+            .await
+        {
             Ok(result) => Ok(result),
             Err(DeserializeFileError::FutureVersion(_version)) => {
                 Err(LocalMutableStoreError::internal_with_context(
@@ -272,13 +309,19 @@ impl MutableStoreBucket {
                 )))
             }
             Err(DeserializeFileError::Corrupt(reason)) => {
-                Self::recover_corrupt_bucket(&path, reason, latest_version)
+                Self::recover_corrupt_bucket(&path, reason, latest_version).await
             }
         }
     }
 
-    fn deserialize_files_parse(
-        file: &mut std::fs::File,
+    /// Buckets that fit inside the composite open's head bytes — the common
+    /// case — parse straight from the head with no further dispatch. Larger
+    /// buckets do one vectored read scattering the sorted index and entries
+    /// straight into their final chunk allocations.
+    async fn deserialize_file_content(
+        file: &lore_io::IoFile,
+        file_size: usize,
+        head: &[u8],
         latest_version: u32,
     ) -> Result<
         (
@@ -288,13 +331,11 @@ impl MutableStoreBucket {
         ),
         DeserializeFileError,
     > {
-        let file_size = file
-            .metadata()
-            .map_err(|err| DeserializeFileError::Corrupt(format!("read metadata: {err}")))?
-            .len() as usize;
-        // Guard against underflow before the count subtraction below.
+        // Guard against underflow before the count subtraction below. The head covers the whole
+        // file when it is smaller than the head length, so a head too short for the header is a
+        // file too short for one.
         let header_size = size_of::<MutableStoreHeader>();
-        if file_size < header_size {
+        if head.len() < header_size {
             return Err(DeserializeFileError::Corrupt(format!(
                 "file size {file_size} smaller than header size {header_size}"
             )));
@@ -306,8 +347,7 @@ impl MutableStoreBucket {
         }
 
         let mut header = MutableStoreHeader::new_zeroed();
-        file.read_exact(header.as_mut_bytes())
-            .map_err(|err| DeserializeFileError::Corrupt(format!("read header: {err}")))?;
+        header.as_mut_bytes().copy_from_slice(&head[..header_size]);
 
         if (header.version > latest_version) && (header.version < 0xFFFF) {
             return Err(DeserializeFileError::FutureVersion(header.version));
@@ -320,17 +360,33 @@ impl MutableStoreBucket {
             )));
         }
 
-        let sorted_index = GrowVec::read_from_file(file, expected_count)
-            .map_err(|err| DeserializeFileError::Corrupt(format!("read sorted index: {err}")))?;
-        let entry = GrowVec::read_from_file(file, expected_count)
-            .map_err(|err| DeserializeFileError::Corrupt(format!("read entries: {err}")))?;
+        if file_size <= head.len() {
+            let mut reader = &head[header_size..];
+            let sorted_index = GrowVec::read_from(&mut reader, expected_count).map_err(|err| {
+                DeserializeFileError::Corrupt(format!("read sorted index: {err}"))
+            })?;
+            let entry = GrowVec::read_from(&mut reader, expected_count)
+                .map_err(|err| DeserializeFileError::Corrupt(format!("read entries: {err}")))?;
+            return Ok((sorted_index, entry, header.version));
+        }
 
-        Ok((sorted_index, entry, header.version))
+        let segments = MutableBucketSegments {
+            // SAFETY: the scatter below fills every byte of both vectors or fails, and a
+            // failure drops them here rather than returning them.
+            sorted_index: unsafe { GrowVec::new_unzeroed_with_size(expected_count) },
+            entry: unsafe { GrowVec::new_unzeroed_with_size(expected_count) },
+        };
+        let segments = file
+            .read_exact_vectored_at(segments, header_size as u64)
+            .await
+            .map_err(|err| DeserializeFileError::Corrupt(format!("read bucket data: {err}")))?;
+
+        Ok((segments.sorted_index, segments.entry, header.version))
     }
 
     /// Drop the corrupt file and return an empty bucket. The lost entries repopulate from the
     /// immutable store or remote on the next sync.
-    fn recover_corrupt_bucket(
+    async fn recover_corrupt_bucket(
         path: &Path,
         reason: String,
         latest_version: u32,
@@ -346,7 +402,7 @@ impl MutableStoreBucket {
             "Resetting corrupt mutable bucket {} after deserialize failure: {reason}. Bucket lookup state lost; entries repopulate from the immutable store / remote on next sync.",
             path.display()
         );
-        if let Err(err) = std::fs::remove_file(path)
+        if let Err(err) = lore_io::IoDriver::global().remove_file(path).await
             && err.kind() != ErrorKind::NotFound
         {
             return Err(LocalMutableStoreError::internal_with_context(
@@ -378,16 +434,7 @@ impl MutableStoreBucket {
 
         let path = format_bucket_path(path, group_index, bucket_index);
 
-        let (sorted_index, entry, version) =
-            lore_base::lore_spawn_blocking!(move || Self::deserialize_files(path, authoritative))
-                .await
-                .map_err(|err| {
-                    LocalMutableStoreError::internal_with_context(
-                        err,
-                        "mutable store deserialize task failed",
-                    )
-                })
-                .flatten()?;
+        let (sorted_index, entry, version) = Self::deserialize_files(path, authoritative).await?;
 
         self.sorted_index = sorted_index;
         self.entry = entry;
@@ -397,7 +444,7 @@ impl MutableStoreBucket {
         Ok(())
     }
 
-    fn serialize_files(
+    async fn serialize_files(
         bucket: OwnedRwLockReadGuard<MutableStoreBucket, MutableStoreBucket>,
         group: Arc<MutableStoreGroup>,
         bucket_index: usize,
@@ -424,23 +471,10 @@ impl MutableStoreBucket {
         if let Some(parent_path) = temporary_path.parent()
             && !parent_path.exists()
         {
-            let _ = std::fs::create_dir_all(parent_path);
+            let _ = lore_io::IoDriver::global()
+                .create_dir_all(parent_path)
+                .await;
         }
-
-        let mut file_options = std::fs::File::options();
-        file_options
-            .read(false)
-            .write(true)
-            .create(true)
-            .truncate(true);
-        #[cfg(target_family = "windows")]
-        {
-            // Prevent any other process from writing the file
-            file_options.share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
-        }
-        let mut file = file_options
-            .open(&temporary_path)
-            .internal("opening mutable store bucket file for write")?;
 
         let count = bucket.entry.len();
         if bucket.sorted_index.len() != count {
@@ -453,37 +487,35 @@ impl MutableStoreBucket {
         header.version = group.serialize_version.load(atomic::Ordering::Relaxed);
         header.count = count as u32;
 
-        file.write_all(header.as_bytes())
-            .internal("writing mutable store bucket header")?;
+        let segments = MutableBucketWriteSegments {
+            header: {
+                let mut bytes = Box::new([0u8; size_of::<MutableStoreHeader>()]);
+                bytes.copy_from_slice(header.as_bytes());
+                bytes
+            },
+            bucket,
+        };
 
-        bucket
-            .sorted_index
-            .write_to_file(&mut file)
-            .internal("writing mutable store bucket sorted index")?;
-
-        bucket
-            .entry
-            .write_to_file(&mut file)
-            .internal("writing mutable store bucket entries")?;
-
-        if sync_data {
-            file.sync_all()
-                .internal("syncing mutable store bucket to disk")?;
-        }
-        drop(file);
-
+        let file_options = lore_io::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true);
+        // Prevent any other process from writing the file
+        #[cfg(target_family = "windows")]
+        let file_options =
+            file_options.share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
         if let Some(mut guard) = temporary_guard.take() {
-            fs_util::rename_file(temporary_path.as_path(), path.as_path())
-                .internal("renaming mutable store bucket temporary file")?;
+            lore_io::IoDriver::global()
+                .write_file_segments_atomic(&temporary_path, &path, &file_options, segments)
+                .await
+                .internal("writing mutable store bucket")?;
 
             guard.success();
-        }
-
-        if sync_data
-            && let Some(parent_path) = temporary_path.parent()
-            && let Err(err) = fs_util::sync_dir(parent_path)
-        {
-            lore_base::lore_debug!("Failed to flush and sync mutable index directory: {err}");
+        } else {
+            lore_io::IoDriver::global()
+                .write_file_segments(&path, &file_options, segments, false)
+                .await
+                .internal("writing mutable store bucket")?;
         }
 
         Ok(())
@@ -515,17 +547,7 @@ impl MutableStoreBucket {
 
         let path = format_bucket_path(path, group_index, bucket_index);
 
-        lore_base::lore_spawn_blocking!(move || {
-            Self::serialize_files(bucket, group, bucket_index, path, sync_data)
-        })
-        .await
-        .map_err(|err| {
-            LocalMutableStoreError::internal_with_context(
-                err,
-                "mutable store serialize task failed",
-            )
-        })
-        .flatten()
+        Self::serialize_files(bucket, group, bucket_index, path, sync_data).await
     }
 
     /// Serialize the bucket to its `.new` twin during a fan-out commit. Differs from the regular
@@ -559,17 +581,7 @@ impl MutableStoreBucket {
             PathBuf::from(p)
         };
 
-        lore_base::lore_spawn_blocking!(move || {
-            Self::serialize_files(bucket, group, bucket_index, new_path, sync_data)
-        })
-        .await
-        .map_err(|err| {
-            LocalMutableStoreError::internal_with_context(
-                err,
-                "mutable store serialize_to_new task failed",
-            )
-        })
-        .flatten()
+        Self::serialize_files(bucket, group, bucket_index, new_path, sync_data).await
     }
 
     pub fn lookup(&self, partition: Partition, key: Hash) -> (Hash, bool, usize) {
@@ -686,17 +698,6 @@ impl MutableStoreBucket {
     }
 }
 
-fn read_u32(file: &mut std::fs::File) -> io::Result<u32> {
-    let mut buf = [0u8; 4];
-    file.read_exact(&mut buf)?;
-    Ok(u32::from_ne_bytes(buf))
-}
-
-fn write_u32(mut file: &std::fs::File, value: u32) -> io::Result<()> {
-    let buf = u32::to_ne_bytes(value);
-    file.write_all(&buf)
-}
-
 impl LocalMutableStore {
     pub async fn new(
         path: Option<impl AsRef<Path>>,
@@ -714,28 +715,29 @@ impl LocalMutableStore {
         let mut needs_upgrade = false;
         let mut version = MutableStoreVersion::Initial;
         let lock = if let Some(path) = mutable_path.as_deref() {
-            let lock_path = path.clone();
-            let lock = lore_base::lore_spawn_blocking!(|| {
-                if !lock_path.exists() {
-                    let _ = std::fs::create_dir_all(lock_path.as_path());
-                }
-                FSLock::acquire_directory_lock(lock_path)
-            })
-            .await
-            .map_err(|err| io::Error::other(format!("Store lock task failed: {err}")))
-            .flatten()
-            .internal("acquiring mutable store lock")?;
+            if !path.exists() {
+                let _ = lore_io::IoDriver::global()
+                    .create_dir_all(path.as_path())
+                    .await;
+            }
+            let lock = FSLock::acquire_directory_lock(path.as_path())
+                .await
+                .internal("acquiring mutable store lock")?;
 
             let index_existed = std::fs::exists(path.join("index")).unwrap_or_default();
 
             // Check store version
             let version_path = path.join("version");
-            if let Ok(mut version_file) = std::fs::OpenOptions::new()
-                .read(true)
-                .write(false)
-                .open(&version_path)
+            if let Ok(bytes) = lore_io::IoDriver::global()
+                .read_file_bytes(&version_path)
+                .await
             {
-                match read_u32(&mut version_file).unwrap_or_default() {
+                let stored = bytes
+                    .as_ref()
+                    .get(..4)
+                    .map(|value| u32::from_ne_bytes(value.try_into().expect("4 bytes")))
+                    .unwrap_or_default();
+                match stored {
                     x if x == MutableStoreVersion::LazyFanOut as u32 => {
                         version = MutableStoreVersion::LazyFanOut;
                     }
@@ -749,52 +751,27 @@ impl LocalMutableStore {
             };
 
             if version == MutableStoreVersion::Initial {
-                if index_existed {
-                    // Pre-existing store needs migration — defer until remote is available
+                // Pre-existing stores need migration (defer until remote is
+                // available); brand new stores write LazyFanOut directly.
+                let stored_version = if index_existed {
                     needs_upgrade = true;
-
-                    // Write in-progress version marker
-                    let version_file = std::fs::OpenOptions::new()
-                        .write(true)
-                        .truncate(true)
-                        .create(true)
-                        .open(&version_path)
-                        .map_err(|err| {
-                            LocalMutableStoreError::internal_with_context(
-                                err,
-                                "Failed to upgrade mutable store",
-                            )
-                        })?;
-
-                    write_u32(&version_file, version as u32).map_err(|err| {
+                    version as u32
+                } else {
+                    MutableStoreVersion::LazyFanOut as u32
+                };
+                lore_io::IoDriver::global()
+                    .write_file_bytes(
+                        &version_path,
+                        bytes::Bytes::copy_from_slice(&stored_version.to_ne_bytes()),
+                        false,
+                    )
+                    .await
+                    .map_err(|err| {
                         LocalMutableStoreError::internal_with_context(
                             err,
                             "Failed to upgrade mutable store",
                         )
                     })?;
-                } else {
-                    // Brand new store — write LazyFanOut directly, no migration needed.
-                    let version_file = std::fs::OpenOptions::new()
-                        .write(true)
-                        .truncate(true)
-                        .create(true)
-                        .open(&version_path)
-                        .map_err(|err| {
-                            LocalMutableStoreError::internal_with_context(
-                                err,
-                                "Failed to upgrade mutable store",
-                            )
-                        })?;
-
-                    write_u32(&version_file, MutableStoreVersion::LazyFanOut as u32).map_err(
-                        |err| {
-                            LocalMutableStoreError::internal_with_context(
-                                err,
-                                "Failed to upgrade mutable store",
-                            )
-                        },
-                    )?;
-                }
             }
             Some(lock)
         } else {
@@ -822,7 +799,7 @@ impl LocalMutableStore {
                 // Roll forward any pending fan-out commit before reading the marker. After this returns the marker reflects the post-recovery state.
                 if group_path.exists()
                     && let Err(err) =
-                        crate::local::fan_out::recover_level_transition(&group_path, false)
+                        crate::local::fan_out::recover_level_transition(&group_path, false).await
                 {
                     return Err(LocalMutableStoreError::internal_with_context(
                         err,
@@ -1007,12 +984,16 @@ impl LocalMutableStore {
 
                 if needs_two_phase_commit && first_err.is_none() {
                     // T10 two-phase commit. Every [0..active_buckets] bucket gets a .new file (skipping empties at index >= committed_level since no old file exists there to overwrite). After all .new files are durable, write level.pending as the commit point. Then rename .new -> final, write the level marker, delete level.pending. Recovery on the next store open rolls forward from any pending state.
-                    if let Err(e) = std::fs::create_dir_all(&group_path).map_err(|e| {
-                        LocalMutableStoreError::internal_with_context(
-                            e,
-                            "Failed to create group directory for fan-out commit",
-                        )
-                    }) {
+                    if let Err(e) = lore_io::IoDriver::global()
+                        .create_dir_all(&group_path)
+                        .await
+                        .map_err(|e| {
+                            LocalMutableStoreError::internal_with_context(
+                                e,
+                                "Failed to create group directory for fan-out commit",
+                            )
+                        })
+                    {
                         first_err = Some(e);
                     }
 
@@ -1060,6 +1041,7 @@ impl LocalMutableStore {
                                 active_buckets,
                                 sync_data,
                             )
+                            .await
                             .map_err(|e| {
                                 LocalMutableStoreError::internal_with_context(
                                     e,
@@ -1082,6 +1064,7 @@ impl LocalMutableStore {
                                 active_buckets,
                                 sync_data,
                             )
+                            .await
                             .map_err(|e| {
                                 LocalMutableStoreError::internal_with_context(
                                     e,
@@ -1100,7 +1083,9 @@ impl LocalMutableStore {
                                 );
                                 let final_path =
                                     crate::local::fan_out::bucket_path(&group_path, bucket_index);
-                                if let Err(err) = std::fs::rename(&new_path, &final_path)
+                                if let Err(err) = lore_io::IoDriver::global()
+                                    .rename(&new_path, &final_path)
+                                    .await
                                     && first_err.is_none()
                                 {
                                     first_err = Some(
@@ -1119,6 +1104,7 @@ impl LocalMutableStore {
                                 active_buckets,
                                 sync_data,
                             )
+                            .await
                             .map_err(|e| {
                                 LocalMutableStoreError::internal_with_context(
                                     e,
@@ -1130,15 +1116,15 @@ impl LocalMutableStore {
                         }
 
                         if first_err.is_none()
-                            && let Err(err) = crate::local::fan_out::delete_level_pending(
-                                &group_path,
-                            )
-                            .map_err(|e| {
-                                LocalMutableStoreError::internal_with_context(
-                                    e,
-                                    "Failed to delete level.pending",
-                                )
-                            })
+                            && let Err(err) =
+                                crate::local::fan_out::delete_level_pending(&group_path)
+                                    .await
+                                    .map_err(|e| {
+                                        LocalMutableStoreError::internal_with_context(
+                                            e,
+                                            "Failed to delete level.pending",
+                                        )
+                                    })
                         {
                             first_err = Some(err);
                         }
@@ -1701,38 +1687,89 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    #[test]
-    fn deserialize_accepts_typed_items_v2() {
+    /// A bucket larger than the head the composite open returns is loaded by scattering one
+    /// vectored read into both `GrowVec`s. Per-index contents make a misplaced chunk visible as
+    /// swapped entries rather than as a length mismatch.
+    #[tokio::test]
+    async fn deserialize_scatters_a_bucket_larger_than_the_head_read() {
+        let dir = crate::test_util::TempDir::new("ms_scatter_");
+        let path = dir.path().join("bucket");
+
+        let head = crate::local::immutable_store::BUCKET_HEAD_READ;
+        let per_entry = size_of::<u32>() + size_of::<MutableStoreEntry>();
+        let count = (head / per_entry) + 64;
+        assert!(
+            size_of::<MutableStoreHeader>() + count * per_entry > head,
+            "the bucket has to exceed the head read for this to test anything"
+        );
+
+        let mut header = MutableStoreHeader::new_zeroed();
+        header.version = MutableStoreVersion::LazyFanOut as u32;
+        header.count = count as u32;
+
+        let mut bytes = Vec::with_capacity(size_of::<MutableStoreHeader>() + count * per_entry);
+        bytes.extend_from_slice(header.as_bytes());
+        for index in 0..count {
+            bytes.extend_from_slice(&(index as u32).to_le_bytes());
+        }
+        for index in 0..count {
+            let entry = MutableStoreEntry {
+                key: Hash::from([index as u8; 32]),
+                ..Default::default()
+            };
+            bytes.extend_from_slice(entry.as_bytes());
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (sorted_index, entry, version) = MutableStoreBucket::deserialize_files(path, false)
+            .await
+            .unwrap();
+
+        assert_eq!(version, MutableStoreVersion::LazyFanOut as u32);
+        assert_eq!(sorted_index.len(), count);
+        assert_eq!(entry.len(), count);
+        for index in 0..count {
+            assert_eq!(sorted_index[index], index as u32, "sorted index at {index}");
+            assert_eq!(
+                entry[index].key,
+                Hash::from([index as u8; 32]),
+                "key at {index}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deserialize_accepts_typed_items_v2() {
         let dir = crate::test_util::TempDir::new("ms_v2_");
         let path = dir.path().join("bucket");
         write_bucket_file(&path, MutableStoreVersion::TypedItems as u32);
-        let result = MutableStoreBucket::deserialize_files(path, false);
+        let result = MutableStoreBucket::deserialize_files(path, false).await;
         assert!(result.is_ok(), "v2 (TypedItems) bucket should deserialize");
     }
 
-    #[test]
-    fn deserialize_accepts_lazy_fan_out_v3() {
+    #[tokio::test]
+    async fn deserialize_accepts_lazy_fan_out_v3() {
         let dir = crate::test_util::TempDir::new("ms_v3_");
         let path = dir.path().join("bucket");
         write_bucket_file(&path, MutableStoreVersion::LazyFanOut as u32);
-        let result = MutableStoreBucket::deserialize_files(path, false);
+        let result = MutableStoreBucket::deserialize_files(path, false).await;
         assert!(result.is_ok(), "v3 (LazyFanOut) bucket should deserialize");
     }
 
-    #[test]
-    fn deserialize_rejects_unknown_future_version() {
+    #[tokio::test]
+    async fn deserialize_rejects_unknown_future_version() {
         let dir = crate::test_util::TempDir::new("ms_v100_");
         let path = dir.path().join("bucket");
         write_bucket_file(&path, 100);
-        let result = MutableStoreBucket::deserialize_files(path, false);
+        let result = MutableStoreBucket::deserialize_files(path, false).await;
         assert!(result.is_err(), "v100 bucket should be rejected as too new");
     }
 
     /// A torn write can leave a bucket file at its correct byte length but entirely
     /// zero-filled, so the header reads count=0 while the size implies a nonzero count. This
     /// recovers to an empty bucket rather than hard-erroring.
-    #[test]
-    fn deserialize_recovers_zero_filled_bucket() {
+    #[tokio::test]
+    async fn deserialize_recovers_zero_filled_bucket() {
         let dir = crate::test_util::TempDir::new("ms_zerofill_");
         let path = dir.path().join("bucket");
         // Correct length for a 1-entry bucket, but all zeros.
@@ -1741,21 +1778,22 @@ mod tests {
         std::fs::write(&path, vec![0u8; len]).unwrap();
 
         let (sorted_index, entry, version) = MutableStoreBucket::deserialize_files(path, false)
+            .await
             .expect("zero-filled bucket should recover to empty");
         assert_eq!(sorted_index.len(), 0);
         assert_eq!(entry.len(), 0);
         assert_eq!(version, MutableStoreVersion::LazyFanOut as u32);
     }
 
-    #[test]
-    fn deserialize_authoritative_errors_and_preserves_corrupt_bucket() {
+    #[tokio::test]
+    async fn deserialize_authoritative_errors_and_preserves_corrupt_bucket() {
         let dir = crate::test_util::TempDir::new("ms_auth_corrupt_");
         let path = dir.path().join("bucket");
         let len =
             size_of::<MutableStoreHeader>() + size_of::<u32>() + size_of::<MutableStoreEntry>();
         std::fs::write(&path, vec![0u8; len]).unwrap();
 
-        let result = MutableStoreBucket::deserialize_files(path.clone(), true);
+        let result = MutableStoreBucket::deserialize_files(path.clone(), true).await;
         assert!(
             result.is_err(),
             "authoritative store must not reset a corrupt bucket"
@@ -1771,12 +1809,14 @@ mod tests {
         assert_eq!(MutableStoreVersion::LazyFanOut as u32, 3);
     }
 
-    #[test]
-    fn latest_version_constant_in_deserialize_path_matches_lazy_fan_out() {
+    #[tokio::test]
+    async fn latest_version_constant_in_deserialize_path_matches_lazy_fan_out() {
         let dir = crate::test_util::TempDir::new("ms_latest_");
         let path = dir.path().join("bucket");
         write_bucket_file(&path, MutableStoreVersion::LazyFanOut as u32);
-        let (_, _, version) = MutableStoreBucket::deserialize_files(path, false).unwrap();
+        let (_, _, version) = MutableStoreBucket::deserialize_files(path, false)
+            .await
+            .unwrap();
         assert_eq!(version, MutableStoreVersion::LazyFanOut as u32);
     }
 

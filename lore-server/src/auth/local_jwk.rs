@@ -33,11 +33,25 @@ impl LocalJwkService {
 #[async_trait]
 impl JWKService for LocalJwkService {
     async fn get_key(&self, kid: &str) -> Result<(DecodingKey, Algorithm), JWKServiceError> {
+        self.get_cached_key(kid).ok_or(JWKServiceError::NotFound)
+    }
+
+    // The whole accept-list lives in memory, so the synchronous hot path
+    // can always answer for a known kid.
+    fn get_cached_key(&self, kid: &str) -> Option<(DecodingKey, Algorithm)> {
         self.keys
             .iter()
             .find(|(key_id, _, _)| key_id == kid)
             .map(|(_, key, alg)| (key.clone(), *alg))
-            .ok_or(JWKServiceError::NotFound)
+    }
+
+    /// Local keys live for the process; there is never fresher material to
+    /// fetch, so a rotation suspicion can only answer "unchanged".
+    async fn refresh_key(
+        &self,
+        _kid: &str,
+    ) -> Result<Option<(DecodingKey, Algorithm)>, JWKServiceError> {
+        Ok(None)
     }
 }
 

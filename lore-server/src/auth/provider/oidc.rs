@@ -408,13 +408,25 @@ pub(crate) mod test_support {
             &self,
             kid: &str,
         ) -> Result<(DecodingKey, jsonwebtoken::Algorithm), JWKServiceError> {
-            if kid != KID {
-                return Err(JWKServiceError::NotFound);
-            }
-            Ok((
-                DecodingKey::from_secret(SIGNING_SECRET.as_ref()),
-                jsonwebtoken::Algorithm::HS256,
-            ))
+            self.get_cached_key(kid).ok_or(JWKServiceError::NotFound)
+        }
+
+        fn get_cached_key(&self, kid: &str) -> Option<(DecodingKey, jsonwebtoken::Algorithm)> {
+            (kid == KID).then(|| {
+                (
+                    DecodingKey::from_secret(SIGNING_SECRET.as_ref()),
+                    jsonwebtoken::Algorithm::HS256,
+                )
+            })
+        }
+
+        // The static test key never rotates; a refresh can only answer
+        // "unchanged".
+        async fn refresh_key(
+            &self,
+            _kid: &str,
+        ) -> Result<Option<(DecodingKey, jsonwebtoken::Algorithm)>, JWKServiceError> {
+            Ok(None)
         }
     }
 

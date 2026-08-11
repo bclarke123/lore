@@ -312,7 +312,7 @@ mod tests {
                     presign_config: Some(test_presign_config()),
                     local_auth: None,
                 };
-                let settings = LoreHttpServerSettings::default();
+                let settings = LoreHttpServerSettings::test_default();
                 let server =
                     TestServer::new(create_router(state, test_health, &settings)).unwrap();
 

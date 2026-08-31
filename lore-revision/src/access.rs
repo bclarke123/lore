@@ -101,22 +101,53 @@ fn grants_key(repository: &RepositoryContext) -> (Hash, KeyType) {
     (key, KeyType::AccessControl)
 }
 
+/// The discriminant [`KeyType::AccessControl`] held before the 0.9.1 upstream
+/// merge renumbered it to 8 (upstream took 7 for `Resolve`). The mutable
+/// store stamps the discriminant into the row key, so grant pointers written
+/// by a pre-merge server live at this slot. Reading it as a fallback cannot
+/// collide with real `Resolve` rows: the key hash is derived from
+/// [`GRANTS_FUNCTION`], and nothing but grant pointers was ever written
+/// under it.
+const LEGACY_GRANTS_KEY_TYPE: KeyType = KeyType::Resolve;
+
+/// The grants pointer plus which key slot held it.
+struct GrantsPointer {
+    hash: Hash,
+    /// Found under [`LEGACY_GRANTS_KEY_TYPE`]; the current key holds nothing,
+    /// so a compare-and-swap on it must expect the default hash, and a write
+    /// through the current key permanently shadows the legacy row.
+    legacy: bool,
+}
+
 /// Load the current grants pointer, mapping "never written" to the default
-/// hash.
-async fn load_pointer(repository: &Arc<RepositoryContext>) -> Result<Hash, RepositoryError> {
+/// hash. A miss at the current key falls back to the pre-0.9.1 key slot so
+/// grants written before the `KeyType` renumbering stay readable.
+async fn load_pointer(
+    repository: &Arc<RepositoryContext>,
+) -> Result<GrantsPointer, RepositoryError> {
     let (key, key_type) = grants_key(repository);
-    match repository
-        .read_mutable_store()
-        .load(repository.id, key, key_type)
-        .await
-    {
-        Ok(hash) => Ok(hash),
-        // Missing key or tombstone both mean "no grants yet".
-        Err(lore_storage::StoreError::AddressNotFound(_)) => Ok(Hash::default()),
-        Err(err) => {
-            Err(err).forward::<RepositoryError>("Failed to load access-control grants pointer")
+    for (key_type, legacy) in [(key_type, false), (LEGACY_GRANTS_KEY_TYPE, true)] {
+        match repository
+            .read_mutable_store()
+            .load(repository.id, key, key_type)
+            .await
+        {
+            // Found. A default hash is a tombstone — "cleared here", an
+            // explicit state that must not fall through to the legacy slot
+            // and resurrect old grants.
+            Ok(hash) => return Ok(GrantsPointer { hash, legacy }),
+            // Never written at this slot: try the next one.
+            Err(lore_storage::StoreError::AddressNotFound(_)) => {}
+            Err(err) => {
+                return Err(err)
+                    .forward::<RepositoryError>("Failed to load access-control grants pointer");
+            }
         }
     }
+    Ok(GrantsPointer {
+        hash: Hash::default(),
+        legacy: false,
+    })
 }
 
 async fn load_blob(
@@ -156,11 +187,28 @@ async fn store_blob(
 
 /// Load the grant set for the context's repository. A repository with no
 /// grants yet yields an empty set.
+///
+/// Grants found under the legacy key slot are re-registered under the
+/// current one when the context can write, so the fallback read is paid
+/// once per repository rather than on every load.
 pub async fn load_grants(
     repository: Arc<RepositoryContext>,
 ) -> Result<AccessGrants, RepositoryError> {
     let pointer = load_pointer(&repository).await?;
-    load_blob(&repository, pointer).await
+    if pointer.legacy
+        && let Some(handle) = repository.try_write_mutable_store()
+    {
+        let (key, key_type) = grants_key(&repository);
+        // Best-effort: expect "never written" at the current slot; a racing
+        // writer that got there first wins and this copy is a no-op.
+        let _ = handle
+            .compare_and_swap(repository.id, key, Hash::default(), pointer.hash, key_type)
+            .await
+            .inspect_err(|err| {
+                lore_base::lore_debug!("Failed to upgrade legacy access-control grants: {err}");
+            });
+    }
+    load_blob(&repository, pointer.hash).await
 }
 
 /// Apply `mutate` to the grant set under a compare-and-swap loop and return
@@ -172,11 +220,19 @@ pub async fn modify_grants(
 ) -> Result<AccessGrants, RepositoryError> {
     let (key, key_type) = grants_key(&repository);
     for _attempt in 0..CAS_ATTEMPTS {
-        let expected = load_pointer(&repository).await?;
-        let mut grants = load_blob(&repository, expected).await?;
+        let pointer = load_pointer(&repository).await?;
+        // A legacy-slot pointer means the current key holds nothing: the
+        // swap below expects the default hash there, and its success
+        // permanently shadows the legacy row.
+        let expected = if pointer.legacy {
+            Hash::default()
+        } else {
+            pointer.hash
+        };
+        let mut grants = load_blob(&repository, pointer.hash).await?;
         mutate(&mut grants);
         let updated = store_blob(&repository, &grants).await?;
-        if updated == expected {
+        if updated == pointer.hash {
             // No change; nothing to swap.
             return Ok(grants);
         }
@@ -201,6 +257,14 @@ pub async fn modify_grants(
 /// Remove every grant for the context's repository (repository deletion).
 pub async fn clear_grants(repository: Arc<RepositoryContext>) -> Result<(), RepositoryError> {
     modify_grants(repository, BTreeMap::clear).await.map(|_| ())
+}
+
+/// The grants pointer key plus its current and legacy key slots, exposed for
+/// the legacy-upgrade tests and nothing else.
+#[doc(hidden)]
+pub fn grants_slots(repository: &RepositoryContext) -> (Hash, KeyType, KeyType) {
+    let (key, current) = grants_key(repository);
+    (key, current, LEGACY_GRANTS_KEY_TYPE)
 }
 
 /// Convenience: a server context for grant operations against `repository`.

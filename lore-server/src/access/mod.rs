@@ -409,6 +409,105 @@ mod tests {
         Principals::from_claims(&claims(user_id, email))
     }
 
+    /// Grants written by a pre-0.9.1 server live under the discriminant
+    /// `AccessControl` held before the upstream merge renumbered it. They
+    /// must stay readable through the legacy-slot fallback and be
+    /// re-registered under the current slot on first load.
+    #[tokio::test]
+    async fn legacy_key_slot_grants_survive_and_upgrade() {
+        let (immutable, mutable_old, execution) = test_store_create().await.expect("test stores");
+        let (_imm2, mutable_new, _exec2) = test_store_create().await.expect("fresh stores");
+        let verifier = || JwtVerifier {
+            jwk_service: Arc::new(crate::auth::jwk::JwkServiceImpl::default()),
+            jwt_issuer: None,
+            jwt_audience: None,
+        };
+        let access_old = AccessControl::new(
+            immutable.clone(),
+            mutable_old.clone(),
+            verifier(),
+            Vec::new(),
+        );
+        let access_new = AccessControl::new(
+            immutable.clone(),
+            mutable_new.clone(),
+            verifier(),
+            Vec::new(),
+        );
+        Box::pin(
+            lore_base::runtime::LORE_CONTEXT.scope(execution, async move {
+                let project = repo("0194b726b34e72b0b45550b88a967076");
+                let alice = principals("static:alice", "alice@example.com");
+
+                // Write grants through the current slot, then relocate the
+                // pointer row to the legacy slot in a fresh mutable store:
+                // exactly what a pre-merge store looks like to a post-merge
+                // server (the blob itself lives in the shared immutable
+                // store and is unaffected by the renumbering).
+                access_old
+                    .grant(project, "static:alice", AccessRole::Write)
+                    .await
+                    .expect("grant");
+                access_old
+                    .grant(project, PUBLIC_PRINCIPAL, AccessRole::Read)
+                    .await
+                    .expect("public grant");
+                let ctx_old = lore_revision::access::server_context(
+                    immutable.clone(),
+                    mutable_old.clone(),
+                    project,
+                );
+                let (key, current_slot, legacy_slot) =
+                    lore_revision::access::grants_slots(&ctx_old);
+                let pointer = ctx_old
+                    .read_mutable_store()
+                    .load(project, key, current_slot)
+                    .await
+                    .expect("pointer");
+                let ctx_new = lore_revision::access::server_context(
+                    immutable.clone(),
+                    mutable_new.clone(),
+                    project,
+                );
+                ctx_new
+                    .try_write_mutable_store()
+                    .expect("write handle")
+                    .store(project, key, pointer, legacy_slot)
+                    .await
+                    .expect("legacy row");
+
+                // The post-merge server reads them through the fallback...
+                assert!(access_new.is_public(project).await.expect("is_public"));
+                assert_eq!(
+                    access_new.role_for(&alice, project).await.expect("role"),
+                    Some(AccessRole::Write)
+                );
+                // ...and the first load re-registered the pointer under the
+                // current slot, so the fallback read is paid only once.
+                assert_eq!(
+                    ctx_new
+                        .read_mutable_store()
+                        .load(project, key, current_slot)
+                        .await
+                        .expect("upgraded pointer"),
+                    pointer
+                );
+
+                // Later modifications go through the current slot cleanly.
+                access_new
+                    .grant(project, "static:bob", AccessRole::Read)
+                    .await
+                    .expect("post-upgrade grant");
+                let bob = principals("static:bob", "bob@example.com");
+                assert_eq!(
+                    access_new.role_for(&bob, project).await.expect("role"),
+                    Some(AccessRole::Read)
+                );
+            }),
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn deny_by_default_then_grant_then_revoke() {
         let (access, execution) = access_with_admins(vec![]).await;

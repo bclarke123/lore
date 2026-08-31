@@ -5,7 +5,6 @@ use std::sync::Arc;
 use lore_error_set::prelude::*;
 
 use super::LinkError;
-use crate::error::LoreResultExt;
 use crate::link;
 use crate::link::LinkFlags;
 use crate::lore::Hash;
@@ -29,9 +28,16 @@ pub(crate) async fn reset_staged_add_link(
     let absolute_path = link_path.to_absolute_path(repository.require_path()?);
 
     // If the link replaced a committed directory, `link::add` staged that
-    // directory node for delete. Capture it so we can restore it.
+    // directory node for delete. Capture it so we can restore it. Resolve
+    // against the link node's path WITHIN its owning repository (not the full
+    // top-level `link_path`), so this works for a nested link whose owning
+    // state is a linked repo rather than the top-level one.
+    let owner_relative_path = state_staged
+        .node_path(repository.clone(), link_node_id)
+        .await
+        .unwrap_or_else(|_| link_path.as_str().to_string());
     let committed_directory_node = state_current
-        .find_node_link(repository.clone(), link_path.as_str())
+        .find_node_link(repository.clone(), &owner_relative_path)
         .await
         .ok()
         .filter(|node_link| node_link.is_valid())
@@ -44,9 +50,7 @@ pub(crate) async fn reset_staged_add_link(
 
     util::fs::unlink_recursive(absolute_path.as_path())
         .await
-        .emit_map_err(LinkError::internal(
-            "Failed to remove realized link directory",
-        ))?;
+        .internal("removing the realized link directory")?;
 
     if let Some(committed_node_id) = committed_directory_node {
         // Restore the committed directory: recreate the empty placeholder on
@@ -55,9 +59,7 @@ pub(crate) async fn reset_staged_add_link(
         lore_io::IoDriver::global()
             .create_dir_all(absolute_path.as_path())
             .await
-            .emit_map_err(LinkError::internal(
-                "Failed to recreate placeholder directory",
-            ))?;
+            .internal("recreating the placeholder directory")?;
 
         let block_index = NodeBlock::index(committed_node_id);
         let node_index = Node::index(committed_node_id);
@@ -128,7 +130,7 @@ pub(crate) async fn reset_staged_remove_link(
     lore_io::IoDriver::global()
         .create_dir_all(absolute_path.as_path())
         .await
-        .emit_map_err(LinkError::internal("Failed to recreate link directory"))?;
+        .internal("recreating the link directory")?;
 
     let linked_repository = Arc::new(repository.to_link_context(link_id).await);
     link::realize_link_pin_change(

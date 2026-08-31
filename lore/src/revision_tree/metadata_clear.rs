@@ -133,8 +133,6 @@ fn validate_entries(
         if entry_id != 0 && !ids.insert(entry_id) {
             return Err(reject(entry_id, index, "two entries share one caller id"));
         }
-        // Sound because the entry point checked every string the call carries
-        // before dispatching it.
         if entry.key.as_str().is_empty() {
             return Err(reject(entry_id, index, "key must not be empty"));
         }
@@ -196,6 +194,10 @@ fn apply_entries(
 /// The whole batch applies under one write lock on the pending metadata, which
 /// is what makes it atomic and is why there is no fan-out: the work is buffer
 /// edits, not I/O. Per-entry events are therefore ordered by entry index.
+///
+/// The handle is claimed even though this edits no tree: that pending buffer is
+/// what a commit clones and then empties, so a clear landing inside a commit would
+/// apply to metadata the commit has already taken.
 pub async fn metadata_clear(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeMetadataClearArgs,
@@ -238,6 +240,7 @@ async fn metadata_clear_impl(
         async move |internal: Arc<RevisionTreeInternal>,
                     args: LoreRevisionTreeMetadataClearArgs| {
             let batch_id = args.batch_id;
+            let _access = internal.access_shared().await;
             let result = metadata_clear_batch(&internal, &args);
             emit_batch_complete(batch_id, batch_error_code(&result));
             result
@@ -477,7 +480,7 @@ mod tests {
             .serialize(internal.repository_context.clone())
             .await
             .expect("serializing the fragment must succeed");
-        internal.state.set_metadata_hash(hash);
+        internal.state_for_tests().set_metadata_hash(hash);
 
         let (status, events) = run_clear(handle, vec![clear_entry(10, "parent-key")]).await;
         assert_eq!(status, 0, "clearing an unset key is a no-op success");

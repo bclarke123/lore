@@ -15,7 +15,6 @@ use lore_base::types::Address;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
-use lore_revision::errors::StateErrors;
 use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
@@ -144,12 +143,11 @@ fn batch_error_code(result: &Result<(), AddError>) -> LoreErrorCode {
     }
 }
 
-/// Zero the fields a kind does not carry, and assign a file id where one is due.
+/// Zero the fields a kind does not carry.
 ///
 /// A directory's size and address are derived when the revision is committed and
 /// a link has no content of its own, so a value supplied for either is dropped
-/// rather than stored. A file arriving without a file id is given a generated one
-/// so it has a stable identity before commit.
+/// rather than stored.
 fn fields_for_kind(flags: NodeFlags, size: u64, address: Address) -> (u64, Address) {
     if flags.is_directory() {
         return (0, Address::default());
@@ -157,11 +155,23 @@ fn fields_for_kind(flags: NodeFlags, size: u64, address: Address) -> (u64, Addre
     if flags.contains(NodeFlags::Link) {
         return (0, address);
     }
-    let mut address = address;
-    if address.context.is_zero() {
-        address.context = uuid::Uuid::now_v7().into();
-    }
     (size, address)
+}
+
+/// Give a file arriving without a file id a generated one, so it has a stable
+/// identity before commit.
+///
+/// Only for a node being created. A node being restored already has an identity,
+/// and generating one here would leave the restore unable to keep it — the zero
+/// context that means "preserve" would never reach [`State::node_undelete`].
+fn with_generated_file_id(flags: NodeFlags, address: Address) -> Address {
+    if flags.is_directory() || flags.contains(NodeFlags::Link) || !address.context.is_zero() {
+        return address;
+    }
+    Address {
+        context: uuid::Uuid::now_v7().into(),
+        ..address
+    }
 }
 
 /// Map a `LoreNodeType` `kind` to its node flags; `None` if unsupported.
@@ -193,6 +203,10 @@ struct Planned {
     entry_id: u64,
     entry_index: usize,
     parent: ParentRef,
+    /// An existing node staged for deletion that this entry takes back into the
+    /// revision instead of creating one. Set only when the name is held by a
+    /// deleted child of the same kind.
+    restore: Option<NodeID>,
     node: Node,
 }
 
@@ -230,28 +244,138 @@ fn reject_internal(
     AddError::internal_with_context(error, &format!("entry {entry_index}: {context}"))
 }
 
-/// Name hashes of every existing child of `parent`, collected in one walk of the
-/// sibling chain and sorted for lookup.
-///
-/// A sorted `Vec` rather than a set: the values are already hashes, so a hash set
-/// would run each of them through the hasher a second time, and would carry
-/// bucket overhead on a collection whose size is the parent's child count rather
-/// than anything the batch chose.
-async fn child_name_hashes(
+/// A child staged for deletion, which a matching name may restore rather than
+/// collide with.
+#[derive(Clone, Copy)]
+struct DeletedChild {
+    name_hash: u64,
+    node_id: NodeID,
+    /// The node's own type flags, so a restore only happens for the same kind.
+    kind: NodeFlags,
+}
+
+/// The existing children of one parent, split by whether they still belong to
+/// the revision.
+struct ChildNames {
+    /// Name hashes of the children a name would collide with, sorted for lookup.
+    ///
+    /// A sorted `Vec` rather than a set: the values are already hashes, so a hash
+    /// set would run each of them through the hasher a second time, and would
+    /// carry bucket overhead on a collection whose size is the parent's child
+    /// count rather than anything the batch chose.
+    live: Vec<u64>,
+    /// The children staged for deletion. A name matching one of these restores it
+    /// instead of creating a node, so this keeps the node id and the kind the
+    /// direct lookup would otherwise have to fetch again. Scanned rather than
+    /// searched: it is empty unless something in this parent has been deleted.
+    deleted: Vec<DeletedChild>,
+}
+
+/// What an existing parent already holds under a name.
+enum NameLookup {
+    /// Nothing holds the name.
+    Vacant,
+    /// A child that belongs to the revision holds it.
+    Live,
+    /// Only a child staged for deletion holds it, and it can be restored.
+    Deleted(DeletedChild),
+}
+
+impl ChildNames {
+    /// What this parent holds under `name_hash`, for a node of `kind`.
+    ///
+    /// A live child wins over a deleted one: the name is genuinely taken, and a
+    /// deleted namesake alongside it is the remains of an earlier replacement. A
+    /// deleted child of a different kind does not answer the name either — the
+    /// caller is replacing the node rather than restoring it.
+    fn lookup(&self, name_hash: u64, kind: NodeFlags) -> NameLookup {
+        if self.live.binary_search(&name_hash).is_ok() {
+            return NameLookup::Live;
+        }
+        match self
+            .deleted
+            .iter()
+            .find(|child| child.name_hash == name_hash && child.kind == kind)
+        {
+            Some(child) => NameLookup::Deleted(*child),
+            None => NameLookup::Vacant,
+        }
+    }
+}
+
+/// Every existing child of `parent`, collected in one walk of the sibling chain.
+async fn child_names(
     state: &Arc<State>,
     context: &Arc<RepositoryContext>,
     parent: NodeID,
     parent_node: &Node,
-) -> Result<Vec<u64>, StateError> {
+) -> Result<ChildNames, StateError> {
     let mut children =
         StateNodeChildrenIterator::from_parent(state.clone(), context.clone(), parent, parent_node)
             .await?;
-    let mut hashes = Vec::new();
-    while let Some((_, node)) = children.next().await? {
-        hashes.push(node.name_hash);
+    let mut live = Vec::new();
+    let mut deleted = Vec::new();
+    while let Some((node_id, node)) = children.next().await? {
+        if node.is_staged_delete() {
+            deleted.push(DeletedChild {
+                name_hash: node.name_hash,
+                node_id,
+                kind: node_kind_flags(&node),
+            });
+        } else {
+            live.push(node.name_hash);
+        }
     }
-    hashes.sort_unstable();
-    Ok(hashes)
+    live.sort_unstable();
+    Ok(ChildNames { live, deleted })
+}
+
+/// The type flags of an existing node, with everything else masked off, so two
+/// nodes' kinds compare without their staging state getting in the way.
+fn node_kind_flags(node: &Node) -> NodeFlags {
+    if node.is_file() {
+        NodeFlags::File
+    } else if node.is_link() {
+        NodeFlags::Link
+    } else {
+        NodeFlags::NoFlags
+    }
+}
+
+/// Walk one parent's chain looking for a single name, for the first entry to land
+/// under that parent — the case where snapshotting every child to check one name
+/// would be a loss.
+async fn find_name_in_parent(
+    state: &Arc<State>,
+    context: &Arc<RepositoryContext>,
+    parent: NodeID,
+    parent_node: &Node,
+    name_hash: u64,
+    kind: NodeFlags,
+) -> Result<NameLookup, StateError> {
+    let mut children =
+        StateNodeChildrenIterator::from_parent(state.clone(), context.clone(), parent, parent_node)
+            .await?;
+    let mut restorable = None;
+    while let Some((node_id, node)) = children.next().await? {
+        if node.name_hash != name_hash {
+            continue;
+        }
+        if !node.is_staged_delete() {
+            return Ok(NameLookup::Live);
+        }
+        if restorable.is_none() && node_kind_flags(&node) == kind {
+            restorable = Some(DeletedChild {
+                name_hash,
+                node_id,
+                kind,
+            });
+        }
+    }
+    Ok(match restorable {
+        Some(child) => NameLookup::Deleted(child),
+        None => NameLookup::Vacant,
+    })
 }
 
 /// How far a batch has got with the checks it runs once per existing parent.
@@ -271,8 +395,8 @@ struct ParentState {
     /// The parent as it read when it was checked, so neither a name lookup nor
     /// the snapshot walk has to fetch it again.
     node: Node,
-    /// Its child name hashes, sorted, collected once a second entry named it.
-    names: Option<Vec<u64>>,
+    /// Its children, collected once a second entry named it.
+    names: Option<ChildNames>,
 }
 
 /// Check that an existing node can take children, attributing any failure to
@@ -280,6 +404,12 @@ struct ParentState {
 ///
 /// Returns the parent it read, which the caller keeps: every later lookup under
 /// this parent starts from the child chain it holds.
+///
+/// A discarded slot and a slot the allocator never handed out both read back as
+/// ordinary directories, so each is refused on its own terms: a child hung off a
+/// discarded slot is orphaned once the allocator reuses it, and since every
+/// non-root node has a non-empty name, a zero name length is what separates an
+/// unallocated slot from a real node.
 async fn check_existing_parent(
     state: &Arc<State>,
     context: &Arc<RepositoryContext>,
@@ -290,15 +420,18 @@ async fn check_existing_parent(
     let Ok(parent_node) = state.node(context.clone(), parent).await else {
         return Err(reject(entry_id, entry_index, "parent node id is unknown"));
     };
-    // A discarded slot keeps its name and carries neither the file nor the link
-    // flag, so it reads back as a perfectly ordinary directory. Nothing below
-    // would catch it, and a child hung off one is orphaned as soon as the
-    // allocator hands the slot out again.
     if parent_node.is_discarded() {
         return Err(reject(
             entry_id,
             entry_index,
             "parent node has been deleted",
+        ));
+    }
+    if parent_node.is_staged_delete() {
+        return Err(reject(
+            entry_id,
+            entry_index,
+            "parent node is staged for deletion, so a child added under it would go with it",
         ));
     }
     if parent_node.is_link() {
@@ -315,8 +448,6 @@ async fn check_existing_parent(
             "parent node is not a directory",
         ));
     }
-    // Every non-root node has a non-empty name, so a zero name length means the
-    // parent id landed on an unallocated slot rather than a real node.
     if parent != ROOT_NODE && parent_node.name_length == 0 {
         return Err(reject(
             entry_id,
@@ -329,7 +460,9 @@ async fn check_existing_parent(
 
 /// Check every entry against the tree and against the rest of the batch,
 /// producing the apply plan. Mutates nothing; the first invalid entry rejects
-/// the batch.
+/// the batch. Names are held to the rules the name table applies on write, so a
+/// name it would refuse fails here rather than part-way through the apply phase
+/// with earlier nodes already created.
 ///
 /// An existing parent is checked once per batch. Its names are looked up
 /// directly for the first entry that lands under it and, from the second entry
@@ -352,15 +485,10 @@ async fn plan_entries(
             return Err(reject(entry_id, index, "two entries share one caller id"));
         }
 
-        // Sound because the entry point checked every string the call carries
-        // before dispatching it.
         let name = entry.name.as_str();
         if name.is_empty() {
             return Err(reject(entry_id, index, "name must not be empty"));
         }
-        // The same rules the name table applies when the node is written, run
-        // here so a name it would refuse fails the batch cleanly instead of
-        // surfacing part-way through the apply phase with nodes already created.
         if let Err(error) = validate_node_name_for_store(name) {
             return Err(reject(entry_id, index, &error.to_string()));
         }
@@ -398,13 +526,13 @@ async fn plan_entries(
                 }
                 ParentProgress::Checked => {
                     let node = existing[&parent_node_id].node;
-                    match child_name_hashes(state, context, parent_node_id, &node).await {
-                        Ok(hashes) => {
+                    match child_names(state, context, parent_node_id, &node).await {
+                        Ok(names) => {
                             existing.insert(
                                 parent_node_id,
                                 ParentState {
                                     node,
-                                    names: Some(hashes),
+                                    names: Some(names),
                                 },
                             );
                         }
@@ -431,46 +559,62 @@ async fn plan_entries(
                 "two entries add the same name under one parent",
             ));
         }
+        let mut restore = None;
         if let ParentRef::Existing(parent_node_id) = parent {
             let snapshot_hit = existing
                 .get(&parent_node_id)
                 .and_then(|parent| parent.names.as_ref())
-                .map(|hashes| hashes.binary_search(&name_hash).is_ok());
-            let occupied = if let Some(occupied) = snapshot_hit {
-                occupied
+                .map(|names| names.lookup(name_hash, flags));
+            let held = if let Some(held) = snapshot_hit {
+                held
             } else {
                 let parent_node = existing[&parent_node_id].node;
-                match state
-                    .find_subnode_of(context.clone(), parent_node_id, &parent_node, name_hash)
-                    .await
+                match find_name_in_parent(
+                    state,
+                    context,
+                    parent_node_id,
+                    &parent_node,
+                    name_hash,
+                    flags,
+                )
+                .await
                 {
-                    Ok(_) => true,
-                    Err(StateErrors::NodeNotFound(_)) => false,
+                    Ok(held) => held,
                     Err(error) => {
                         return Err(reject_internal(
                             entry_id,
                             index,
                             error,
-                            "State::find_subnode",
+                            "search a parent's children for the name",
                         ));
                     }
                 }
             };
-            if occupied {
-                return Err(reject(
-                    entry_id,
-                    index,
-                    "a child with this name already exists",
-                ));
+            match held {
+                NameLookup::Live => {
+                    return Err(reject(
+                        entry_id,
+                        index,
+                        "a child with this name already exists",
+                    ));
+                }
+                NameLookup::Deleted(child) => restore = Some(child.node_id),
+                NameLookup::Vacant => {}
             }
         }
 
         let (size, address) = fields_for_kind(flags, entry.size, entry.address);
+        let address = if restore.is_some() {
+            address
+        } else {
+            with_generated_file_id(flags, address)
+        };
 
         planned.push(Planned {
             entry_id,
             entry_index: index,
             parent,
+            restore,
             node: Node {
                 flags: flags.bits(),
                 mode: entry.mode,
@@ -573,10 +717,34 @@ async fn apply_wave(
                 for index in group {
                     let item = planned[index];
                     let name = entry_name(&args, item.entry_index);
-                    match state
-                        .node_add(context.clone(), parent, item.node, name)
-                        .await
-                    {
+                    let outcome = match item.restore {
+                        Some(node_id) => state
+                            .node_undelete(
+                                context.clone(),
+                                node_id,
+                                item.node.mode,
+                                item.node.size,
+                                item.node.address,
+                            )
+                            .await
+                            .map(|()| node_id),
+                        None => match state
+                            .node_add(context.clone(), parent, item.node, name)
+                            .await
+                        {
+                            Ok(node_id) => state
+                                .node_mark_staged(
+                                    context.clone(),
+                                    node_id,
+                                    NodeFlags::StagedAdd,
+                                    NodeFlags::DirtyAdd,
+                                )
+                                .await
+                                .map(|()| node_id),
+                            Err(error) => Err(error),
+                        },
+                    };
+                    match outcome {
                         Ok(node_id) => {
                             emit_add_complete(item.entry_id, node_id, LoreErrorCode::None);
                             landed.push((index, node_id));
@@ -591,8 +759,6 @@ async fn apply_wave(
 
     let mut applied = 0;
     while let Some(result) = tasks.join_next().await {
-        // A task that died mid-group returns nothing; its entries simply do not
-        // count as applied, which is what the caller's shortfall measures.
         if let Ok(landed) = result {
             applied += landed.len();
             for (index, node_id) in landed {
@@ -720,8 +886,10 @@ async fn add_batch(
         return Ok(());
     }
     let context = internal.repository_context.clone();
-    let planned = plan_entries(&internal.state, &context, args.entries.as_slice()).await?;
-    apply_plan(args.clone(), internal.state.clone(), context, planned).await
+    let access = internal.access_shared().await;
+    let state = access.state();
+    let planned = plan_entries(&state, &context, args.entries.as_slice()).await?;
+    apply_plan(args.clone(), state, context, planned).await
 }
 
 async fn add_impl(
@@ -1065,7 +1233,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "a batch with an invalid entry must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "a batch with an invalid entry must fail"
+        );
         assert_eq!(
             add_outcome(&events, 2)
                 .expect("the offending entry must report")
@@ -1098,7 +1270,8 @@ mod tests {
         .await;
 
         assert_eq!(
-            status, 1,
+            status,
+            InvalidArguments::FFI_CODE,
             "a case-variant duplicate within a batch must fail"
         );
         assert_eq!(
@@ -1122,7 +1295,11 @@ mod tests {
 
         let (status, events) =
             run_add(handle, vec![entry(2, ROOT_NODE, "dup", LoreNodeType::File)]).await;
-        assert_eq!(status, 1, "colliding with an existing child must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "colliding with an existing child must fail"
+        );
         assert_eq!(
             add_outcome(&events, 2).expect("AddComplete must fire").1,
             LoreErrorCode::InvalidArguments,
@@ -1145,7 +1322,11 @@ mod tests {
             ],
         )
         .await;
-        assert_eq!(forward.0, 1, "a forward parent reference must fail");
+        assert_eq!(
+            forward.0,
+            InvalidArguments::FFI_CODE,
+            "a forward parent reference must fail"
+        );
         assert_eq!(
             add_outcome(&forward.1, 1).expect("AddComplete must fire").1,
             LoreErrorCode::InvalidArguments
@@ -1159,7 +1340,11 @@ mod tests {
             ],
         )
         .await;
-        assert_eq!(leaf_parent.0, 1, "parenting onto a file entry must fail");
+        assert_eq!(
+            leaf_parent.0,
+            InvalidArguments::FFI_CODE,
+            "parenting onto a file entry must fail"
+        );
         assert_eq!(
             add_outcome(&leaf_parent.1, 4)
                 .expect("AddComplete must fire")
@@ -1183,7 +1368,11 @@ mod tests {
             }],
         )
         .await;
-        assert_eq!(bad_kind.0, 1, "an unsupported kind must fail");
+        assert_eq!(
+            bad_kind.0,
+            InvalidArguments::FFI_CODE,
+            "an unsupported kind must fail"
+        );
         assert_eq!(
             add_outcome(&bad_kind.1, 1)
                 .expect("AddComplete must fire")
@@ -1196,7 +1385,11 @@ mod tests {
             vec![entry(2, 1_000_000, "orphan", LoreNodeType::File)],
         )
         .await;
-        assert_eq!(unknown.0, 1, "an unknown parent must fail");
+        assert_eq!(
+            unknown.0,
+            InvalidArguments::FFI_CODE,
+            "an unknown parent must fail"
+        );
         assert_eq!(
             add_outcome(&unknown.1, 2).expect("AddComplete must fire").1,
             LoreErrorCode::InvalidArguments
@@ -1271,7 +1464,11 @@ mod tests {
             ],
         )
         .await;
-        assert_eq!(shared_id.0, 1, "two entries sharing a caller id must fail");
+        assert_eq!(
+            shared_id.0,
+            InvalidArguments::FFI_CODE,
+            "two entries sharing a caller id must fail"
+        );
         assert_eq!(
             add_outcome(&shared_id.1, 2)
                 .expect("AddComplete must fire")
@@ -1388,7 +1585,7 @@ mod tests {
             let internal = guard.internal_clone();
             let block_index = NodeBlock::index(doomed);
             let block = internal
-                .state
+                .state_for_tests()
                 .block(internal.repository_context.clone(), block_index)
                 .await
                 .expect("the parent block must be readable");
@@ -1398,7 +1595,8 @@ mod tests {
         let (status, events) =
             run_add(handle, vec![entry(2, doomed, "child", LoreNodeType::File)]).await;
         assert_eq!(
-            status, 1,
+            status,
+            InvalidArguments::FFI_CODE,
             "a deleted parent must be rejected, got {events:?}"
         );
         assert_eq!(
@@ -1418,9 +1616,6 @@ mod tests {
         let partition = Partition::from([0xbbu8; 16]);
         let (handle, store_handle_id) = load_handle("add-dup-snapshot", partition).await;
 
-        // Enough existing children that the snapshot has to be genuinely ordered
-        // to be searchable: with only a couple, an unordered probe finds the
-        // collision often enough to pass by luck.
         let seeded: Vec<String> = (0..SNAPSHOT_SEED_CHILDREN)
             .map(|index| format!("seed-{index:02}"))
             .collect();
@@ -1445,7 +1640,8 @@ mod tests {
             )
             .await;
             assert_eq!(
-                status, 1,
+                status,
+                InvalidArguments::FFI_CODE,
                 "colliding with existing child {index} must fail, got {events:?}"
             );
             assert_eq!(
@@ -1491,7 +1687,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "an unknown handle must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "an unknown handle must fail"
+        );
         for id in [7u64, 8] {
             assert!(
                 add_outcome(&events, id).is_none(),
@@ -1505,7 +1705,7 @@ mod tests {
             )),
             "the batch terminal must carry the call id, got {events:?}"
         );
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
     }
 
     /// The batch terminal fires once on every path, so a caller can wait on it
@@ -1526,7 +1726,7 @@ mod tests {
 
         let (status, events) =
             run_add(handle, vec![entry(2, ROOT_NODE, "", LoreNodeType::File)]).await;
-        assert_eq!(status, 1, "got {events:?}");
+        assert_eq!(status, InvalidArguments::FFI_CODE, "got {events:?}");
         assert_eq!(
             batch_outcomes(&events),
             vec![(CALL_ID, LoreErrorCode::InvalidArguments)],

@@ -8,10 +8,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Once;
-use std::sync::atomic::AtomicBool;
+use std::sync::OnceLock;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use lore_base::error::InvalidArguments;
 use lore_base::runtime::runtime_shutdown_timeout;
 use lore_base::text::TextNotUtf8;
 use lore_base::text::ValidateText;
@@ -515,6 +516,16 @@ impl ValidateText for LoreGlobalArgs {
                     .validate_text()
                     .map_err(|error| error.inside("identity"))
             })
+            .and_then(|()| {
+                self.identity_token
+                    .validate_text()
+                    .map_err(|error| error.inside("identity_token"))
+            })
+            .and_then(|()| {
+                self.access_token
+                    .validate_text()
+                    .map_err(|error| error.inside("access_token"))
+            })
     }
 }
 
@@ -694,6 +705,10 @@ pub enum LoreLoadConfig {
     Default = 7,
 }
 
+/// How often an operation emits progress events when the caller names no
+/// interval, in milliseconds.
+pub const DEFAULT_EVENT_INTERVAL_MS: u64 = 100;
+
 /// Common options shared by repository operations.
 #[repr(C)]
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -720,8 +735,6 @@ pub struct LoreGlobalArgs {
     pub remote: u8,
     /// Dry run mode, only report what would have been changed and perform no changes to local file system
     pub dry_run: u8,
-    /// Avoid recording last access timestamps in the data stores
-    pub no_atime: u8,
     /// Maximum number of parallel connections for bulk data transfer
     pub max_connections: u32,
     /// Search limit when iterating revisions
@@ -751,6 +764,33 @@ pub struct LoreGlobalArgs {
     /// this only state fragments and fragments flagged for local cache priority
     /// are retained
     pub cache: u8,
+    /// Authentication token to use instead of the one held in the secure token
+    /// store. Authorization tokens are exchanged from it as they are needed.
+    ///
+    /// Supplying either token puts the call in external-credential mode: `identity`
+    /// must be left empty, since it is read from the token.
+    pub identity_token: LoreString,
+    /// Authorization token to use instead of exchanging one with the auth
+    /// service. If given, will not perform token exchanges.
+    ///
+    /// Supplying either token puts the call in external-credential mode: `identity`
+    /// must be left empty, since it is read from the token.
+    pub access_token: LoreString,
+    /// How much an operation reports about what it cost.
+    ///
+    /// - `0` — no statistics event, and no per-fragment counters kept for one.
+    /// - `1` — one statistics event when the operation finishes: per-action file
+    ///   counts, and the fragment, local-store and remote-store totals.
+    /// - `2` — also a `FragmentWrite` event per stored fragment, which describes
+    ///   the shape of what was written rather than its sums. One event per
+    ///   fragment is the cost of this level.
+    ///
+    /// A level above the highest known behaves as the highest known.
+    pub stats: u32,
+    /// How often an operation emits progress events, in milliseconds. Applies
+    /// whatever `stats` is set to, statistics being reported once at the end
+    /// rather than on an interval. Zero takes [`DEFAULT_EVENT_INTERVAL_MS`].
+    pub event_interval_ms: u64,
 }
 
 impl LoreGlobalArgs {
@@ -764,6 +804,51 @@ impl LoreGlobalArgs {
 
     pub fn identity(&self) -> Option<&str> {
         (&self.identity).into()
+    }
+
+    /// The authentication token supplied for this call, or an empty string when
+    /// the credential comes from the token store as usual.
+    pub fn identity_token(&self) -> &str {
+        self.identity_token.as_str()
+    }
+
+    /// The authorization token supplied for this call, or an empty string when
+    /// it is obtained by exchange as usual.
+    pub fn access_token(&self) -> &str {
+        self.access_token.as_str()
+    }
+
+    /// Validates the global arguments. Can mutate the arguments after validation
+    /// E.g. if called with `identity_token`, sets the identity from the token.
+    pub fn validate(&mut self) -> Result<(), InvalidArguments> {
+        let invalid = |reason: String| Err(InvalidArguments { reason });
+
+        // The identity token names the identity when there is one; otherwise an
+        // access token on its own does.
+        let (token, which) = if !self.identity_token.is_empty() {
+            (self.identity_token(), "identity token")
+        } else if !self.access_token.is_empty() {
+            (self.access_token(), "access token")
+        } else {
+            return Ok(());
+        };
+
+        if !self.identity.is_empty() {
+            return invalid(format!(
+                "the {which} already names the identity it acts as; do not also pass an identity"
+            ));
+        }
+
+        let identity = lore_credential::identity_from_token(token);
+        if identity.is_empty() {
+            return invalid(format!(
+                "the {which} is not a JSON Web Token naming an identity, so there is no identity to act as"
+            ));
+        }
+
+        self.identity = identity.into();
+
+        Ok(())
     }
 
     pub fn force(&self) -> bool {
@@ -796,10 +881,6 @@ impl LoreGlobalArgs {
 
     pub fn dry_run(&self) -> bool {
         self.dry_run != 0
-    }
-
-    pub fn atime(&self) -> bool {
-        self.no_atime == 0
     }
 
     pub fn search_limit(&self) -> Option<usize> {
@@ -838,6 +919,28 @@ impl LoreGlobalArgs {
 
     pub fn cache(&self) -> bool {
         self.cache != 0
+    }
+
+    /// Whether an operation should emit statistics events at all.
+    pub fn stats(&self) -> bool {
+        self.stats > 0
+    }
+
+    /// Whether an operation should emit per-fragment detail alongside the totals.
+    pub fn stats_full(&self) -> bool {
+        self.stats > 1
+    }
+
+    /// How often to emit progress events. Zero takes the default, and the floor
+    /// keeps an interval from costing more than the operation it reports on.
+    pub fn event_interval(&self) -> std::time::Duration {
+        const MINIMUM_INTERVAL_MS: u64 = 10;
+        let interval_ms = if self.event_interval_ms == 0 {
+            DEFAULT_EVENT_INTERVAL_MS
+        } else {
+            self.event_interval_ms.max(MINIMUM_INTERVAL_MS)
+        };
+        std::time::Duration::from_millis(interval_ms)
     }
 
     /// Returns the store keep-alive duration if enabled.
@@ -941,9 +1044,27 @@ pub struct ExecutionContext {
     pub dispatcher: EventDispatcher,
     pub log_level: LoreLogLevel,
     user_id: Mutex<String>,
-    pub failure: AtomicBool,
     mode: ExecutionMode,
     caller_state: Option<Arc<dyn Any + Send + Sync>>,
+    /// What this call's fragment writes cost, accumulated across every write it
+    /// performs — including the ones a background tracker task performs and the
+    /// ones inside linked and layered repositories, which run under this same
+    /// context.
+    ///
+    /// It lives here rather than being threaded through the write API because a
+    /// write that has to finish before its caller continues — serializing a
+    /// state block, say — carries no tracker to hang the counters off, and would
+    /// otherwise go unaccounted.
+    ///
+    /// Allocated on first read: at statistics level zero the write pipeline holds
+    /// no counters, and only a push reads them whatever the level.
+    fragment_stats: OnceLock<Arc<lore_storage::FragmentWriteStats>>,
+    /// What this call's push registered with the peer, accumulated across every
+    /// revision, link and layer it covers.
+    ///
+    /// Kept whatever the statistics level: the per-revision progress event reads
+    /// its share out of these, so they are load-bearing rather than diagnostic.
+    push_stats: OnceLock<Arc<crate::branch::push::PushStats>>,
 }
 
 impl ExecutionContext {
@@ -1017,6 +1138,18 @@ impl ExecutionContext {
     pub fn caller_state(&self) -> Option<&Arc<dyn Any + Send + Sync>> {
         self.caller_state.as_ref()
     }
+
+    /// The counters this call's fragment writes report into. See the field.
+    pub fn fragment_stats(&self) -> &Arc<lore_storage::FragmentWriteStats> {
+        self.fragment_stats
+            .get_or_init(Arc::<lore_storage::FragmentWriteStats>::default)
+    }
+
+    /// The counters this call's push registers into. See the field.
+    pub(crate) fn push_stats(&self) -> &Arc<crate::branch::push::PushStats> {
+        self.push_stats
+            .get_or_init(|| Arc::new(crate::branch::push::PushStats::new(self.globals().stats())))
+    }
 }
 
 impl Default for ExecutionContext {
@@ -1028,9 +1161,10 @@ impl Default for ExecutionContext {
             dispatcher: EventDispatcher::default(),
             log_level: LoreLogLevel::Error,
             user_id: Mutex::default(),
-            failure: AtomicBool::default(),
             mode: ExecutionMode::Client,
             caller_state: None,
+            fragment_stats: OnceLock::new(),
+            push_stats: OnceLock::new(),
         }
     }
 }
@@ -1053,27 +1187,34 @@ fn install_crypto_provider() -> Result<(), String> {
 }
 
 /// Error codes returned across the FFI boundary.
+///
+/// Every discriminant except the legacy categories and `Internal` matches the
+/// `#[ffi_code(..)]` of the same-named struct in [`lore_base::error`], so a
+/// caller comparing a `status` against one of these names gets the same answer
+/// as a caller comparing it against the discrete type's code. The grouped
+/// allocation those codes come from is documented on that module.
+///
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(i32)]
 #[derive(Eq, PartialEq)]
 pub enum LoreError {
     /// The arguments supplied to the operation were invalid.
-    InvalidArguments = 1,
-    /// A content-addressable object could not be found in any store.
-    AddressNotFound = 2,
-    /// A file path could not be resolved to a tracked node or found in the file system.
-    FileNotFound = 3,
-    /// A payload blob could not be found with the associated hash.
-    PayloadNotFound = 4,
+    InvalidArguments = 3,
     /// The backing store is overloaded; the caller should retry later.
-    SlowDown = 5,
+    SlowDown = 31,
+    /// A content-addressable object could not be found in any store.
+    AddressNotFound = 80,
+    /// A payload blob could not be found with the associated hash.
+    PayloadNotFound = 81,
+    /// A file path could not be resolved to a tracked node or found in the file system.
+    FileNotFound = 82,
     /// A blob exceeded a size limit enforced by the caller or the protocol.
-    /// Discriminant matches the error code of the underlying `Oversized` struct
-    /// in `lore-base` so callers see a single consistent code.
-    Oversized = 26,
+    Oversized = 118,
 
-    // Legacy error categories (transitional, will be removed)
+    // Legacy error categories (transitional, will be removed). They sit in the
+    // 100–109 range that `lore_base::error` reserves for them, so no discrete
+    // error type is ever allocated a code that collides with one of these.
     /// A requested item was not found.
     NotFound = 101,
     /// An item that was being created already exists.
@@ -1337,6 +1478,30 @@ pub enum LoreNodeType {
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
+/// The change staged on a node for the next revision. `None` is a node the
+/// current revision holds unchanged; every other value is an edit that has not
+/// been committed yet.
+#[derive(Clone, Copy, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LoreNodeStagedAction {
+    /// No staged change.
+    #[default]
+    None = 0,
+    /// Staged for addition; the node is not in the revision it was loaded from.
+    Add = 1,
+    /// Staged with rewritten content fields.
+    Modify = 2,
+    /// Staged for removal; the node is dropped when the revision is committed.
+    Delete = 3,
+    /// Staged at a new path or under a new name.
+    Move = 4,
+    /// Staged as a copy of another node.
+    Copy = 5,
+}
+
+/// cbindgen:prefix-with-name
+/// cbindgen:rename-all=ScreamingSnakeCase
+#[repr(C)]
 /// The change applied to a file.
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1452,6 +1617,134 @@ pub fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `{"iss":"lore","sub":"alice","name":"Alice","exp":2000000000,"aud":["example.com"]}`
+    const ALICE_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
+
+    /// The tokens cross the C boundary as raw bytes and `validate` reads them as
+    /// text, so they have to be checked like every other string a call carries.
+    #[test]
+    fn a_token_that_is_not_utf8_is_reported_by_field() {
+        let globals = LoreGlobalArgs {
+            identity_token: LoreString::from_bytes(&[b'a', 0xff, 0xfe]),
+            ..Default::default()
+        };
+        assert_eq!(
+            globals
+                .validate_text()
+                .expect_err("invalid text must be reported")
+                .field(),
+            "identity_token"
+        );
+
+        let globals = LoreGlobalArgs {
+            access_token: LoreString::from_bytes(&[b'a', 0xff, 0xfe]),
+            ..Default::default()
+        };
+        assert_eq!(
+            globals
+                .validate_text()
+                .expect_err("invalid text must be reported")
+                .field(),
+            "access_token"
+        );
+    }
+
+    #[test]
+    fn no_credential_arguments_is_valid() {
+        let mut globals = LoreGlobalArgs::default();
+        assert!(globals.validate().is_ok());
+        assert!(globals.identity.is_empty());
+    }
+
+    #[test]
+    fn identity_alone_is_valid_and_untouched() {
+        let mut globals = LoreGlobalArgs {
+            identity: "bob".into(),
+            ..Default::default()
+        };
+        assert!(globals.validate().is_ok());
+        assert_eq!(globals.identity.as_str(), "bob");
+    }
+
+    #[test]
+    fn identity_token_resolves_the_identity_it_names() {
+        let mut globals = LoreGlobalArgs {
+            identity_token: ALICE_TOKEN.into(),
+            ..Default::default()
+        };
+        assert!(globals.validate().is_ok());
+        assert_eq!(globals.identity.as_str(), "alice");
+    }
+
+    #[test]
+    fn access_token_alone_resolves_the_identity_it_names() {
+        // Mode 2: only an access token. It names the identity, and operations
+        // that need an authentication token fail later rather than reading one
+        // out of the store.
+        let mut globals = LoreGlobalArgs {
+            access_token: ALICE_TOKEN.into(),
+            ..Default::default()
+        };
+        assert!(globals.validate().is_ok());
+        assert_eq!(globals.identity.as_str(), "alice");
+    }
+
+    #[test]
+    fn both_tokens_take_the_identity_from_the_identity_token() {
+        // Mode 3: both supplied. The authentication token is the authority on
+        // identity.
+        let mut globals = LoreGlobalArgs {
+            identity_token: ALICE_TOKEN.into(),
+            access_token: "authz-token".into(),
+            ..Default::default()
+        };
+        assert!(globals.validate().is_ok());
+        assert_eq!(globals.identity.as_str(), "alice");
+    }
+
+    #[test]
+    fn access_token_naming_no_identity_is_rejected() {
+        // With no identity token to fall back on, an access token that names no
+        // subject leaves the call with no identity to act as.
+        let mut globals = LoreGlobalArgs {
+            access_token: "not-a-jwt".into(),
+            ..Default::default()
+        };
+        assert!(globals.validate().is_err());
+        assert!(globals.identity.is_empty());
+    }
+
+    #[test]
+    fn identity_and_access_token_are_mutually_exclusive() {
+        let mut globals = LoreGlobalArgs {
+            identity: "alice".into(),
+            access_token: ALICE_TOKEN.into(),
+            ..Default::default()
+        };
+        assert!(globals.validate().is_err());
+    }
+
+    #[test]
+    fn identity_and_identity_token_are_mutually_exclusive() {
+        let mut globals = LoreGlobalArgs {
+            identity: "alice".into(),
+            identity_token: ALICE_TOKEN.into(),
+            ..Default::default()
+        };
+        // Rejected even when they agree: one of them has to be the authority.
+        assert!(globals.validate().is_err());
+    }
+
+    #[test]
+    fn identity_token_naming_no_identity_is_rejected() {
+        let mut globals = LoreGlobalArgs {
+            identity_token: "not-a-jwt".into(),
+            ..Default::default()
+        };
+        assert!(globals.validate().is_err());
+        assert!(globals.identity.is_empty());
+    }
 
     /// A name arriving across the C boundary can hold any byte sequence. The
     /// formatting paths run on every dispatched command, so they must render
@@ -1743,5 +2036,43 @@ mod binary_tests {
     fn json_text_that_is_not_base64_fails_to_read() {
         let result: Result<LoreBinary, _> = serde_json::from_str(r#""not base64!""#);
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod event_interval_tests {
+    use super::*;
+
+    fn globals(event_interval_ms: u64) -> LoreGlobalArgs {
+        LoreGlobalArgs {
+            event_interval_ms,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_unset_interval_takes_the_default() {
+        assert_eq!(
+            globals(0).event_interval(),
+            std::time::Duration::from_millis(DEFAULT_EVENT_INTERVAL_MS)
+        );
+    }
+
+    /// A caller asking for a sub-millisecond tick would spend more on reporting
+    /// than on the commit, so the floor holds regardless of what was asked.
+    #[test]
+    fn an_interval_below_the_floor_is_raised_to_it() {
+        assert_eq!(
+            globals(1).event_interval(),
+            std::time::Duration::from_millis(10)
+        );
+    }
+
+    #[test]
+    fn an_explicit_interval_is_used_as_given() {
+        assert_eq!(
+            globals(2500).event_interval(),
+            std::time::Duration::from_millis(2500)
+        );
     }
 }

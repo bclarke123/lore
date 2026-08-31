@@ -4,7 +4,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
@@ -12,8 +11,9 @@ use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinSet;
 
+use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::branch;
-use crate::branch::push::PushStatistics;
+use crate::branch::push::PushProgress;
 use crate::branch::push::push_fragments;
 use crate::branch::push::push_query;
 use crate::change;
@@ -78,6 +78,7 @@ use crate::state::LinkMergeEntry;
 use crate::state::State;
 use crate::state::StateNodeChildrenWithNameIterator;
 use crate::util::path::RelativePath;
+use crate::util::path::RelativePathBuf;
 use crate::util::serde::u8_as_bool;
 
 /// Data for the event sent when a branch merge starts.
@@ -396,11 +397,20 @@ pub struct MergeStartOptions {
     pub scope: MergeScope,
 }
 
+/// The revisions a merge's three-way diff ran between, other than the target.
+#[derive(Clone, Copy)]
+pub struct MergeDiffEndpoints {
+    pub base: Hash,
+    pub source: Hash,
+}
+
 /// Result of merging a single repository (main or linked).
 pub struct MergeRepositoryResult {
     pub signature: Hash,
     pub has_conflicts: bool,
     pub state_staged: Arc<State>,
+    /// Endpoints for reconciling state the diff does not carry, such as link pins.
+    pub endpoints: MergeDiffEndpoints,
     /// Conflict-realization context: the 3-way merge inputs and the conflict
     /// pairs from the diff. Surfaced so `merge_start_all` can remap paths
     /// onto the link's mount and call `realize_conflicts` without re-running
@@ -640,6 +650,10 @@ async fn merge_repository(
         signature,
         has_conflicts,
         state_staged,
+        endpoints: MergeDiffEndpoints {
+            base: diff_base,
+            source: diff_source,
+        },
         conflict_context,
     })
 }
@@ -696,6 +710,8 @@ pub async fn merge_start(
             let MergeRepositoryResult {
                 mut signature,
                 has_conflicts,
+                state_staged,
+                endpoints,
                 ..
             } = merge_repository(
                 repository.clone(),
@@ -708,6 +724,26 @@ pub async fn merge_start(
             .await?;
 
             let dry_run = execution_context().globals().dry_run();
+
+            // The parent's link list is parent state, so `--ignore-links` skips
+            // merging the linked repositories, not the comparison. Carrying a
+            // row would realize linked content, which the flag does suppress.
+            let state_base = state::State::deserialize(repository.clone(), endpoints.base)
+                .await
+                .forward::<MergeError>("deserializing diff base state")?;
+            let state_source = state::State::deserialize(repository.clone(), endpoints.source)
+                .await
+                .forward::<MergeError>("deserializing diff source state")?;
+            Box::pin(link::classify_link_pins(
+                repository.clone(),
+                &state_staged,
+                &state_source,
+                link::LinkPinResolution::ThreeWay(state_base),
+                &[],
+            ))
+            .await
+            .forward::<MergeError>("comparing link pins")?;
+
             if !has_conflicts && !dry_run && !options.no_commit {
                 signature = auto_commit_merge(repository, token, options.message).await?;
             }
@@ -788,6 +824,7 @@ async fn merge_start_link(
         link_node,
         link_context,
         link_reference,
+        ..
     } = link::resolve_link_at_path(&state, repository.clone(), &link_path)
         .await
         .forward_with::<MergeError, _>(|| format!("link not found: {link_path}"))?;
@@ -892,6 +929,7 @@ async fn merge_start_link(
         link_reference.signature,
         result.signature,
         link_reference.branch,
+        link::LinkPinRealize::WorkingTree,
     )
     .await
     .forward_with::<MergeError, _>(|| format!("staging link pin for {link_path}"))?;
@@ -930,7 +968,6 @@ async fn merge_start_link(
             link: None,
             layer_messages: std::collections::HashMap::new(),
             layer: None,
-            stats: false,
         };
         let signature = Box::pin(commit::commit(repository, token, commit_options))
             .await
@@ -988,7 +1025,7 @@ async fn enumerate_eligible_links(
 
     // This loop is sequential. The per-link awaits (`node_path`, `node`,
     // `to_link_context`, `check_link_merge_eligible`) are independent and
-    // could fan out via `JoinSet`/`MAX_TASK_COUNT` for workspaces with many
+    // could fan out via `JoinSet`/`MAX_CONCURRENT_TREE_TASKS` for workspaces with many
     // links. Deferred — N is small in practice for current users.
     let mut eligible_links = Vec::new();
     for link_reference in &link_list {
@@ -1349,6 +1386,7 @@ async fn finalize_link_conflict_state(
             merged.link_reference.signature,
             merged.new_signature,
             merged.link_reference.branch,
+            link::LinkPinRealize::WorkingTree,
         )
         .await
         .forward_with::<MergeError, _>(|| {
@@ -1448,6 +1486,7 @@ async fn finalize_main_merge(
         signature: _,
         has_conflicts,
         state_staged,
+        endpoints,
         ..
     } = merge_repository(
         repository.clone(),
@@ -1470,12 +1509,47 @@ async fn finalize_main_merge(
                 merged.link_reference.signature,
                 merged.new_signature,
                 merged.link_reference.branch,
+                link::LinkPinRealize::WorkingTree,
             )
             .await
             .forward_with::<MergeError, _>(|| {
                 format!("staging merged link pin for {}", merged.link_path)
             })?;
         }
+    }
+
+    // Links merged above already carry the pin their own merge produced. The
+    // comparison runs on a dry run too, so `--dry-run` reports a row the real
+    // merge would refuse.
+    let merged_nodes: Vec<NodeID> = merged_links
+        .iter()
+        .map(|merged| merged.link_reference.local_node)
+        .collect();
+    let state_base = state::State::deserialize(repository.clone(), endpoints.base)
+        .await
+        .forward::<MergeError>("deserializing diff base state")?;
+    let state_source = state::State::deserialize(repository.clone(), endpoints.source)
+        .await
+        .forward::<MergeError>("deserializing diff source state")?;
+    let planned = Box::pin(link::classify_link_pins(
+        repository.clone(),
+        &state_staged,
+        &state_source,
+        link::LinkPinResolution::ThreeWay(state_base),
+        &merged_nodes,
+    ))
+    .await
+    .forward::<MergeError>("comparing link pins with the merged branch")?;
+
+    if !dry_run {
+        Box::pin(link::apply_link_pins(
+            repository.clone(),
+            &state_staged,
+            planned,
+            link::LinkPinRealize::WorkingTree,
+        ))
+        .await
+        .forward::<MergeError>("carrying link pins from the merged branch")?;
 
         if !link_merge_entries.is_empty() {
             state_staged
@@ -1512,7 +1586,6 @@ async fn auto_commit_merge(
         link: None,
         layer_messages: std::collections::HashMap::new(),
         layer: None,
-        stats: false,
     };
     Box::pin(commit::commit(repository, token, commit_options))
         .await
@@ -1868,8 +1941,6 @@ pub async fn apply_diff(
         .await
         .forward::<MergeError>("deserializing diff base state")?;
 
-    // Queue up to a given number of parallel tasks to verify filesystem
-    const MAX_TASK_COUNT: usize = 1000;
     let mut tasks = JoinSet::new();
     let mut failure = None;
     for change in diff.changes.iter() {
@@ -1894,7 +1965,7 @@ pub async fn apply_diff(
                 .forward::<MergeError>("verifying filesystem for change")
             }
         });
-        while tasks.len() > MAX_TASK_COUNT
+        while tasks.len() > MAX_CONCURRENT_TREE_TASKS
             && let Some(result) = tasks.join_next().await
         {
             let result = result
@@ -1951,7 +2022,7 @@ pub async fn apply_diff(
                 .forward::<MergeError>("verifying filesystem for conflict")
             }
         });
-        while tasks.len() > MAX_TASK_COUNT
+        while tasks.len() > MAX_CONCURRENT_TREE_TASKS
             && let Some(result) = tasks.join_next().await
         {
             let result = result
@@ -2276,7 +2347,7 @@ pub(crate) async fn check_and_capture_dirty_for_merge(
         state_staged.clone(),
         repository.clone(),
         crate::node::ROOT_NODE,
-        RelativePath::new(),
+        RelativePathBuf::new(),
         &mut paths,
     )
     .await
@@ -2382,6 +2453,7 @@ async fn resolve_abort_entries(
             link_node,
             link_context,
             link_reference,
+            ..
         } = link::resolve_link_at_path(state_staged, repository.clone(), &link_path)
             .await
             .forward_with::<MergeError, _>(|| format!("link not found: {link_path}"))?;
@@ -2464,6 +2536,7 @@ pub async fn branch_merge_abort(
                 r.link_reference.signature,
                 entry.base.signature,
                 entry.base.branch,
+                link::LinkPinRealize::WorkingTree,
             )
             .await
             .forward_with::<MergeError, _>(|| format!("staging link pin for {}", r.link_path))?;
@@ -2553,6 +2626,7 @@ async fn merge_abort_link(
         link_node,
         link_context,
         link_reference,
+        ..
     } = link::resolve_link_at_path(&state_staged, repository.clone(), &link_path)
         .await
         .forward_with::<MergeError, _>(|| format!("link not found: {link_path}"))?;
@@ -2573,6 +2647,7 @@ async fn merge_abort_link(
         link_reference.signature,
         entry.base.signature,
         entry.base.branch,
+        link::LinkPinRealize::WorkingTree,
     )
     .await
     .forward_with::<MergeError, _>(|| format!("staging link pin for {link_path}"))?;
@@ -2651,6 +2726,7 @@ async fn merge_abort_ignore_links(
                 current_ref.signature,
                 r.link_reference.signature,
                 r.link_reference.branch,
+                link::LinkPinRealize::WorkingTree,
             )
             .await
             .forward_with::<MergeError, _>(|| format!("restoring link pin for {}", r.link_path))?;
@@ -3828,6 +3904,7 @@ async fn merge_into_link(
     // propagating the rehash result so no spawned leader outlives the
     // function holding references to local state.
     let rehash_tracker = std::sync::Arc::new(lore_storage::write_tracker::WriteTracker::new());
+    let modified_times = std::sync::Arc::new(crate::state::RecordedModifiedTimes::default());
     let rehash_result = commit::commit_files_and_rehash(
         repository.clone(),
         token.share(),
@@ -3838,10 +3915,14 @@ async fn merge_into_link(
         std::sync::Arc::new(std::collections::HashMap::new()),
         target_branch,
         rehash_tracker.clone(),
+        modified_times.clone(),
+        commit::CommitStats::new(),
+        execution_context().globals().event_interval(),
     )
     .await;
     let drain_result = rehash_tracker.await_all().await;
     rehash_result.forward::<MergeError>("rehashing commit")?;
+    modified_times.discard();
     drain_result.forward::<MergeError>("draining rehash tracker")?;
 
     let state_new = state_staged;
@@ -3879,7 +3960,7 @@ async fn merge_into_link(
     let mut revision_number = state_new.revision_number();
 
     if let Ok(remote) = repository.remote().await {
-        let stats = Arc::new(PushStatistics::default());
+        let stats = Arc::new(PushProgress::new(execution_context().push_stats().clone()));
         let correlation_id = execution_context().globals().correlation_id.to_string();
         let storage_protocol = remote
             .session(repository.id, &correlation_id)
@@ -3894,6 +3975,7 @@ async fn merge_into_link(
             storage_protocol.clone(),
             fragments,
             remote.environment.max_query_batch(),
+            execution_context().push_stats(),
         )
         .await
         .forward::<MergeError>("querying fragments")?;
@@ -4042,13 +4124,10 @@ pub async fn merge_into(
     .await
     .forward::<MergeError>("running diff")?;
 
-    // `state::diff` recurses into links when pin hashes differ; for
-    // `--ignore-links` we want a parent-only changeset, so drop those.
-    // The link pin itself remains whatever `state_branch` has on the
-    // target side.
-    if options.ignore_links {
-        changes.retain(|c| c.to.repository.id == repository.id);
-    }
+    // Realizing a linked repository's changes against the parent state attaches
+    // its file nodes under the parent's link node and overwrites
+    // `link_node.child`. Link contents go through `merge into --link`.
+    changes.retain(|c| c.to.repository.id == repository.id);
 
     change::sort_by_path(&mut changes);
 
@@ -4125,6 +4204,22 @@ pub async fn merge_into(
     .forward::<MergeError>("realizing changes")?;
     lore_debug!("Realized changes on state");
 
+    // The target branch is required to be merged into this one already, so this
+    // branch's rows are the newer ones. The working tree stays on the current
+    // branch, so nothing is realized on disk.
+    if !options.ignore_links {
+        Box::pin(link::merge_link_pins(
+            repository.clone(),
+            &state_staged,
+            &state_current,
+            link::LinkPinResolution::Incoming,
+            link::LinkPinRealize::StateOnly,
+            &[],
+        ))
+        .await
+        .forward::<MergeError>("carrying link pins into the target branch")?;
+    }
+
     LoreEvent::BranchMergeIntoSyncEnd(LoreBranchMergeIntoSyncEndEventData {
         count: changes_count,
     })
@@ -4165,6 +4260,7 @@ pub async fn merge_into(
     // propagating the rehash result so no spawned leader outlives the
     // function holding references to local state.
     let rehash_tracker = std::sync::Arc::new(lore_storage::write_tracker::WriteTracker::new());
+    let modified_times = std::sync::Arc::new(crate::state::RecordedModifiedTimes::default());
     let rehash_result = commit::commit_files_and_rehash(
         repository.clone(),
         token.share(),
@@ -4175,10 +4271,14 @@ pub async fn merge_into(
         std::sync::Arc::new(std::collections::HashMap::new()),
         current_branch,
         rehash_tracker.clone(),
+        modified_times.clone(),
+        commit::CommitStats::new(),
+        execution_context().globals().event_interval(),
     )
     .await;
     let drain_result = rehash_tracker.await_all().await;
     rehash_result.forward::<MergeError>("rehashing commit")?;
+    modified_times.discard();
     drain_result.forward::<MergeError>("draining rehash tracker")?;
     lore_debug!("Rehashed state");
 
@@ -4222,7 +4322,7 @@ pub async fn merge_into(
     let mut revision_number = state_new.revision_number();
 
     if let Ok(remote) = repository.remote().await {
-        let stats = Arc::new(PushStatistics::default());
+        let stats = Arc::new(PushProgress::new(execution_context().push_stats().clone()));
 
         LoreEvent::BranchMergeIntoFragmentBegin(LoreBranchMergeIntoFragmentBeginEventData {
             fragments: fragments.len() as u64,
@@ -4243,6 +4343,7 @@ pub async fn merge_into(
             storage_protocol.clone(),
             fragments,
             remote.environment.max_query_batch(),
+            execution_context().push_stats(),
         )
         .await
         .forward::<MergeError>("querying fragments")?;
@@ -4258,8 +4359,8 @@ pub async fn merge_into(
             tokio::select! {
                 _ = ticker.tick() => {
                     LoreEvent::BranchMergeIntoFragmentProgress(LoreBranchMergeIntoFragmentProgressEventData {
-                        complete: stats.fragment_complete.load(Ordering::Relaxed) as u64,
-                        count: stats.fragment_count.load(Ordering::Relaxed) as u64,
+                        complete: stats.complete(),
+                        count: stats.count(),
                     }).send();
                 },
                 result = &mut push_task => {
@@ -4270,7 +4371,7 @@ pub async fn merge_into(
         result.forward::<MergeError>("pushing fragments")?;
 
         LoreEvent::BranchMergeIntoFragmentEnd(LoreBranchMergeIntoFragmentEndEventData {
-            fragments: stats.fragment_complete.load(Ordering::Relaxed) as u64,
+            fragments: stats.complete(),
         })
         .send();
 

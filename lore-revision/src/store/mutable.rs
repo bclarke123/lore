@@ -29,11 +29,13 @@ use crate::lore_info;
 use crate::metadata;
 use crate::repository;
 use crate::repository::RepositoryContext;
+use crate::repository::RepositoryContextCreationArgs;
 use crate::store;
 use crate::store::ImmutableStore;
 use crate::store::KeyType;
 use crate::store::StoreError;
 use crate::store::StoreMatch;
+use crate::store::query_one;
 
 // Backward compatibility aliases
 #[error_set]
@@ -129,6 +131,7 @@ async fn migrate_initial_to_typed(
             committed_level: std::sync::atomic::AtomicUsize::new(
                 lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
             ),
+            flush_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }));
     }
 
@@ -175,6 +178,7 @@ async fn migrate_initial_to_typed(
             committed_level: std::sync::atomic::AtomicUsize::new(
                 lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
             ),
+            flush_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }));
     }
 
@@ -269,15 +273,12 @@ async fn migrate_bucket_initial_to_typed(
             context: Context::default(),
         };
 
-        let is_local_immutable = if let Ok(result) = immutable_store
-            .clone()
-            .query(entry.partition, address, StoreMatch::MatchFull)
-            .await
-        {
-            result.match_made != StoreMatch::MatchNone
-        } else {
-            false
-        };
+        let is_local_immutable =
+            if let Ok(result) = query_one(&immutable_store, entry.partition, address).await {
+                result.match_made != StoreMatch::MatchNone
+            } else {
+                false
+            };
 
         if is_local_immutable {
             migrate_immutable_value_to_typed(
@@ -409,16 +410,17 @@ async fn migrate_immutable_value_to_typed(
     mutable_store: Arc<MutableStore>,
     remote: &Arc<Connection>,
 ) -> Result<(), MutableStoreError> {
-    let repository = Arc::new(RepositoryContext::new(
-        None,
-        immutable_store.clone(),
-        mutable_store as Arc<dyn store::MutableStore>,
-        entry.partition,
-        crate::instance::InstanceId::default(),
-        Ok(remote.clone()),
-        Arc::default(),
-        crate::repository::RepositoryFormat::Lore,
-    ));
+    let repository = Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
+        path: None,
+        immutable_store: immutable_store.clone(),
+        mutable_store: mutable_store as Arc<dyn store::MutableStore>,
+        id: entry.partition,
+        instance_id: crate::instance::InstanceId::default(),
+        remote: Ok(remote.clone()),
+        filter: Arc::default(),
+        format: crate::repository::RepositoryFormat::Lore,
+        filesystem_provider: None,
+    }));
     let hash = entry.value;
 
     if let Ok(metadata) = metadata::Metadata::deserialize(repository.clone(), hash).await {

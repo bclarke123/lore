@@ -24,6 +24,7 @@ use lore_revision::interface::LoreString;
 use lore_revision::metadata::Metadata;
 use lore_revision::metadata::MetadataError;
 use lore_revision::metadata::MetadataType;
+use lore_revision::state::State;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -158,8 +159,6 @@ fn validate_entries(entries: &[LoreRevisionTreeMetadataGetEntry]) -> Result<(), 
                 "two entries share one caller id",
             ));
         }
-        // Sound because the entry point checked every string the call carries
-        // before dispatching it.
         if key.is_empty() {
             return Err(reject(entry_id, index, key, "key must not be empty"));
         }
@@ -217,13 +216,14 @@ fn resolve_from_pending(
 /// metadata fragment answers nothing, which is not a failure.
 async fn resolve_from_revision(
     internal: &Arc<RevisionTreeInternal>,
+    state: &State,
     entries: &[LoreRevisionTreeMetadataGetEntry],
     resolved: &mut [Resolved],
 ) -> Result<(), MetadataGetError> {
     if !resolved.iter().any(|slot| matches!(slot, Resolved::Absent)) {
         return Ok(());
     }
-    let metadata_hash = internal.state.metadata_hash();
+    let metadata_hash = state.metadata_hash();
     if metadata_hash.is_zero() {
         return Ok(());
     }
@@ -339,7 +339,8 @@ async fn metadata_get_batch(
 
     let mut resolved = resolve_from_pending(&internal, entries);
     if args.include_revision != 0 {
-        resolve_from_revision(&internal, entries, &mut resolved).await?;
+        let access = internal.access_shared().await;
+        resolve_from_revision(&internal, &access.state(), entries, &mut resolved).await?;
     }
     emit_resolved(entries, &resolved);
     Ok(())
@@ -596,7 +597,7 @@ mod tests {
             .serialize(internal.repository_context.clone())
             .await
             .expect("serializing the fragment must succeed");
-        internal.state.set_metadata_hash(hash);
+        internal.state_for_tests().set_metadata_hash(hash);
     }
 
     /// The loaded revision is read only when it is both asked for and needed.
@@ -608,7 +609,7 @@ mod tests {
         let (handle, store_handle_id) = load_handle("md-not-read", partition).await;
         let internal = rt_handle::lookup(handle).expect("the handle must resolve");
         internal
-            .state
+            .state_for_tests()
             .set_metadata_hash(Hash::from_u64(0xdead_beef));
         seed(handle, vec![set_entry(1, "mine", "value")]).await;
 
@@ -777,7 +778,7 @@ mod tests {
         let (handle, store_handle_id) = load_handle("md-unreadable", partition).await;
         let internal = rt_handle::lookup(handle).expect("the handle must resolve");
         internal
-            .state
+            .state_for_tests()
             .set_metadata_hash(Hash::from_u64(0xdead_beef));
 
         let (status, events) = run_get_including_revision(handle, vec![get_entry(20, "any")]).await;
@@ -841,7 +842,6 @@ mod tests {
         let partition = Partition::from([0x39u8; 16]);
         let (handle, store_handle_id) = load_handle("md-undecodable", partition).await;
 
-        // A boolean is one byte; three bytes under that tag is not decodable.
         let internal = rt_handle::lookup(handle).expect("the handle must resolve");
         internal
             .pending_metadata
@@ -892,7 +892,9 @@ mod tests {
     }
 
     /// Bad arguments still reject the whole read, even though an absent key does
-    /// not — the exemption is from atomicity, not from argument checking.
+    /// not — the exemption is from atomicity, not from argument checking. The
+    /// rejection carries empty text for "no value": the event has no absent
+    /// variant, and a numeric zero would read as a key that really holds zero.
     #[tokio::test]
     async fn get_rejects_bad_arguments_despite_tolerating_absent_keys() {
         let partition = Partition::from([0x3au8; 16]);
@@ -905,9 +907,6 @@ mod tests {
         let (status, events) = run_get(handle, vec![get_entry(20, "a"), get_entry(20, "b")]).await;
         assert_ne!(status, 0, "a repeated non-zero caller id must reject");
         assert!(rejection_reason(&events).contains("two entries share one caller id"));
-        // The rejection names the key it was about, and carries no value: this
-        // event has no absent variant, and a numeric zero would read as a key
-        // that really holds zero.
         assert_eq!(
             get_outcomes(&events),
             vec![(

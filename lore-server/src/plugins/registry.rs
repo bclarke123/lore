@@ -719,6 +719,7 @@ mod tests {
     use lore_base::error::PluginInitError;
     use lore_base::lore_spawn;
     use lore_base::types::Address;
+    use lore_base::types::Context;
     use lore_base::types::Fragment;
     use lore_base::types::Hash;
     use lore_base::types::KeyType;
@@ -733,9 +734,8 @@ mod tests {
     use lore_revision::lore::RepositoryId;
     use lore_storage::KeyValueStream;
     use lore_storage::StoreError;
-    use lore_storage::StoreMatch;
+    use lore_storage::StoreGetData;
     use lore_storage::StoreObliterateStats;
-    use lore_storage::StoreQueryResult;
     use tokio::sync::broadcast::Receiver;
 
     use super::*;
@@ -754,47 +754,28 @@ mod tests {
 
     #[async_trait]
     impl ImmutableStore for MockImmutableStore {
-        async fn get_metadata(
-            self: Arc<Self>,
-            partition: Partition,
-            address: Address,
-        ) -> Result<StoreQueryResult, StoreError> {
-            self.query(partition, address, StoreMatch::MatchFull).await
-        }
-
-        async fn exist(
-            self: Arc<Self>,
-            _partition: Partition,
-            _address: Address,
-            _match_requested: StoreMatch,
-        ) -> Result<StoreMatch, StoreError> {
-            Ok(StoreMatch::MatchNone)
-        }
-
-        async fn exist_batch(
-            self: Arc<Self>,
-            _partition: Partition,
-            addresses: &[Address],
-            _match_requested: StoreMatch,
-        ) -> Result<Vec<StoreMatch>, StoreError> {
-            Ok(vec![StoreMatch::MatchNone; addresses.len()])
-        }
-
         async fn query(
             self: Arc<Self>,
             _partition: Partition,
+            _addresses: &[Address],
+            _results: &mut [lore_storage::StoreMatchResult],
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn get_metadata(
+            self: Arc<Self>,
+            _partition: Partition,
             _address: Address,
-            _match_requested: StoreMatch,
-        ) -> Result<StoreQueryResult, StoreError> {
-            Ok(StoreQueryResult::default())
+        ) -> Result<StoreGetData, StoreError> {
+            Ok(StoreGetData::default())
         }
 
         async fn get(
             self: Arc<Self>,
             _partition: Partition,
             _address: Address,
-            _match_required: StoreMatch,
-        ) -> Result<(Fragment, Bytes), StoreError> {
+        ) -> Result<StoreGetData, StoreError> {
             Err(StoreError::from(AddressNotFound::from(Address::default())))
         }
 
@@ -841,8 +822,6 @@ mod tests {
             None
         }
 
-        async fn compact_stop(self: Arc<Self>) {}
-
         fn max_query_batch(&self) -> Option<usize> {
             None
         }
@@ -853,6 +832,17 @@ mod tests {
 
         async fn verify(self: Arc<Self>, _heal: bool) -> Result<(), StoreError> {
             Ok(())
+        }
+
+        async fn copy(
+            self: Arc<Self>,
+            _source_partition: Partition,
+            _source_address: Address,
+            _destination_partition: Partition,
+            _destination_context: Context,
+            _durable: bool,
+        ) -> Result<(), StoreError> {
+            Err(StoreError::internal("Copy not supported by this store"))
         }
     }
 

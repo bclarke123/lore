@@ -68,12 +68,12 @@ Environment-variable overrides apply last, after every file layer, so they win o
 
 With no config files loaded, the server runs as a self-contained, single-node instance, substituting ephemeral local artifacts for what a production deployment would configure. It logs each substitution so the choice is visible.
 
-- **TLS certificate.** When the public-facing QUIC endpoint has no certificate, the server writes a self-signed certificate for `localhost`, `127.0.0.1`, and `::1` to `<temp>/lore-server/<endpoint>-cert.pem` (and `-key.pem`). It's untrusted, regenerated on every restart, and for local development only.
+- **TLS certificate.** When a QUIC endpoint that does not require mutual TLS has no certificate, the server writes a self-signed certificate for `localhost`, `127.0.0.1`, and `::1` to `<temp>/lore-server/<endpoint>-<pid>-cert.pem` (and `-key.pem`), where `<pid>` is the server's process id. It's untrusted, regenerated on every restart, and for local development only.
 - **Local store path.** When a local store has no `path`, it uses `<temp>/lore-server`. Because that path is fixed, a later run reopens the same directory and reuses whatever the previous run left.
 - **Presigned URL feature.** When `presigned_url_hmac_key` is absent, the feature starts disabled.
 
 > [!NOTE]
-> `<temp>` is the OS temporary directory (`$TMPDIR` or `/tmp` on Linux; a per-user `/var/folders/…` path on macOS). The server always uses the same fixed subdirectory, `<temp>/lore-server`, so the paths above are stable across runs.
+> `<temp>` is the OS temporary directory (`$TMPDIR` or `/tmp` on Linux; a per-user `/var/folders/…` path on macOS). The server always uses the same fixed subdirectory, `<temp>/lore-server`, so the store path above is stable across runs. Certificate file names carry the process id so that servers sharing a machine cannot overwrite each other's certificate; they are not stable across runs, and old pairs are left behind rather than cleaned up.
 
 <!-- -->
 
@@ -110,7 +110,7 @@ The `[server]` table and its sub-tables configure the network endpoints and grac
 
 #### Certificate block
 
-Each QUIC endpoint takes an optional `[server.quic.certificate]` (or `[server.quic_internal.certificate]`) block. When omitted on the public endpoint, the server generates an ephemeral certificate (see [Zero-config defaults](#zero-config-defaults)). The block as a whole is optional, but when it is present `cert_file` and `pkey_file` are both required — only `cert_chain` is individually optional.
+Each QUIC endpoint takes an optional `[server.quic.certificate]` (or `[server.quic_internal.certificate]`) block. A configured block is always used as given. When it is omitted, the server generates an ephemeral certificate (see [Zero-config defaults](#zero-config-defaults)) on the public endpoint, and on the internal endpoint when `verify_client_certs = false` — there the certificate only has to satisfy the handshake, since no client is being verified. The internal endpoint with `verify_client_certs = true` has no such fallback: mutual TLS is the authentication, so a missing certificate fails startup. The block as a whole is optional, but when it is present `cert_file` and `pkey_file` are both required — only `cert_chain` is individually optional.
 
 | Field | Default | Description |
 | --- | --- | --- |
@@ -137,14 +137,51 @@ Each QUIC endpoint takes an optional `[server.quic.certificate]` (or `[server.qu
 | `presigned_url_min_ttl_seconds` | `1` | Minimum lifetime a presigned URL may request. |
 | `presigned_url_default_ttl_seconds` | `3600` | Default presigned URL lifetime. |
 | `presigned_url_max_ttl_seconds` | `86400` | Maximum presigned URL lifetime. |
+| `presigned_url_extra_content_types` | `[]` | Content types added to the default set. See below. |
+| `presigned_url_denied_content_types` | `[]` | Content types removed from that set. See below. |
 
 #### `presigned_url_hmac_key`
 
 This field is optional. When it's absent, the server starts with the presigned URL feature disabled and logs `Presigned URL feature disabled (presigned_url_hmac_key not configured)`. When it's set, the value must be valid hexadecimal that decodes to at least 32 bytes — generate one with `openssl rand -hex 32`. An invalid or too-short key stops the server from starting. Set this only for deployments that hand out presigned URLs, and use a fresh key per deployment.
 
+#### Presigned URL content types
+
+Redeemed content is served only with a `Content-Type` on an allowlist. A type off the allowlist is rejected at mint with 400 and coerced to `application/octet-stream` at redeem.
+
+Both fields are additive: they build on the default set rather than replacing it, so adding one type does not require restating the others. The default set is `application/octet-stream`, `binary/octet-stream`, `image/png`, `image/jpeg`, `image/gif`, `image/webp`, `application/pdf`, and `text/plain`. Both fields default to empty, so a config that sets neither gets exactly that set.
+
+```toml
+[server.http]
+presigned_url_extra_content_types = ["application/zip", "audio/mpeg"]
+presigned_url_denied_content_types = ["application/pdf"]
+```
+
+Removals apply after additions, so a type named in both fields is not allowed. Denying every default type is valid. The server logs the resolved set at startup.
+
+Some types can never be allowed, because a browser executes them as a document and redeemed bytes are caller-supplied: `text/html`, `application/xhtml+xml`, `image/svg+xml`, `text/xml`, `application/xml`, `application/xslt+xml`, `text/javascript`, `application/javascript`, and `application/ecmascript`. Naming one in `presigned_url_extra_content_types` stops the server from starting; naming one in `presigned_url_denied_content_types` has no effect.
+
+Each entry must be a bare `type/subtype` drawn from the RFC 9110 token character set. Any of the following stops the server from starting:
+
+| Rejected entry | Example |
+| --- | --- |
+| Empty or whitespace-only | `""` |
+| A parameter | `text/plain; charset=utf-8` |
+| A comma-joined list | `image/png,image/gif` |
+| A wildcard | `image/*`, `*/*` |
+| Whitespace inside the value | `text / html`, `image/pn g` |
+| A control character or any non-ASCII character | `image/pñg` |
+| Not exactly one `type` and one `subtype` | `png`, `image/`, `image/png/extra` |
+
+> [!NOTE]
+> These are array fields, so they cannot be set through a `LORE__` environment variable, and a later config layer replaces the whole array rather than merging it.
+
 ### gRPC endpoints
 
-`[server.grpc]` is the public gRPC API (HTTP/2 over TCP) serving the admin, storage, revision, repository, environment, lock, and notification services. It runs whenever the server is in normal (non-maintenance) mode. `[server.grpc_internal]` is the opt-in server-to-server gRPC internal endpoint; it is disabled by default and requires mutual TLS. Both tables share the same field set.
+`[server.grpc]` is the public gRPC API over HTTP/2 and TCP. It serves the admin,
+storage, revision, repository, environment, thin-client, lock, and notification
+services in normal mode. `[server.grpc_internal]` is the opt-in server-to-server
+endpoint. It is disabled by default and requires mutual TLS. Both tables share
+the same fields.
 
 > [!NOTE]
 > `[server.grpc]`'s default port `41337` is the same number as `[server.quic]`, but the two do not conflict: gRPC listens on TCP and QUIC on UDP.
@@ -165,13 +202,102 @@ This field is optional. When it's absent, the server starts with the presigned U
 | `enabled` | `false` | Whether to start the replication endpoint. Set `true` to opt in. |
 | `verify_client_certs` | `true` | Require client certificates (mutual TLS). The endpoint refuses to start unless this is `true` with a full certificate triple (`cert_file` + `pkey_file` + `cert_chain`), or explicitly set to `false` to accept unverified clients. |
 
-### gRPC public-service tuning
+### gRPC public services
 
-`[server.grpc_public_services]` applies per-service tuning to the public gRPC endpoint. Only the lock service is currently configurable.
+`[server.grpc_public_services]` holds one block per service the public gRPC endpoint can register, plus `forwarded_requests`.
+
+Every service block accepts `enabled` and a `general` namespace. A block may
+also define service-specific fields. A `general` field affects only the
+services named in its description:
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `lock_service.max_encoding_message_size` | `16777216` (16 MiB) | Maximum encoded gRPC response size, in bytes, for the lock service. When unset, the gRPC framework default applies. |
+| `enabled` | `true` | Whether the public router registers this service. Set `false` and every RPC on it answers `UNIMPLEMENTED`. |
+| `general.max_encoding_message_size` | unset | Maximum encoded gRPC response size in bytes. When unset, the gRPC framework default applies. Honored by `lock_service`. |
+
+Use `lock_service.general.max_encoding_message_size` instead of
+`lock_service.max_encoding_message_size`, which current servers ignore. During
+a mixed-version rollout, set both paths. Legacy servers read the direct key;
+current servers read the key beneath `general`. Remove the direct key after all
+servers are upgraded.
+
+#### Selecting services
+
+An absent block means enabled. A present block without `enabled` also means
+enabled. Restrict a deployment by disabling every service it must not serve:
+
+| Block | Registers |
+| --- | --- |
+| `admin_service` | `urc.rpc.AdminService` (`ServerInfo`, `Obliterate`) |
+| `storage_service` | `urc.rpc.StorageService` and `lore.storage.v1.StorageService` |
+| `revision_service` | `urc.rpc.RevisionService` and `lore.revision.v1.RevisionService` |
+| `repository_service` | `urc.rpc.RepositoryService` and `lore.repository.v1.RepositoryService` |
+| `environment_service` | `urc.rpc.EnvironmentService` and `lore.environment.v1.EnvironmentService` |
+| `thin_client_service` | `lore.thin_client.v1.ThinClientService`. Every RPC it serves is a read. |
+| `lock_service` | `urc.lock.LockService`. Also requires `[lock_store]` at a mode other than `none`. |
+| `notification_service` | `lore.notification.NotificationService`. Registers for local notification mode, the default when `[notification]` is absent. Notification plugins provide a sender but do not register this public service. |
+
+One block gates a whole proto family. The legacy `urc.rpc` services are not
+read-only shadows of their `v1` twins. They carry `BranchPush`,
+`RepositoryCreate`, and `RepositoryDelete`.
+
+Each flag is a scalar, so it is also settable from the environment:
+
+```shell
+LORE__SERVER__GRPC_PUBLIC_SERVICES__STORAGE_SERVICE__ENABLED=false
+```
+
+Disabling every service is legal. The process starts, and the public gRPC
+listener answers every RPC with `UNIMPLEMENTED`. The same result occurs when
+only `lock_service` is enabled without a store, or only `notification_service`
+is enabled with a notification plugin. An empty effective set logs a warning:
+`No public gRPC services registered; every RPC on this listener will answer
+UNIMPLEMENTED`.
+
+Unknown keys are ignored, as elsewhere in the settings. A misspelled block or
+key therefore leaves the service registered. Verify the effective set in the
+startup log.
+
+The startup message `Registered public gRPC services` lists the services that
+the router registered. Its `authenticated` field reports whether `[server.auth]`
+is active. The effective set can differ from the configured set because
+`lock_service` requires a store and `notification_service` requires local mode.
+
+For example, a read-only thin-client deployment disables every other service:
+
+```toml
+# Enabled by default; written out so the file states what the process serves.
+[server.grpc_public_services.thin_client_service]
+enabled = true
+
+[server.grpc_public_services.admin_service]
+enabled = false
+
+[server.grpc_public_services.storage_service]
+enabled = false
+
+# ... revision_service, repository_service, environment_service,
+#     lock_service, notification_service
+```
+
+`lore-server/config/thin.example.toml` is a complete example. It contains the
+exclusions above, disables the QUIC and HTTP listeners, and points both stores
+at a separate full server so the process keeps no repository copy. Copy it to a
+separate directory as `default.toml`, then point `LORE_CONFIG_PATH` at that
+directory. The server does not load the example in place.
+
+> [!IMPORTANT]
+> These flags govern only the gRPC router. The separate QUIC and HTTP listeners
+> accept writes, so a read-only process must also set
+> `server.quic.enabled = false` and `server.http.enabled = false`. Disabling HTTP
+> also removes `/health_check`. Use a gRPC readiness probe or an external
+> health-only endpoint.
+>
+> These flags reduce exposure, not memory. The stores are unaffected.
+>
+> A service added in a later release defaults to enabled. It therefore mounts on
+> a restricted deployment without an edit. Check the `Registered public gRPC
+> services` line after an upgrade.
 
 ### Authentication
 
@@ -206,7 +332,9 @@ Lore Server keeps three stores: an immutable store for content-addressed fragmen
 | --- | --- | --- |
 | `[immutable_store]` | `local` | `local`, `composite`, `replicated`, `remote`, or a plugin name such as `aws`. |
 | `[mutable_store]` | `local` | `local`, `remote`, or a plugin name such as `aws`. |
-| `[lock_store]` | `local` | `local`, or a plugin name such as `aws` (DynamoDB). |
+| `[lock_store]` | `local` | `local`, `none`, or a plugin name such as `aws` (DynamoDB). |
+
+`lock_store.mode = "none"` builds no lock store, so `LockService` does not register. The mode exists because `default.toml` sets `[lock_store]` and a layered configuration cannot remove a key a lower layer supplied.
 
 Each mode reads its settings from a matching sub-table. The `local` mode uses `[immutable_store.local]`, `[mutable_store.local]`, and the in-memory local lock store. Plugin modes such as `aws` read from `[plugins.<name>]` (see [Plugin backends](#plugin-backends)).
 
@@ -307,7 +435,7 @@ Five kinds of backend can be supplied by a plugin, each chosen by a different fi
 | --- | --- | --- |
 | Immutable store | `immutable_store.mode` | `local`, `composite`, `replicated`, `remote` |
 | Mutable store | `mutable_store.mode` | `local`, `remote` |
-| Lock store | `lock_store.mode` | `local` |
+| Lock store | `lock_store.mode` | `local`, `none` |
 | Topology | `topology.provider` | `none`, `fixed`, `rotating_id_fixed`, `composite` |
 | Notification | `notification.mode` | `local` |
 

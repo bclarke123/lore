@@ -460,6 +460,7 @@ async fn logout_local(
     callback: LoreEventCallback,
 ) -> i32 {
     let repository_path = globals.repository_path.to_string();
+    let identity = globals.identity().unwrap_or_default().to_string();
 
     let execution = setup_execution(globals, callback);
 
@@ -467,7 +468,8 @@ async fn logout_local(
         .scope(execution, async move {
             let result = async move {
                 let auth_url =
-                    resolve_auth_endpoint(args.auth_url.as_str(), &repository_path).await?;
+                    resolve_auth_endpoint(args.auth_url.as_str(), &repository_path, &identity)
+                        .await?;
 
                 if args.user_id.is_empty() {
                     lore_credential::token_store::remove_all_tokens_for_auth_url(&auth_url)
@@ -608,6 +610,7 @@ pub async fn local_user_info(
 async fn resolve_auth_endpoint(
     auth_endpoint: &str,
     repository_path: &str,
+    identity: &str,
 ) -> Result<String, AuthStoreError> {
     if !auth_endpoint.is_empty() {
         return Ok(auth_endpoint.to_string());
@@ -618,7 +621,7 @@ async fn resolve_auth_endpoint(
     if let Some(remote_url) = read_repository_config(repository_path) {
         let connection = lore_revision::protocol::connect(
             &remote_url,
-            "",
+            identity,
             lore_revision::lore::RepositoryId::default(),
         )
         .await
@@ -642,6 +645,7 @@ async fn local_user_info_impl(
     callback: LoreEventCallback,
 ) -> i32 {
     let repository_path = globals.repository_path.to_string();
+    let identity = globals.identity().unwrap_or_default().to_string();
 
     let execution = setup_execution(globals, callback);
 
@@ -651,7 +655,8 @@ async fn local_user_info_impl(
         .scope(execution, async move {
             let result = async move {
                 let auth_endpoint =
-                    resolve_auth_endpoint(args.auth_endpoint.as_str(), &repository_path).await?;
+                    resolve_auth_endpoint(args.auth_endpoint.as_str(), &repository_path, &identity)
+                        .await?;
 
                 let mut user_ids: Vec<String> = args
                     .user_ids
@@ -660,13 +665,22 @@ async fn local_user_info_impl(
                     .map(|s| s.as_str().to_string())
                     .collect();
 
-                // When no user IDs are provided, resolve the current user
+                // When no user IDs are provided, resolve the current user: the
+                // identity this call acts as, which is what a supplied token
+                // names. Only without one does the store decide, since a caller
+                // working from supplied tokens may have no store at all -- and
+                // whichever identity it holds first need not be this caller.
                 if user_ids.is_empty() {
-                    let identities = lore_credential::token_store::load_identities(&auth_endpoint)
-                        .await
-                        .forward::<AuthStoreError>("accessing token store")?;
-                    if let Some(first) = identities.into_iter().next() {
-                        user_ids.push(first);
+                    if !identity.is_empty() {
+                        user_ids.push(identity.clone());
+                    } else {
+                        let identities =
+                            lore_credential::token_store::load_identities(&auth_endpoint)
+                                .await
+                                .forward::<AuthStoreError>("accessing token store")?;
+                        if let Some(first) = identities.into_iter().next() {
+                            user_ids.push(first);
+                        }
                     }
                 }
 
@@ -716,18 +730,18 @@ mod resolve_auth_endpoint_tests {
     // repository config or the network.
     #[tokio::test]
     async fn returns_explicit_endpoint_verbatim() {
-        let endpoint = resolve_auth_endpoint("ucs-auth://auth.example.com", "/does/not/exist")
+        let endpoint = resolve_auth_endpoint("ucs-auth://auth.example.com", "/does/not/exist", "")
             .await
             .expect("an explicit endpoint should resolve");
         assert_eq!(endpoint, "ucs-auth://auth.example.com");
     }
 
     // With no explicit endpoint and no resolvable repository remote, the
-    // operation is `NotSupported` (code 18) — there is no URL to key a token
+    // operation is `NotSupported` (code 9) — there is no URL to key a token
     // lookup on — rather than an opaque internal error.
     #[tokio::test]
     async fn missing_endpoint_is_not_supported() {
-        let err = resolve_auth_endpoint("", "/does/not/exist")
+        let err = resolve_auth_endpoint("", "/does/not/exist", "")
             .await
             .expect_err("a missing endpoint must be an error");
 

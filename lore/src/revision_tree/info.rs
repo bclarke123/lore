@@ -101,7 +101,10 @@ async fn info_impl(
         async move |internal, args: LoreRevisionTreeInfoArgs| {
             let id = args.id;
 
-            let metadata_hash = internal.state.metadata_hash();
+            let access = internal.access_shared().await;
+            let state = access.state();
+
+            let metadata_hash = state.metadata_hash();
             let metadata = if metadata_hash.is_zero() {
                 Metadata::default()
             } else {
@@ -130,8 +133,8 @@ async fn info_impl(
             LoreEvent::RevisionTreeInfo(LoreRevisionTreeInfoEventData {
                 id,
                 repository: internal.repository,
-                revision: internal.state.revision(),
-                parent: internal.state.parents(),
+                revision: state.revision(),
+                parent: state.parents(),
                 creation_timestamp,
                 author_identity,
                 metadata_key_count,
@@ -227,7 +230,7 @@ mod tests {
         let entry = rt_handle::REGISTRY
             .get(&handle.handle_id)
             .expect("handle registered");
-        (entry.state.clone(), entry.repository_context.clone())
+        (entry.state_for_tests(), entry.repository_context.clone())
     }
 
     fn release(handle: LoreRevisionTree, store_handle_id: u64) {
@@ -333,7 +336,6 @@ mod tests {
         let (handle, store_handle_id) =
             load_handle("info-corrupt", Partition::from([0x44u8; 16])).await;
         let (state, _repository_context) = handle_state(handle);
-        // Point the revision at a metadata fragment that was never written to the store.
         state.set_metadata_hash(Hash::from([0x7Eu8; 32]));
 
         let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
@@ -376,7 +378,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "an unknown handle must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "an unknown handle must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let data = info_event(&events)
             .expect("a handle miss must still emit the info terminal carrying the id");
@@ -386,6 +392,6 @@ mod tests {
             LoreErrorCode::InvalidArguments,
             "got {events:?}"
         );
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
     }
 }

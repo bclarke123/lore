@@ -68,6 +68,9 @@ pub struct LoreRevisionTreeChildEventData {
     pub parent_id: NodeID,
     /// The kind of node.
     pub kind: u32,
+    /// The change staged on the node, as a `LoreNodeStagedAction`. A child
+    /// staged for deletion is still listed, carrying the deletion here.
+    pub staged_action: u32,
     /// The file mode bits.
     pub mode: u16,
     /// The size of the node's content in bytes.
@@ -133,6 +136,9 @@ pub struct LoreRevisionTreeNodeInfoEventData {
     pub parent_id: NodeID,
     /// The kind of node.
     pub kind: u32,
+    /// The change staged on the node, as a `LoreNodeStagedAction`. A node
+    /// staged for deletion still reports, carrying the deletion here.
+    pub staged_action: u32,
     /// The file mode bits.
     pub mode: u16,
     /// The size of the node's content in bytes.
@@ -208,6 +214,9 @@ pub struct LoreRevisionTreeAddCompleteEventData {
 pub struct LoreRevisionTreeDeleteCompleteEventData {
     /// Correlation id of the entry this reports, not of the call.
     pub entry_id: u64,
+    /// How many nodes the entry's subtree removed, staged and discarded
+    /// together. Zero on failure, since nothing was removed.
+    pub node_count: u64,
     /// The outcome of the call.
     pub error_code: LoreErrorCode,
 }
@@ -290,10 +299,14 @@ pub struct LoreRevisionTreeMetadataGetCompleteEventData {
 }
 
 /// Terminal per-call event for `commit`. On success `revision_hash` is the
-/// newly-committed revision and `new_tip_hash` is `Hash::default()`. When
-/// `error_code` reports `BranchAdvanced`, `new_tip_hash` carries the
-/// observed branch tip so the caller can reload without an extra
-/// `branch::load_latest` round-trip.
+/// newly-committed revision and `new_tip_hash` is `Hash::default()`.
+///
+/// A non-zero `new_tip_hash` means the branch had advanced past the revision
+/// the handle was built on, and carries the tip to reload from so the caller
+/// needs no extra `branch::load_latest` round-trip. It is the only signal for
+/// that case: no `LoreErrorCode` value names a tip collision, so `error_code`
+/// reports `Internal` with the reason in the completion detail — the same code
+/// the file-system commit returns.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

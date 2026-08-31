@@ -91,11 +91,11 @@ pub async fn handler(
     LORE_CONTEXT
         .scope(execution, async move {
             // Read (defragment + decompress) up front so failures surface as a
-            // unary Status before the stream opens. `read_with_info` also
+            // unary Status before the stream opens. `read` also
             // yields the root fragment, whose `size_content` is the total
             // content size — reported alongside ranged reads so callers can
             // say "bytes X-Y of Z" without a second round-trip.
-            let (fragment, bytes) = match lore_storage::read_with_info(
+            let (fragment, bytes) = match lore_storage::read(
                 immutable_store.clone(),
                 repository_id,
                 address,
@@ -121,7 +121,7 @@ pub async fn handler(
                     {
                         fallback = fallback.with_max_content_size(max);
                     }
-                    lore_storage::read_with_info(
+                    lore_storage::read(
                         immutable_store,
                         repository_id,
                         address,

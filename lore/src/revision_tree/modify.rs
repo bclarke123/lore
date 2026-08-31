@@ -23,6 +23,7 @@ use lore_revision::event::revision_tree::LoreRevisionTreeModifyCompleteEventData
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreError;
 use lore_revision::node::INVALID_NODE;
+use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
@@ -145,11 +146,21 @@ struct Planned {
     mode: u16,
     size: u64,
     address: Address,
+    /// The staged and dirty change the rewrite records, decided while the plan
+    /// phase had the node in hand.
+    staged: NodeFlags,
+    dirty: NodeFlags,
 }
 
 /// Check every entry against the tree and against the rest of the batch,
 /// producing the apply plan. Mutates nothing; the first invalid entry rejects
 /// the batch.
+///
+/// A discarded slot and a slot the allocator never handed out both read back as
+/// ordinary directories, so each is refused on its own terms rather than left to
+/// the kind check, which would report the wrong reason. Since every allocated
+/// node has a name, a zero name length is what separates the second from a real
+/// node.
 async fn plan_entries(
     state: &Arc<State>,
     context: &Arc<RepositoryContext>,
@@ -175,15 +186,12 @@ async fn plan_entries(
         let Ok(node) = state.node(context.clone(), entry.node_id).await else {
             return Err(reject(entry_id, index, "node id is unknown"));
         };
-        // A discarded slot carries neither the file nor the link flag, so it
-        // reads back as an ordinary directory. The kind check below refuses it
-        // too, but as the wrong kind rather than as a deleted node.
         if node.is_discarded() {
             return Err(reject(entry_id, index, "node has been deleted"));
         }
-        // A slot the allocator never handed out reads back zeroed, which is a
-        // perfectly ordinary directory. Every allocated node has a name, so a
-        // zero length is what separates the two.
+        if node.is_staged_delete() {
+            return Err(reject(entry_id, index, "node is staged for deletion"));
+        }
         if entry.node_id != ROOT_NODE && node.name_length == 0 {
             return Err(reject(
                 entry_id,
@@ -199,12 +207,15 @@ async fn plan_entries(
             ));
         }
 
+        let (staged, dirty) = State::staged_edit_flags(&node);
         planned.push(Planned {
             entry_id,
             node_id: entry.node_id,
             mode: entry.mode,
             size: entry.size,
             address: entry.address,
+            staged,
+            dirty,
         });
     }
 
@@ -241,7 +252,7 @@ async fn apply_plan(
         lore_spawn!(tasks, async move {
             let mut applied = 0;
             for item in &planned[start..end] {
-                match state
+                let rewritten = state
                     .node_modify(
                         context.clone(),
                         item.node_id,
@@ -249,8 +260,21 @@ async fn apply_plan(
                         item.size,
                         item.address,
                     )
-                    .await
-                {
+                    .await;
+                let outcome = match rewritten {
+                    Ok(()) => {
+                        state
+                            .node_mark_staged(
+                                context.clone(),
+                                item.node_id,
+                                item.staged,
+                                item.dirty,
+                            )
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                match outcome {
                     Ok(()) => {
                         emit_modify_complete(item.entry_id, item.node_id, LoreErrorCode::None);
                         applied += 1;
@@ -264,8 +288,6 @@ async fn apply_plan(
 
     let mut applied = 0usize;
     while let Some(result) = tasks.join_next().await {
-        // A task that died mid-bucket returns nothing; its entries simply do not
-        // count as applied, which is what the shortfall below measures.
         if let Ok(count) = result {
             applied += count;
         }
@@ -346,8 +368,10 @@ async fn modify_batch(
         return Ok(());
     }
     let context = internal.repository_context.clone();
-    let planned = plan_entries(&internal.state, &context, args.entries.as_slice()).await?;
-    apply_plan(internal.state.clone(), context, planned).await
+    let access = internal.access_shared().await;
+    let state = access.state();
+    let planned = plan_entries(&state, &context, args.entries.as_slice()).await?;
+    apply_plan(state, context, planned).await
 }
 
 async fn modify_impl(
@@ -805,7 +829,7 @@ mod tests {
         let internal = rt_handle::lookup(handle).expect("the handle must resolve");
         let block_index = NodeBlock::index(node_id);
         let block = internal
-            .state
+            .state_for_tests()
             .block(internal.repository_context.clone(), block_index)
             .await
             .expect("the block must be readable");
@@ -1020,7 +1044,9 @@ mod tests {
     /// and nothing holds the tree still in between. Driving the two phases
     /// separately puts that interleaving under the test's control rather than a
     /// race's, which is the only way to reach the apply phase's failure path now
-    /// that validation catches everything the arguments can get wrong.
+    /// that validation catches everything the arguments can get wrong. It runs
+    /// through the real dispatcher rather than a hand-built scope, so the events
+    /// reach the callback the way they do on any other call.
     #[tokio::test]
     async fn a_target_deleted_after_validation_fails_the_batch_as_internal() {
         let partition = Partition::from([0x2du8; 16]);
@@ -1033,8 +1059,6 @@ mod tests {
         )
         .await;
 
-        // Runs through the real dispatcher rather than a hand-built scope, so the
-        // events reach the callback the way they do on any other call.
         let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let status = revision_tree_call(
             LoreGlobalArgs::default(),
@@ -1045,12 +1069,16 @@ mod tests {
             |_: &u64| {},
             async move |internal: Arc<RevisionTreeInternal>, call_id: u64| {
                 let entries = vec![entry(10, node_id)];
-                let planned =
-                    plan_entries(&internal.state, &internal.repository_context, &entries).await?;
+                let planned = plan_entries(
+                    &internal.state_for_tests(),
+                    &internal.repository_context,
+                    &entries,
+                )
+                .await?;
 
                 let block_index = NodeBlock::index(node_id);
                 let block = internal
-                    .state
+                    .state_for_tests()
                     .block(internal.repository_context.clone(), block_index)
                     .await
                     .expect("the block must be readable");
@@ -1059,7 +1087,7 @@ mod tests {
                     .discard_node(block_index, Node::index(node_id));
 
                 let result = apply_plan(
-                    internal.state.clone(),
+                    internal.state_for_tests(),
                     internal.repository_context.clone(),
                     planned,
                 )

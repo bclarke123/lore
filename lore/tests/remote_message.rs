@@ -10,9 +10,13 @@ use lore::remote::message::write_v1_message;
 use lore::repository::LoreRepositoryStatusArgs;
 use lore::revision_tree::add::LoreRevisionTreeAddArgs;
 use lore::revision_tree::add::LoreRevisionTreeAddEntry;
+use lore::revision_tree::delete::LoreRevisionTreeDeleteArgs;
+use lore::revision_tree::delete::LoreRevisionTreeDeleteEntry;
 use lore::revision_tree::handle::LoreRevisionTree;
 use lore::revision_tree::modify::LoreRevisionTreeModifyArgs;
 use lore::revision_tree::modify::LoreRevisionTreeModifyEntry;
+use lore::revision_tree::move_node::LoreRevisionTreeMoveArgs;
+use lore::revision_tree::move_node::LoreRevisionTreeMoveEntry;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
@@ -189,6 +193,149 @@ async fn revision_tree_modify_batch_survives_the_wire() {
                     entries.as_slice(),
                     "{label} must carry every entry field unchanged"
                 );
+            }
+            other => panic!("Unexpected command: {other:?}"),
+        }
+    }
+}
+
+/// The smallest batch entry in the namespace, and the one most likely to be
+/// mistaken for needing no coverage: two integers, both of which a caller
+/// correlates results by.
+#[tokio::test]
+async fn revision_tree_delete_batch_survives_the_wire() {
+    let entries = LoreArray::from_vec(vec![
+        LoreRevisionTreeDeleteEntry {
+            entry_id: 7,
+            node_id: 42,
+        },
+        LoreRevisionTreeDeleteEntry {
+            entry_id: 0,
+            node_id: 43,
+        },
+    ]);
+    let args = LoreRevisionTreeDeleteArgs {
+        batch_id: 900,
+        handle: LoreRevisionTree { handle_id: 5 },
+        entries: entries.clone(),
+    };
+
+    for (serialization, label) in [
+        (SerializationType::Json, "json"),
+        (SerializationType::Bincode, "bincode"),
+    ] {
+        let message = MessageToServer {
+            globals: LoreGlobalArgs::default(),
+            command: LoreCommand::RevisionTreeDelete(args.clone()),
+        };
+        let message_bytes = write_v1_message(message, serialization).unwrap();
+        let processed: Result<Option<(V1Header, MessageToServer)>, MessageError> =
+            blocking_read_v1_message(&mut message_bytes.as_slice());
+        let processed = processed
+            .unwrap_or_else(|error| panic!("{label} must read back: {error:?}"))
+            .expect("a whole message must be present");
+
+        match processed.1.command {
+            LoreCommand::RevisionTreeDelete(read_back) => {
+                assert_eq!(read_back.batch_id, args.batch_id, "{label}");
+                assert_eq!(read_back.handle.handle_id, args.handle.handle_id, "{label}");
+                assert_eq!(
+                    read_back.entries.as_slice(),
+                    entries.as_slice(),
+                    "{label} must carry every entry field unchanged"
+                );
+            }
+            other => panic!("Unexpected command: {other:?}"),
+        }
+    }
+}
+
+/// The only batch entry carrying both a string and two node ids, so a wire format
+/// that lost the string's length or ran the fields out of order would show here.
+#[tokio::test]
+async fn revision_tree_move_batch_survives_the_wire() {
+    let entries = LoreArray::from_vec(vec![
+        LoreRevisionTreeMoveEntry {
+            entry_id: 7,
+            node_id: 42,
+            destination_parent_id: 0,
+            dst_name: LoreString::from_str("moved.bin"),
+        },
+        LoreRevisionTreeMoveEntry {
+            entry_id: 0,
+            node_id: 43,
+            destination_parent_id: 42,
+            dst_name: LoreString::from_str("renamed.bin"),
+        },
+    ]);
+    let args = LoreRevisionTreeMoveArgs {
+        batch_id: 900,
+        handle: LoreRevisionTree { handle_id: 5 },
+        entries: entries.clone(),
+    };
+
+    for (serialization, label) in [
+        (SerializationType::Json, "json"),
+        (SerializationType::Bincode, "bincode"),
+    ] {
+        let message = MessageToServer {
+            globals: LoreGlobalArgs::default(),
+            command: LoreCommand::RevisionTreeMove(args.clone()),
+        };
+        let message_bytes = write_v1_message(message, serialization).unwrap();
+        let processed: Result<Option<(V1Header, MessageToServer)>, MessageError> =
+            blocking_read_v1_message(&mut message_bytes.as_slice());
+        let processed = processed
+            .unwrap_or_else(|error| panic!("{label} must read back: {error:?}"))
+            .expect("a whole message must be present");
+
+        match processed.1.command {
+            LoreCommand::RevisionTreeMove(read_back) => {
+                assert_eq!(read_back.batch_id, args.batch_id, "{label}");
+                assert_eq!(read_back.handle.handle_id, args.handle.handle_id, "{label}");
+                assert_eq!(
+                    read_back.entries.as_slice(),
+                    entries.as_slice(),
+                    "{label} must carry every entry field unchanged"
+                );
+            }
+            other => panic!("Unexpected command: {other:?}"),
+        }
+    }
+}
+
+/// The only revision-tree verb that publishes anything, and the one whose
+/// arguments no longer name the branch — the nested options struct is the part a
+/// hand-written encoder is most likely to flatten away.
+#[tokio::test]
+async fn revision_tree_commit_survives_the_wire() {
+    use lore::revision_tree::commit::LoreRevisionTreeCommitArgs;
+    use lore::revision_tree::commit::LoreRevisionTreeCommitOptions;
+
+    let args = LoreRevisionTreeCommitArgs {
+        id: 4242,
+        handle: LoreRevisionTree { handle_id: 9 },
+        options: LoreRevisionTreeCommitOptions { remote_write: 1 },
+    };
+
+    for (serialization, label) in [
+        (SerializationType::Json, "json"),
+        (SerializationType::Bincode, "bincode"),
+    ] {
+        let message = MessageToServer {
+            globals: LoreGlobalArgs::default(),
+            command: LoreCommand::RevisionTreeCommit(args),
+        };
+        let message_bytes = write_v1_message(message, serialization).unwrap();
+        let processed: Result<Option<(V1Header, MessageToServer)>, MessageError> =
+            blocking_read_v1_message(&mut message_bytes.as_slice());
+        let processed = processed
+            .unwrap_or_else(|error| panic!("{label} must read back: {error:?}"))
+            .expect("a whole message must be present");
+
+        match processed.1.command {
+            LoreCommand::RevisionTreeCommit(read_back) => {
+                assert_eq!(read_back, args, "{label} must carry every field unchanged");
             }
             other => panic!("Unexpected command: {other:?}"),
         }

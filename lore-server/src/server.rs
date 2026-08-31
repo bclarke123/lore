@@ -47,6 +47,7 @@ use lore_telemetry::user_agent_filter::UserAgentFilter;
 use lore_transport::grpc::set_user_agent;
 use lore_transport::quic::client;
 use lore_transport::quic::client::ClientCerts;
+use lore_transport::quic::client::STREAM_COUNT;
 use lore_transport::quic::client::ServiceClient;
 use lore_transport::quic::storage_service::client::StorageClient;
 use opentelemetry::KeyValue;
@@ -74,6 +75,7 @@ use crate::hooks::HookDispatcher;
 use crate::hooks::HookRegistrationContext;
 use crate::hooks::HookRegistry;
 use crate::http::LoreHttpServer;
+use crate::http::security_headers::ContentTypePolicy;
 use crate::http::server::LoreHttpServerSettings;
 use crate::http::server::PresignSettings;
 use crate::plugins;
@@ -93,11 +95,13 @@ use crate::quic::replication_store_service::client_container;
 use crate::quic::replication_store_service::client_container::ClientContainerConfig;
 use crate::quic::replication_store_service::server::ReplicationStoreService;
 use crate::quic::storage_service::StorageService;
+use crate::quic::stream_handler::AdmissionLimits;
 use crate::quic::stream_handler::StreamHandler;
 use crate::server_config::ServerConfig;
 use crate::settings::CompositeStoreSettings;
 use crate::settings::CompositeSubStoreSettings;
 use crate::settings::GrpcSettings;
+use crate::settings::HttpSettings;
 use crate::settings::LocalImmutableStoreSettings;
 use crate::settings::LocalMutableStoreSettings;
 use crate::settings::NotificationSettings;
@@ -122,6 +126,8 @@ mod store_mode {
     pub const REMOTE: &str = "remote";
     pub const COMPOSITE: &str = "composite";
     pub const REPLICATED: &str = "replicated";
+    /// Build no store. `[lock_store]` only.
+    pub const NONE: &str = "none";
 }
 
 /// Command-line options for the Lore server binary.
@@ -339,6 +345,14 @@ impl From<QuicSettings> for QuinnConfigBuilder {
     }
 }
 
+/// Requests a connection may hold in handling, defaulting to the capacity of its streams' pools.
+fn connection_inflight_limit(settings: &QuicSettings, process_limit: usize) -> usize {
+    settings.connection_inflight_limit.unwrap_or_else(|| {
+        let streams = settings.max_bidi_streams.unwrap_or(STREAM_COUNT as u64);
+        process_limit.saturating_mul(streams as usize)
+    })
+}
+
 async fn launch_quinn_server(
     name: &'static str,
     stream_handler_factory: Box<dyn StreamHandlerFactory>,
@@ -442,11 +456,13 @@ async fn launch_grpc_server(
     let addr =
         SocketAddr::from_str(format!("{}:{}", grpc_settings.host, grpc_settings.port).as_str())?;
 
+    let locks = lock_store.is_some() && service_settings.lock_service.enabled;
+
     info!(
         "Starting Lore GRPC Server: {}, Auth: {} Locks: {}",
         &addr,
         jwt_verifier.as_ref().map_or("disabled", |_| "enabled"),
-        lock_store.as_ref().map_or("disabled", |_| "enabled"),
+        if locks { "enabled" } else { "disabled" },
     );
 
     // The settings map has no relevant entries to surface yet, so it stays empty.
@@ -621,6 +637,33 @@ async fn launch_grpc_internal_server(
         .await
 }
 
+fn build_lore_http_settings(
+    http_settings: &HttpSettings,
+    user_agent_filter: Arc<UserAgentFilter>,
+) -> LoreHttpServerSettings {
+    LoreHttpServerSettings {
+        port: http_settings.port,
+        host: http_settings.host.clone(),
+        max_file_size: http_settings.max_file_size,
+        request_timeout_seconds: http_settings.request_timeout_seconds,
+        request_body_timeout_seconds: http_settings.request_body_timeout_seconds,
+        available_interval_seconds: http_settings.available_interval_seconds,
+        available_timeout_seconds: http_settings.available_timeout_seconds,
+        store_health_check: http_settings.store_health_check,
+        presign: PresignSettings {
+            hmac_key: http_settings.presigned_url_hmac_key.clone(),
+            min_ttl_seconds: http_settings.presigned_url_min_ttl_seconds,
+            default_ttl_seconds: http_settings.presigned_url_default_ttl_seconds,
+            max_ttl_seconds: http_settings.presigned_url_max_ttl_seconds,
+            content_type_policy: ContentTypePolicy {
+                extra: http_settings.presigned_url_extra_content_types.clone(),
+                denied: http_settings.presigned_url_denied_content_types.clone(),
+            },
+        },
+        user_agent_filter,
+    }
+}
+
 async fn launch_http_server(
     settings: LoreHttpServerSettings,
     immutable_store: Arc<dyn ImmutableStore>,
@@ -698,8 +741,7 @@ impl QuicPublicStreamHandler {
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
         jwt_verifier: Option<JwtVerifier>,
-        process_limit: usize,
-        handler_duration_timeout: Option<Duration>,
+        limits: AdmissionLimits,
     ) -> Self {
         let mut service_store = ServiceStore::default();
 
@@ -718,8 +760,7 @@ impl QuicPublicStreamHandler {
                     Box::new(StreamHandler::new(
                         Arc::new(storage_protocol),
                         context,
-                        process_limit,
-                        handler_duration_timeout,
+                        limits,
                     )) as Box<dyn StreamDataHandler>
                 }) as StreamDataHandlerBuilder
             };
@@ -747,12 +788,8 @@ impl QuicPublicStreamHandler {
                         local_store.clone(),
                         mutable_store.clone(),
                     );
-                    Box::new(StreamHandler::new(
-                        Arc::new(v4_service),
-                        context,
-                        process_limit,
-                        handler_duration_timeout,
-                    )) as Box<dyn StreamDataHandler>
+                    Box::new(StreamHandler::new(Arc::new(v4_service), context, limits))
+                        as Box<dyn StreamDataHandler>
                 }) as StreamDataHandlerBuilder,
             );
         }
@@ -785,8 +822,7 @@ impl QuicInternalStreamHandler {
     fn new(
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
-        process_limit: usize,
-        handler_duration_timeout: Option<Duration>,
+        limits: AdmissionLimits,
     ) -> Self {
         let mut service_store = ServiceStore::default();
         {
@@ -795,12 +831,7 @@ impl QuicInternalStreamHandler {
                 Box::new(move |context: Arc<AttributeMap>| {
                     let protocol =
                         ReplicationStoreService::new(immutable_store.clone(), local_store.clone());
-                    Box::new(StreamHandler::new(
-                        Arc::new(protocol),
-                        context,
-                        process_limit,
-                        handler_duration_timeout,
-                    ))
+                    Box::new(StreamHandler::new(Arc::new(protocol), context, limits))
                 }),
             );
         }
@@ -936,6 +967,12 @@ fn configure_lock_store_via_plugin(
     if let Some(lock_settings) = &settings.lock_store {
         let mode = &lock_settings.mode;
 
+        // The only way to opt out of a store `default.toml` sets.
+        if mode == store_mode::NONE {
+            info!("No lock store configured, LockService will not register");
+            return Ok(None);
+        }
+
         if mode == store_mode::LOCAL {
             info!("Creating local (in-memory) lock store");
             let store = crate::lock::store::LocalLockStore::default();
@@ -1003,10 +1040,15 @@ fn resolve_local_store_path(configured: &str, store_label: &str) -> PathBuf {
 /// endpoint that has no certificate configured by generating an ephemeral
 /// self-signed certificate and writing it under the system temporary directory.
 ///
-/// Used for the user-facing QUIC endpoint so a stand alone server binary with
-/// no external config can serve TLS out of the box. A prominent warning is
-/// logged because these certificates are untrusted and regenerated on every
-/// startup.
+/// Used for QUIC endpoints that carry no mTLS requirement, so a stand alone
+/// server binary with no external config can serve TLS out of the box. A
+/// prominent warning is logged because these certificates are untrusted and
+/// regenerated on every startup.
+///
+/// The file names carry the process id: several servers routinely share one
+/// machine (and therefore one temporary directory), and a fixed name would let
+/// them overwrite each other's certificate between the write here and the read
+/// in the endpoint setup, pairing one server's certificate with another's key.
 fn generate_ephemeral_certificate(endpoint: &str) -> Result<crate::tls::CertificateSettings> {
     let dir = local_data_dir();
     std::fs::create_dir_all(&dir).map_err(|e| {
@@ -1016,8 +1058,9 @@ fn generate_ephemeral_certificate(endpoint: &str) -> Result<crate::tls::Certific
         )
     })?;
 
-    let cert_file = dir.join(format!("{endpoint}-cert.pem"));
-    let pkey_file = dir.join(format!("{endpoint}-key.pem"));
+    let process_id = std::process::id();
+    let cert_file = dir.join(format!("{endpoint}-{process_id}-cert.pem"));
+    let pkey_file = dir.join(format!("{endpoint}-{process_id}-key.pem"));
 
     let generated = lore_transport::tls::generate_self_signed(vec![
         "localhost".to_string(),
@@ -1077,16 +1120,16 @@ async fn create_local_store(
         options,
         true,  /* Server mode, deserialize all buckets immediately */
         lore_storage::local::immutable_store::ImmutableStoreSettings {
-            allow_partial_fragment: false, /* Server mode, partial fragments not allowed */
             protect_local_fragment: false, /* Server mode, no need to try protect local fragments from eviction */
             implicit_durable_stored: true, /* Server mode, consider all fragments as durably stored */
+            isolate_partitions: true, /* Server mode, one process holds content for every tenant */
             flush_background,
             flush_delay_seconds: settings.flush_delay_seconds as u64,
             target_capacity_percentage: settings.target_capacity_percentage.unwrap_or(default_settings.target_capacity_percentage),
             target_size_percentage: settings.target_size_percentage.unwrap_or(default_settings.target_size_percentage),
             compaction_parallel_groups: settings.compaction_parallel_groups.unwrap_or(default_settings.compaction_parallel_groups),
             verify_write: false,
-            atime: false,
+            atime: true,
             initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX, /* Server mode, full 256-bucket layout from the start */
             fan_out_threshold: lore_storage::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
         },
@@ -1228,8 +1271,10 @@ async fn configure_composite_store(
 ) -> Result<Arc<dyn ImmutableStore>> {
     info!("Wiring up Composite store");
 
-    let mut composite_store_builder = CompositeStoreBuilder::default()
-        .with_cache_query_results(settings.should_cache_query_results.unwrap_or_default());
+    let mut composite_store_builder = CompositeStoreBuilder::default().with_cache_metadata(
+        settings.cache_metadata.unwrap_or_default(),
+        settings.cache_metadata_semaphore_size,
+    );
 
     let store = Box::pin(configure_composite_substore(
         registry,
@@ -1652,9 +1697,6 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     #[cfg(target_os = "linux")]
     log_base_address().await;
 
-    // Enforce repository isolation in local store by default
-    lore_storage::concurrency::LOCAL_ISOLATION.store(true, std::sync::atomic::Ordering::Release);
-
     let execution = execution_context();
     let frequency = Duration::from_millis(metrics_config.export_interval_millis);
     let meter = lore_telemetry::meter("tokio_runtime");
@@ -1832,15 +1874,15 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         }
     };
 
-    let forwarded_requests: Option<Arc<dyn ForwardedRequests>> = if let Some(grpc_public_services) =
-        &settings.server.grpc_public_services
-        && let Some(forwarded_requests_settings) = &grpc_public_services.forwarded_requests
-    {
-        let factory = GrpcForwardedRequests::new(forwarded_requests_settings).await?;
-        Some(Arc::new(factory))
-    } else {
-        None
-    };
+    let forwarded_requests: Option<Arc<dyn ForwardedRequests>> =
+        if let Some(forwarded_requests_settings) =
+            &settings.server.grpc_public_services.forwarded_requests
+        {
+            let factory = GrpcForwardedRequests::new(forwarded_requests_settings).await?;
+            Some(Arc::new(factory))
+        } else {
+            None
+        };
 
     let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
     let mut endpoints = JoinSet::new();
@@ -1993,9 +2035,18 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 .handler_timeout_seconds
                 .map(Duration::from_secs);
 
-            /// With 8 streams per connection this amounts to 4000 commands
-            /// being processed in parallel per connection
-            const DEFAULT_PROCESS_LIMIT: usize = 500;
+            /// With the 8 streams a connection opens this amounts to 4000 commands being
+            /// processed in parallel per connection.
+            const DEFAULT_STREAM_MESSAGE_LIMIT: usize = 500;
+            let process_limit = quic_settings
+                .stream_message_limit
+                .unwrap_or(DEFAULT_STREAM_MESSAGE_LIMIT);
+            let limits = AdmissionLimits {
+                process_limit,
+                inflight_limit: connection_inflight_limit(&quic_settings, process_limit),
+                handler_timeout: request_handler_timeout,
+                permit_timeout: quic_settings.permit_timeout_ms.map(Duration::from_millis),
+            };
 
             let local_immutable_store = local_store().unwrap_or_else(|| {
                 warn!("No local store available for public QUIC server, operations requiring local store will route to the main store");
@@ -2014,10 +2065,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     local_immutable_store,
                     mutable_store,
                     jwt_verifier,
-                    quic_settings
-                        .connection_message_limit
-                        .unwrap_or(DEFAULT_PROCESS_LIMIT),
-                    request_handler_timeout,
+                    limits,
                 )),
                 frequency,
                 quic_settings,
@@ -2050,6 +2098,12 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                  clients"
             );
         }
+        // Without mTLS the certificate is only there to satisfy the TLS
+        // handshake — peers connect over `quic://` and do not validate it — so
+        // an ephemeral one keeps the endpoint zero-config. Under mTLS the
+        // certificate is the authentication, and a generated one would be
+        // worthless, so that path keeps demanding a configured triple.
+        let generate_ephemeral_cert = security == EndpointSecurity::Untrusted;
         lore_spawn!(endpoints, {
             let immutable_store = immutable_store.clone();
             let settings = settings.clone();
@@ -2068,21 +2122,26 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 immutable_store.clone()
             });
 
+            let process_limit = quic_settings
+                .stream_message_limit
+                .unwrap_or(replication_store_service::DEFAULT_CLIENT_MESSAGE_LIMIT);
+            let limits = AdmissionLimits {
+                process_limit,
+                inflight_limit: connection_inflight_limit(&quic_settings, process_limit),
+                handler_timeout: request_handler_timeout,
+                permit_timeout: quic_settings.permit_timeout_ms.map(Duration::from_millis),
+            };
+
             launch_quinn_server(
                 "internal",
                 Box::new(QuicInternalStreamHandler::new(
                     immutable_store,
                     local_immutable_store,
-                    quic_settings
-                        .connection_message_limit
-                        .unwrap_or(replication_store_service::DEFAULT_CLIENT_MESSAGE_LIMIT),
-                    request_handler_timeout,
+                    limits,
                 )),
                 frequency,
                 quic_settings,
-                // Internal QUIC endpoint requires a real (mTLS) certificate;
-                // never fall back to an ephemeral one.
-                false,
+                generate_ephemeral_cert,
                 shutdown_rx,
             )
         });
@@ -2092,23 +2151,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         if let Some(http_settings) = settings.server.http.as_ref()
             && http_settings.enabled
         {
-            let lore_http_settings = LoreHttpServerSettings {
-                port: http_settings.port,
-                host: http_settings.host.clone(),
-                max_file_size: http_settings.max_file_size,
-                request_timeout_seconds: http_settings.request_timeout_seconds,
-                request_body_timeout_seconds: http_settings.request_body_timeout_seconds,
-                available_interval_seconds: http_settings.available_interval_seconds,
-                available_timeout_seconds: http_settings.available_timeout_seconds,
-                store_health_check: http_settings.store_health_check,
-                presign: PresignSettings {
-                    hmac_key: http_settings.presigned_url_hmac_key.clone(),
-                    min_ttl_seconds: http_settings.presigned_url_min_ttl_seconds,
-                    default_ttl_seconds: http_settings.presigned_url_default_ttl_seconds,
-                    max_ttl_seconds: http_settings.presigned_url_max_ttl_seconds,
-                },
-                user_agent_filter: user_agent_filter.clone(),
-            };
+            let lore_http_settings =
+                build_lore_http_settings(http_settings, user_agent_filter.clone());
             let immutable_store = immutable_store.clone();
             let mutable_store = mutable_store.clone();
             let shutdown_rx = _shutdown_rx.clone();
@@ -2197,6 +2241,87 @@ fn server_log_dispatch(level: lore_base::log::LoreLogLevel, location: &str, mess
 
 #[cfg(test)]
 mod tests {
+    /// Covers the `[server.http]` to `LoreHttpServerSettings` mapping, the one seam
+    /// between config deserialization and the HTTP server's own settings.
+    mod http_settings_mapping {
+        use std::sync::Arc;
+
+        use super::super::build_lore_http_settings;
+        use crate::settings::HttpSettings;
+
+        fn http_settings(extra_keys: &str) -> HttpSettings {
+            let config = format!(
+                r#"
+                enabled = true
+                host = "127.0.0.1"
+                max_file_size = 1024
+                port = 8080
+                request_timeout_seconds = 30
+                request_body_timeout_seconds = 30
+                available_interval_seconds = 5
+                available_timeout_seconds = 30
+                store_health_check = false
+                {extra_keys}
+                "#
+            );
+            toml::from_str(&config).expect("[server.http] should deserialize")
+        }
+
+        /// The whole read path: TOML to the policy the allowlist is built from.
+        #[test]
+        fn content_type_policy_is_carried_from_config() {
+            let settings = build_lore_http_settings(
+                &http_settings(
+                    r#"
+                    presigned_url_extra_content_types = ["application/zip"]
+                    presigned_url_denied_content_types = ["application/pdf"]
+                    "#,
+                ),
+                Arc::default(),
+            );
+
+            assert_eq!(
+                settings.presign.content_type_policy.extra,
+                ["application/zip"]
+            );
+            assert_eq!(
+                settings.presign.content_type_policy.denied,
+                ["application/pdf"]
+            );
+        }
+
+        /// Absent keys give an empty policy, which resolves to the built-in set.
+        #[test]
+        fn absent_content_type_keys_give_an_empty_policy() {
+            let settings = build_lore_http_settings(&http_settings(""), Arc::default());
+
+            assert!(settings.presign.content_type_policy.extra.is_empty());
+            assert!(settings.presign.content_type_policy.denied.is_empty());
+        }
+
+        /// Guards against a copy-paste slip putting the wrong source field on a
+        /// neighbouring target field.
+        #[test]
+        fn presign_ttl_and_key_are_carried_from_config() {
+            let settings = build_lore_http_settings(
+                &http_settings(
+                    r#"
+                    presigned_url_hmac_key = "abcdef"
+                    presigned_url_min_ttl_seconds = 5
+                    presigned_url_default_ttl_seconds = 60
+                    presigned_url_max_ttl_seconds = 600
+                    "#,
+                ),
+                Arc::default(),
+            );
+
+            assert_eq!(settings.presign.hmac_key.as_deref(), Some("abcdef"));
+            assert_eq!(settings.presign.min_ttl_seconds, 5);
+            assert_eq!(settings.presign.default_ttl_seconds, 60);
+            assert_eq!(settings.presign.max_ttl_seconds, 600);
+        }
+    }
+
     mod validate_endpoint_security {
         use std::path::PathBuf;
 

@@ -268,6 +268,7 @@ impl QuicService for StorageServiceV4 {
                             | crate::quic::storage_service::ParsedStorageRequest::GetMetadata(_)
                             | crate::quic::storage_service::ParsedStorageRequest::Query(_)
                             | crate::quic::storage_service::ParsedStorageRequest::MutableLoad(_)
+                            | crate::quic::storage_service::ParsedStorageRequest::GetResolved(_)
                     )
                 {
                     return Err(MessageHandleError::AuthorizationFailure(
@@ -346,6 +347,32 @@ impl QuicService for StorageServiceV4 {
                             correlation_id,
                             user_id,
                             self.mutable_store.clone(),
+                        )
+                        .await
+                    }
+                    crate::quic::storage_service::ParsedStorageRequest::GetResolved(resolved) => {
+                        crate::protocol::storage::get_resolved::handle_get_resolved(
+                            resolved.key,
+                            resolved.context,
+                            resolved.flags,
+                            repository,
+                            correlation_id,
+                            user_id,
+                            self.mutable_store.clone(),
+                            self.immutable_store.clone(),
+                        )
+                        .await
+                    }
+                    crate::quic::storage_service::ParsedStorageRequest::PutResolved(resolved) => {
+                        crate::protocol::storage::put_resolved::handle_put_resolved(
+                            resolved.key,
+                            resolved.put(),
+                            resolved.address,
+                            repository,
+                            correlation_id,
+                            user_id,
+                            self.mutable_store.clone(),
+                            self.immutable_store.clone(),
                         )
                         .await
                     }

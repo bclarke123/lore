@@ -28,7 +28,7 @@
 // inside an event is valid only while the callback runs; copy its bytes to keep
 // them after the callback returns. A string the caller passes in must be valid
 // UTF-8: the library checks every string an operation carries before it starts
-// the call, and fails the whole call with error code 1 (invalid arguments)
+// the call, and fails the whole call with error code 3 (invalid arguments)
 // naming the offending field if any of them is not. The library copies the
 // bytes, so the caller may free the string once the call returns. See
 // lore_string_t for the layout of the type.
@@ -50,7 +50,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define LORE_INTERFACE_VERSION "0.8.7-nightly"
+#define LORE_INTERFACE_VERSION "0.9.1-nightly"
 
 // The kind of value held by a metadata entry.
 //
@@ -115,6 +115,18 @@ typedef enum lore_file_action_t {
   LORE_FILE_ACTION_COPY = 4,
 } lore_file_action_t;
 
+// Staged change to a link itself, as opposed to content inside it.
+typedef enum lore_link_staged_state_t {
+  // The link carries no staged change.
+  LORE_LINK_STAGED_STATE_NONE = 0,
+  // The link was added and is not committed yet.
+  LORE_LINK_STAGED_STATE_ADDED = 1,
+  // The link was removed and the removal is not committed yet.
+  LORE_LINK_STAGED_STATE_REMOVED = 2,
+  // The link's pin was changed and is not committed yet.
+  LORE_LINK_STAGED_STATE_MODIFIED = 3,
+} lore_link_staged_state_t;
+
 // The kind of a tracked node.
 typedef enum lore_node_type_t {
   // A directory.
@@ -133,23 +145,44 @@ typedef enum lore_node_type_t {
 // common cases cheaply without parsing the companion `LORE_EVENT_ERROR`
 // detail.
 //
-// Numbered independently of the general library error code that a `Complete`
-// event's status carries: `NONE`, `INVALID_ARGUMENTS` and `ADDRESS_NOT_FOUND`
-// happen to share its values, `INTERNAL` (3 against -1) and `SLOW_DOWN`
-// (4 against 5) do not. Compare a code from an event only against this enum.
+// The values are the error codes themselves, taken from the registry in
+// `lore_base::error`, so a code read from a per-item event means the same
+// thing as the code on `Complete.status`. This enum names the subset a
+// per-item event can carry; it is not a second numbering.
+//
+// The variant order is the serialized wire format, not the numbering. Serde
+// encodes a variant by its declaration index in a non-self-describing format,
+// and `LoreEvent` crosses the service boundary in one, so reordering these
+// would silently redecode old payloads as different errors. Add new variants
+// at the end and change discriminants in place.
 //
 typedef enum lore_error_code_t {
   // No error; the operation succeeded.
   LORE_ERROR_CODE_NONE = 0,
   // The arguments supplied to the operation were invalid.
-  LORE_ERROR_CODE_INVALID_ARGUMENTS = 1,
+  LORE_ERROR_CODE_INVALID_ARGUMENTS = 3,
   // A content-addressable object could not be found in any store.
-  LORE_ERROR_CODE_ADDRESS_NOT_FOUND = 2,
+  LORE_ERROR_CODE_ADDRESS_NOT_FOUND = 80,
   // An internal error occurred.
-  LORE_ERROR_CODE_INTERNAL = 3,
+  LORE_ERROR_CODE_INTERNAL = -1,
   // The backing store is overloaded; the caller should retry later.
-  LORE_ERROR_CODE_SLOW_DOWN = 4,
+  LORE_ERROR_CODE_SLOW_DOWN = 31,
 } lore_error_code_t;
+
+// Whether a repository being created or cloned should be backed by a shared store.
+//
+// `Inherit` is zero so a zero-initialized C struct keeps following the machine's
+// `use_shared_store_automatically` setting, as callers have always relied on. `Disabled` exists
+// because that inherited setting is otherwise unconditional: without it, a caller on a machine
+// that opts in automatically has no way to ask for a repository backed by its own store.
+typedef enum lore_shared_store_mode_t {
+  // Follow the machine's `use_shared_store_automatically` global setting.
+  LORE_SHARED_STORE_MODE_INHERIT = 0,
+  // Always back the repository with a shared store.
+  LORE_SHARED_STORE_MODE_ENABLED = 1,
+  // Never back the repository with a shared store, whatever the global config says.
+  LORE_SHARED_STORE_MODE_DISABLED = 2,
+} lore_shared_store_mode_t;
 
 // Kind of value a stored key refers to.
 typedef enum lore_key_type_t {
@@ -167,9 +200,30 @@ typedef enum lore_key_type_t {
   LORE_KEY_TYPE_REPOSITORY_ID = 5,
   // Key refers to a repository instance.
   LORE_KEY_TYPE_INSTANCE = 6,
-  // Key refers to per-repository access-control grants.
-  LORE_KEY_TYPE_ACCESS_CONTROL = 7,
+  // Key maps to an immutable content hash, written by `lore_storage_put_resolved` and read by
+  // `lore_storage_get_resolved`. Those two commands do not carry a key type on the wire,
+  // because this is the only one they operate on; a publish large enough to fragment falls
+  // back to an ordinary mutable store write, which does carry it like any other type.
+  LORE_KEY_TYPE_RESOLVE = 7,
 } lore_key_type_t;
+
+// The change staged on a node for the next revision. `None` is a node the
+// current revision holds unchanged; every other value is an edit that has not
+// been committed yet.
+typedef enum lore_node_staged_action_t {
+  // No staged change.
+  LORE_NODE_STAGED_ACTION_NONE = 0,
+  // Staged for addition; the node is not in the revision it was loaded from.
+  LORE_NODE_STAGED_ACTION_ADD = 1,
+  // Staged with rewritten content fields.
+  LORE_NODE_STAGED_ACTION_MODIFY = 2,
+  // Staged for removal; the node is dropped when the revision is committed.
+  LORE_NODE_STAGED_ACTION_DELETE = 3,
+  // Staged at a new path or under a new name.
+  LORE_NODE_STAGED_ACTION_MOVE = 4,
+  // Staged as a copy of another node.
+  LORE_NODE_STAGED_ACTION_COPY = 5,
+} lore_node_staged_action_t;
 
 // Data for a generic progress event.
 typedef struct lore_progress_event_data_t {
@@ -585,6 +639,8 @@ typedef struct lore_branch_diff_node_data_t {
   struct lore_string_t path;
   // Set when the change was merged automatically.
   uint8_t automerged;
+  // Previous path of the node when it was moved or copied. Empty otherwise.
+  struct lore_string_t from_path;
 } lore_branch_diff_node_data_t;
 
 // Event data reporting a single change in a branch diff.
@@ -1016,6 +1072,10 @@ typedef struct lore_branch_push_fragment_end_event_data_t {
 
 // Data for the event sent before a branch is created on the remote.
 typedef struct lore_branch_push_branch_create_begin_event_data_t {
+  // The repository the branch is created in.
+  lore_repository_id_t repository;
+  // The branch being created.
+  lore_branch_id_t branch;
   // The local revision the branch starts from.
   struct lore_hash_t local_revision;
 } lore_branch_push_branch_create_begin_event_data_t;
@@ -1028,6 +1088,10 @@ typedef struct lore_branch_push_branch_create_end_event_data_t {
 
 // Data for the event sent before a revision is pushed to the remote.
 typedef struct lore_branch_push_revision_push_begin_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed to.
+  lore_branch_id_t branch;
   // The latest revision of the branch on the remote.
   struct lore_hash_t remote_revision;
   // The local revision being pushed.
@@ -1046,6 +1110,10 @@ typedef struct lore_branch_push_revision_push_update_event_data_t {
 
 // Data for the event sent after a revision is pushed to the remote.
 typedef struct lore_branch_push_revision_push_end_event_data_t {
+  // The repository that was pushed.
+  lore_repository_id_t repository;
+  // The branch that was pushed to.
+  lore_branch_id_t branch;
   // The branch revision on the remote before the push.
   struct lore_hash_t old_remote_revision;
   // The branch revision on the remote after the push.
@@ -1523,6 +1591,23 @@ typedef struct lore_layer_staged_entry_event_data_t {
   uint64_t staged_file_count;
 } lore_layer_staged_entry_event_data_t;
 
+// Data for an event reporting how a link's branch was resolved in the linked
+// repository. A repository can be linked at more than one mount path, so a
+// consumer must key on `link_path` together with `link_repository`.
+typedef struct lore_link_branch_create_event_data_t {
+  // Path of the link within the parent repository.
+  struct lore_string_t link_path;
+  // Identifier of the repository the link points to.
+  lore_repository_id_t link_repository;
+  // Identifier of the branch in the linked repository.
+  lore_branch_id_t branch;
+  // Hash of the latest revision on that branch.
+  struct lore_hash_t revision;
+  // Set when a branch with this identifier was already present and was
+  // reused rather than created.
+  uint8_t reused;
+} lore_link_branch_create_event_data_t;
+
 // Data for an event reporting a change to a link.
 typedef struct lore_link_change_event_data_t {
   // Path of the link within the parent repository.
@@ -1537,7 +1622,9 @@ typedef struct lore_link_change_event_data_t {
   enum lore_file_action_t action;
 } lore_link_change_event_data_t;
 
-// Data for an event describing a single link in a repository.
+// Data for an event describing a single link in a repository. Carries the
+// branch identifier rather than its name; a consumer that wants the name
+// resolves it, so listing links costs no branch metadata reads.
 typedef struct lore_link_entry_event_data_t {
   // Identifier of the repository the link points to.
   lore_repository_id_t link;
@@ -1551,13 +1638,28 @@ typedef struct lore_link_entry_event_data_t {
   struct lore_string_t source_path;
   // Identifier of the branch the link is pinned to.
   lore_branch_id_t branch;
-  // Name of the branch the link is pinned to.
-  struct lore_string_t branch_name;
+  // Set when the link follows its parent's branch instead of being pinned to
+  // an explicit one, in which case `branch` is the branch it resolved to.
+  uint8_t tracking;
   // Hash of the revision the link is pinned to.
   struct lore_hash_t revision;
   // Link flags.
   uint32_t flags;
 } lore_link_entry_event_data_t;
+
+// Data for an event describing a single link in detail: everything `LinkEntry`
+// reports, plus the state only `link info` gathers.
+typedef struct lore_link_info_event_data_t {
+  // The link as `LinkEntry` reports it.
+  struct lore_link_entry_event_data_t entry;
+  // Hash of the remote latest revision of the pinned branch, zero when the
+  // remote was not consulted.
+  struct lore_hash_t remote_revision;
+  // Staged change to the link itself.
+  enum lore_link_staged_state_t staged_state;
+  // Number of staged files inside the linked repository.
+  uint64_t staged_file_count;
+} lore_link_info_event_data_t;
 
 // Data for an event that marks the start of a lock acquire report.
 typedef struct lore_lock_file_acquire_begin_event_data_t {
@@ -1737,7 +1839,8 @@ typedef struct lore_repository_data_event_data_t {
   struct lore_string_t default_branch_name;
   // Name of the user who created the repository.
   struct lore_string_t creator;
-  // Creation time of the repository, in seconds since the Unix epoch.
+  // Creation time of the repository, in milliseconds since the Unix
+  // epoch.
   uint64_t created;
 } lore_repository_data_event_data_t;
 
@@ -1996,6 +2099,10 @@ typedef struct lore_repository_status_summary_event_data_t {
   uint64_t moves;
   // Number of files copied.
   uint64_t copies;
+  // Number of files the answer required reading, including any that could not be read.
+  uint64_t hash_checks;
+  // Number of files a recorded modified time answered for, sparing them a hash check.
+  uint64_t mtime_matches;
 } lore_repository_status_summary_event_data_t;
 
 // Result of a query against the immutable store for a single fragment.
@@ -2123,6 +2230,8 @@ typedef struct lore_revision_diff_file_event_data_t {
   struct lore_address_t old_address;
   // Address of the file content on the target side.
   struct lore_address_t new_address;
+  // Previous path of the file when it was moved or copied. Empty otherwise.
+  struct lore_string_t from_path;
 } lore_revision_diff_file_event_data_t;
 
 // Data for the event reporting a revision found by a search.
@@ -2406,6 +2515,15 @@ typedef struct lore_storage_put_item_complete_event_data_t {
   struct lore_address_t address;
   // The outcome for the item.
   enum lore_error_code_t error_code;
+  // Non-zero when the local store holds the content. Appended after the original three
+  // fields, so a consumer reading only those is unaffected — `serde(default)` lets an older
+  // payload that lacks the field deserialize, as events cross the IPC boundary.
+  uint8_t stored_local;
+  // Non-zero when the content reached the remote, or was already durable there. A remote
+  // write that fails still reports `error_code = NONE` if the local write succeeded — this is
+  // how a caller tells the two apart. For fragmented content it is the intersection across
+  // every fragment, so it is set only when the whole tree is remote.
+  uint8_t stored_remote;
 } lore_storage_put_item_complete_event_data_t;
 
 // Leading event for each regular `get` item. Reports the total
@@ -2568,6 +2686,9 @@ typedef struct lore_revision_tree_child_event_data_t {
   lore_node_id_t parent_id;
   // The kind of node.
   uint32_t kind;
+  // The change staged on the node, as a `LoreNodeStagedAction`. A child
+  // staged for deletion is still listed, carrying the deletion here.
+  uint32_t staged_action;
   // The file mode bits.
   uint16_t mode;
   // The size of the node's content in bytes.
@@ -2601,6 +2722,9 @@ typedef struct lore_revision_tree_node_info_event_data_t {
   lore_node_id_t parent_id;
   // The kind of node.
   uint32_t kind;
+  // The change staged on the node, as a `LoreNodeStagedAction`. A node
+  // staged for deletion still reports, carrying the deletion here.
+  uint32_t staged_action;
   // The file mode bits.
   uint16_t mode;
   // The size of the node's content in bytes.
@@ -2649,6 +2773,9 @@ typedef struct lore_revision_tree_add_complete_event_data_t {
 typedef struct lore_revision_tree_delete_complete_event_data_t {
   // Correlation id of the entry this reports, not of the call.
   uint64_t entry_id;
+  // How many nodes the entry's subtree removed, staged and discarded
+  // together. Zero on failure, since nothing was removed.
+  uint64_t node_count;
   // The outcome of the call.
   enum lore_error_code_t error_code;
 } lore_revision_tree_delete_complete_event_data_t;
@@ -2702,10 +2829,14 @@ typedef struct lore_revision_tree_metadata_get_complete_event_data_t {
 } lore_revision_tree_metadata_get_complete_event_data_t;
 
 // Terminal per-call event for `commit`. On success `revision_hash` is the
-// newly-committed revision and `new_tip_hash` is `Hash::default()`. When
-// `error_code` reports `BranchAdvanced`, `new_tip_hash` carries the
-// observed branch tip so the caller can reload without an extra
-// `branch::load_latest` round-trip.
+// newly-committed revision and `new_tip_hash` is `Hash::default()`.
+//
+// A non-zero `new_tip_hash` means the branch had advanced past the revision
+// the handle was built on, and carries the tip to reload from so the caller
+// needs no extra `branch::load_latest` round-trip. It is the only signal for
+// that case: no `LoreErrorCode` value names a tip collision, so `error_code`
+// reports `Internal` with the reason in the completion detail — the same code
+// the file-system commit returns.
 typedef struct lore_revision_tree_commit_complete_event_data_t {
   // Correlation id of the originating call.
   uint64_t id;
@@ -2882,6 +3013,156 @@ typedef struct lore_revision_tree_metadata_clear_complete_event_data_t {
   // The outcome of the call.
   enum lore_error_code_t error_code;
 } lore_revision_tree_metadata_clear_complete_event_data_t;
+
+// How many files a commit wrote, split by the action each was staged with.
+//
+// The actions are exclusive: a file is counted once, under the action its staged
+// node flags name.
+typedef struct lore_commit_file_stats_data_t {
+  // Files staged as new additions.
+  uint64_t added;
+  // Files whose content or mode changed.
+  uint64_t modified;
+  // Files staged for deletion.
+  uint64_t deleted;
+  // Files staged as moves.
+  uint64_t moved;
+  // Files staged as copies.
+  uint64_t copied;
+  // Directories staged for deletion.
+  uint64_t directories_deleted;
+  // Files the commit read off disk and fragmented. A different set from
+  // `files`: a staged file whose content turns out to match the revision it is
+  // committed against is read and committed as nothing, a view-excluded path is
+  // committed from its staged node without being read, and an in-memory commit
+  // reads none at all.
+  uint64_t files_read;
+  // Uncompressed content bytes of `files_read`. The same number the progress
+  // event reports as `bytesTransferred`.
+  uint64_t bytes_transferred;
+  // Files whose content the commit wrote: `added + modified + moved + copied`.
+  uint64_t files;
+  // Uncompressed content size of exactly the `files` above, so the two are a
+  // pair. A delete contributes none.
+  //
+  // Distinct from [`FragmentWriteCounts::data_content_bytes`], which counts
+  // fragments rather than files and excludes every fragment that needed no
+  // payload.
+  uint64_t file_bytes;
+} lore_commit_file_stats_data_t;
+
+// A snapshot of [`FragmentWriteStats`], as plain numbers, and the payload an
+// operation reports them in.
+//
+// Only the `data_*` and `fragmentlist_*` fields split by what a payload is. Every
+// other count covers a fragment whatever its payload, content or a fragment list.
+// The content totals take a fragment list as zero, its `size_content` being the
+// content of its leaves.
+//
+// For a drained operation, unless a fragment failed part-way through the
+// pipeline:
+//
+// - `fragments_produced == fragments_deduplicated + fragments_processed`.
+// - `fragment_content_bytes == deduplicated_content_bytes + processed_content_bytes`.
+// - `local_writes == local_metadata_writes + local_payload_writes`.
+// - `remote_writes == remote_copy_writes + remote_put_writes`.
+// - `remote_writes`, `remote_already_durable`, `local_only_writes` and
+//   `remote_upload_failed` sum to `fragments_processed`: every processed
+//   fragment reaches exactly one of those outcomes.
+// - `data_fragments + fragmentlists + no_payload_fragments == fragments_processed`.
+// - `data_content_bytes + no_payload_content_bytes == processed_content_bytes`.
+typedef struct lore_fragment_stats_data_t {
+  // Fragments handed to the store, whatever came of them.
+  uint64_t fragments_produced;
+  // Uncompressed content bytes the produced fragments stand for.
+  uint64_t fragment_content_bytes;
+  // Fragments the stores already held in the form the write wanted, so no
+  // payload was loaded, compressed or uploaded for them.
+  uint64_t fragments_deduplicated;
+  // Content bytes of `fragments_deduplicated`.
+  uint64_t deduplicated_content_bytes;
+  // Fragments that entered the write pipeline.
+  uint64_t fragments_processed;
+  // Content bytes of `fragments_processed`.
+  uint64_t processed_content_bytes;
+  // Of `fragments_processed`, those that produced a stored payload of content.
+  uint64_t data_fragments;
+  // Stored payload bytes of `data_fragments`, after compression where the
+  // pipeline compressed them.
+  uint64_t data_payload_bytes;
+  // Uncompressed content bytes `data_fragments` stand for. Compare against
+  // `data_payload_bytes` for the compression ratio.
+  uint64_t data_content_bytes;
+  // Of `fragments_processed`, those that produced a stored fragment list.
+  uint64_t fragmentlists;
+  // Stored payload bytes of `fragmentlists`.
+  uint64_t fragmentlist_payload_bytes;
+  // Of `fragments_processed`, those that needed no payload, so none was
+  // prepared: the remote duplicated an association for them and the write did
+  // not ask for the payload to be cached locally.
+  uint64_t no_payload_fragments;
+  // Content bytes `no_payload_fragments` stand for.
+  uint64_t no_payload_content_bytes;
+  // Terminal entries written to the local store.
+  uint64_t local_writes;
+  // Of `local_writes`, those that recorded only the fragment header — the
+  // payload lives on the remote and was not cached here.
+  uint64_t local_metadata_writes;
+  // Of `local_writes`, those that also wrote a payload.
+  uint64_t local_payload_writes;
+  // Payload bytes written by `local_payload_writes`.
+  uint64_t local_payload_bytes;
+  // Fragments registered with the remote.
+  uint64_t remote_writes;
+  // Of `remote_writes`, those the remote duplicated from an association it
+  // already held, so no payload crossed the wire.
+  uint64_t remote_copy_writes;
+  // Of `remote_writes`, those whose payload was uploaded.
+  uint64_t remote_put_writes;
+  // Payload bytes uploaded by `remote_put_writes`.
+  uint64_t remote_put_bytes;
+  // Fragments the remote already held under this very address, so they took
+  // neither a copy nor an upload.
+  uint64_t remote_already_durable;
+  // Fragments written with no remote consulted, a local-only write having been
+  // asked for. Branch latest history is one such write, which the server does
+  // not store, so a commit against a remote has exactly one.
+  uint64_t local_only_writes;
+  // Fragments whose upload did not land, leaving them stored only locally for
+  // a later push to offer again. Their payloads are counted under
+  // `local_payload_writes` too, indistinguishably from those kept by request.
+  uint64_t remote_upload_failed;
+} lore_fragment_stats_data_t;
+
+// Event data reporting what a commit cost.
+//
+// Emitted once, when the commit has drained every background write, at
+// statistics level one and above. A commit that failed reports what it had done
+// by then.
+typedef struct lore_revision_commit_stats_event_data_t {
+  // Files committed, by action.
+  struct lore_commit_file_stats_data_t files;
+  // What the commit's fragment writes cost.
+  struct lore_fragment_stats_data_t fragments;
+} lore_revision_commit_stats_event_data_t;
+
+// Data for the event reporting what a push cost.
+//
+// Emitted once, when the push finishes, at statistics level one and above. A
+// push that failed reports what it had done by then. The counts are cumulative
+// across every revision, link and layer the push registers, where
+// [`LoreBranchPushFragmentProgressEventData`] reports the revision in flight.
+//
+// A push stores no payload of its own: a fragment the peer was asked about is
+// deduplicated, copied or put, unless the push ended before it was reached.
+typedef struct lore_branch_push_stats_event_data_t {
+  // Fragments the peer already held, so nothing was registered for them.
+  uint64_t deduplicated;
+  // Fragments the peer duplicated an association for, sending no payload.
+  uint64_t copied;
+  // Fragments whose payload was uploaded.
+  uint64_t put;
+} lore_branch_push_stats_event_data_t;
 
 // An event delivered to a callback. Each variant names a kind of event and
 // carries the data for that event.
@@ -3123,10 +3404,14 @@ enum lore_event_id_t {
   LORE_EVENT_LAYER_REMOVE,
   // One staged entry in a layer listing.
   LORE_EVENT_LAYER_STAGED_ENTRY,
+  // A link's branch in the linked repository was created or reused.
+  LORE_EVENT_LINK_BRANCH_CREATE,
   // A link was changed.
   LORE_EVENT_LINK_CHANGE,
   // One entry in a link listing.
   LORE_EVENT_LINK_ENTRY,
+  // Detailed information about a single link.
+  LORE_EVENT_LINK_INFO,
   // The start of a file lock acquire report.
   LORE_EVENT_LOCK_FILE_ACQUIRE_BEGIN,
   // A file concerning the lock acquire report.
@@ -3343,6 +3628,10 @@ enum lore_event_id_t {
   LORE_EVENT_REVISION_TREE_BATCH_COMPLETE,
   // A metadata-clear entry completed.
   LORE_EVENT_REVISION_TREE_METADATA_CLEAR_COMPLETE,
+  // What a commit has cost so far, or in total once it has drained its writes.
+  LORE_EVENT_REVISION_COMMIT_STATS,
+  // What a push has cost so far, or in total once it has finished.
+  LORE_EVENT_BRANCH_PUSH_STATS,
 };
 typedef uint32_t lore_event_tag_t;
 
@@ -3467,8 +3756,10 @@ typedef struct lore_event_t {
     struct lore_layer_entry_event_data_t layer_entry;
     struct lore_layer_remove_event_data_t layer_remove;
     struct lore_layer_staged_entry_event_data_t layer_staged_entry;
+    struct lore_link_branch_create_event_data_t link_branch_create;
     struct lore_link_change_event_data_t link_change;
     struct lore_link_entry_event_data_t link_entry;
+    struct lore_link_info_event_data_t link_info;
     struct lore_lock_file_acquire_begin_event_data_t lock_file_acquire_begin;
     struct lore_lock_file_acquire_event_data_t lock_file_acquire;
     struct lore_lock_file_status_begin_event_data_t lock_file_status_begin;
@@ -3577,6 +3868,8 @@ typedef struct lore_event_t {
     struct lore_compaction_end_event_data_t compaction_end;
     struct lore_revision_tree_batch_complete_event_data_t revision_tree_batch_complete;
     struct lore_revision_tree_metadata_clear_complete_event_data_t revision_tree_metadata_clear_complete;
+    struct lore_revision_commit_stats_event_data_t revision_commit_stats;
+    struct lore_branch_push_stats_event_data_t branch_push_stats;
   };
 } lore_event_t;
 
@@ -3604,8 +3897,6 @@ typedef struct lore_global_args_t {
   uint8_t remote;
   // Dry run mode, only report what would have been changed and perform no changes to local file system
   uint8_t dry_run;
-  // Avoid recording last access timestamps in the data stores
-  uint8_t no_atime;
   // Maximum number of parallel connections for bulk data transfer
   uint32_t max_connections;
   // Search limit when iterating revisions
@@ -3635,6 +3926,33 @@ typedef struct lore_global_args_t {
   // this only state fragments and fragments flagged for local cache priority
   // are retained
   uint8_t cache;
+  // Authentication token to use instead of the one held in the secure token
+  // store. Authorization tokens are exchanged from it as they are needed.
+  //
+  // Supplying either token puts the call in external-credential mode: `identity`
+  // must be left empty, since it is read from the token.
+  struct lore_string_t identity_token;
+  // Authorization token to use instead of exchanging one with the auth
+  // service. If given, will not perform token exchanges.
+  //
+  // Supplying either token puts the call in external-credential mode: `identity`
+  // must be left empty, since it is read from the token.
+  struct lore_string_t access_token;
+  // How much an operation reports about what it cost.
+  //
+  // - `0` — no statistics event, and no per-fragment counters kept for one.
+  // - `1` — one statistics event when the operation finishes: per-action file
+  //   counts, and the fragment, local-store and remote-store totals.
+  // - `2` — also a `FragmentWrite` event per stored fragment, which describes
+  //   the shape of what was written rather than its sums. One event per
+  //   fragment is the cost of this level.
+  //
+  // A level above the highest known behaves as the highest known.
+  uint32_t stats;
+  // How often an operation emits progress events, in milliseconds. Applies
+  // whatever `stats` is set to, statistics being reported once at the end
+  // rather than on an interval. Zero takes [`DEFAULT_EVENT_INTERVAL_MS`].
+  uint64_t event_interval_ms;
 } lore_global_args_t;
 
 // Arguments for resolving user IDs to display names via the remote auth service.
@@ -3733,6 +4051,8 @@ typedef struct lore_branch_create_args_t {
 typedef struct lore_branch_info_args_t {
   // Name of the branch
   struct lore_string_t branch;
+  // Optional path of a link whose repository the branch belongs to
+  struct lore_string_t link;
 } lore_branch_info_args_t;
 
 // Arguments for diffing two branches, reporting changed and conflicting files.
@@ -3763,6 +4083,14 @@ typedef struct lore_branch_unprotect_args_t {
 typedef struct lore_branch_archive_args_t {
   // Name of the branch
   struct lore_string_t branch;
+  // If set, archive only in this layer (mount path relative to repo root)
+  struct lore_string_t layer;
+  // Also archive the branch in every configured layer
+  uint8_t include_layers;
+  // If set, archive only in this link (mount path relative to repo root)
+  struct lore_string_t link;
+  // Also archive the branch in every configured link
+  uint8_t include_links;
 } lore_branch_archive_args_t;
 
 // Arguments for listing all branches in the repository.
@@ -4203,6 +4531,12 @@ typedef struct lore_link_remove_args_t {
   struct lore_string_t link_path;
 } lore_link_remove_args_t;
 
+// Arguments for reading detailed information about a single link.
+typedef struct lore_link_info_args_t {
+  // Path within this repository of the link to describe
+  struct lore_string_t link_path;
+} lore_link_info_args_t;
+
 // Arguments for listing all linked repositories in the current repository.
 typedef struct lore_link_list_args_t {
   int _unused;
@@ -4236,8 +4570,9 @@ typedef struct lore_repository_clone_args_t {
   struct lore_string_t layer_metadata;
   // (Optional) File containing list of files to prefetch
   struct lore_string_t prefetch;
-  // Use the shared store instead of a local immutable store
-  uint8_t use_shared_store;
+  // Whether to use the shared store instead of a local immutable store. Zero-initialized
+  // (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
+  enum lore_shared_store_mode_t use_shared_store;
   // [Optional] Path to use for the shared store, an empty string means to use the default
   struct lore_string_t shared_store_path;
   // Clone without local repository tracking (memory-only stores)
@@ -4276,8 +4611,9 @@ typedef struct lore_repository_create_args_t {
   struct lore_string_t description;
   // Optional repository ID, set to empty string to generate a new ID
   struct lore_string_t id;
-  // Use the shared store instead of a local immutable store
-  uint8_t use_shared_store;
+  // Whether to use the shared store instead of a local immutable store. Zero-initialized
+  // (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
+  enum lore_shared_store_mode_t use_shared_store;
   // [Optional] Path to use for the shared store, an empty string means to use the default
   struct lore_string_t shared_store_path;
 } lore_repository_create_args_t;
@@ -4402,8 +4738,6 @@ typedef struct lore_revision_commit_args_t {
   struct lore_string_array_t layer_paths;
   // Array of messages corresponding to each layer path (parallel array with `layer_paths`)
   struct lore_string_array_t layer_messages;
-  // Emit per-fragment write stats during the commit
-  uint8_t stats;
 } lore_revision_commit_args_t;
 
 // Arguments for amending the most recent revision's commit message.
@@ -4448,7 +4782,8 @@ typedef struct lore_revision_history_args_t {
   struct lore_string_t revision;
   // Restrict to this branch; empty for current
   struct lore_string_t branch;
-  // Stop at revisions created before this date (Unix timestamp; 0 disables)
+  // Stop at revisions created before this date (milliseconds since the
+  // Unix epoch; 0 disables)
   uint64_t date;
   // Maximum number of revisions to return; 0 for unlimited
   uint32_t length;
@@ -4643,7 +4978,7 @@ typedef struct lore_storage_put_args_t {
   struct lore_storage_put_item_array_t items;
 } lore_storage_put_args_t;
 
-// One get item — the `(partition, address)` to read.
+// One get item — the `(partition, address)` to read, and the range of it to read.
 typedef struct lore_storage_get_item_t {
   // Caller-chosen id echoed back in every event for this item
   uint64_t id;
@@ -4651,7 +4986,15 @@ typedef struct lore_storage_get_item_t {
   struct lore_partition_t partition;
   // Content address to read; `hash == Hash::default()` short-circuits to an empty buffer
   struct lore_address_t address;
-  // Stream one `GET_DATA` per leaf fragment instead of a single reassembled buffer
+  // First content byte to read, counted from the start of the decompressed content.
+  // Past the end of the content rejects with `INVALID_ARGUMENTS`
+  uint64_t offset;
+  // Content bytes to read from `offset`; `0` reads to the end. A range reaching past the
+  // end is clamped to it, so `GET_DATA` may carry fewer bytes than asked for
+  uint64_t length;
+  // Stream one `GET_DATA` per leaf fragment instead of a single reassembled buffer. A read
+  // that fails partway reports the failure on `GET_ITEM_COMPLETE` rather than ending short
+  // with a success code
   uint8_t streaming;
   // Cache fetched bytes back to the local store even without the producer's
   // `PayloadLocalCachePriority` hint
@@ -4674,6 +5017,89 @@ typedef struct lore_storage_get_args_t {
   // Addresses to read; each runs independently and emits its own event sequence
   struct lore_storage_get_item_array_t items;
 } lore_storage_get_args_t;
+
+// One get-resolved item — the mutable key to resolve and the context to read it in.
+typedef struct lore_storage_get_resolved_item_t {
+  // Caller-chosen id echoed back in every event for this item
+  uint64_t id;
+  // Partition to resolve and read within; the zero/default partition rejects with
+  // `INVALID_ARGUMENTS`
+  struct lore_partition_t partition;
+  // Mutable key to resolve, always read as `KeyType::Resolve`
+  struct lore_hash_t key;
+  // Paired with the resolved hash to address the immutable read; the mutable store yields
+  // only a hash.
+  struct lore_context_t context;
+  // Stream one `GET_DATA` per leaf fragment instead of a single reassembled buffer, as
+  // `lore_storage_get` does. Peak memory then follows the fragment size rather than the
+  // content size, which is what makes a key naming something large usable. A read that fails
+  // partway reports the failure on `GET_ITEM_COMPLETE` rather than ending short with a
+  // success code
+  uint8_t streaming;
+  // Cache fetched bytes back to the local store even without the producer's
+  // `PayloadLocalCachePriority` hint
+  uint8_t local_cache;
+} lore_storage_get_resolved_item_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_storage_get_resolved_item_array_t {
+  // Pointer to the first element.
+  const struct lore_storage_get_resolved_item_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_storage_get_resolved_item_array_t;
+
+// Arguments for `lore_storage_get_resolved`.
+typedef struct lore_storage_get_resolved_args_t {
+  // Open storage handle
+  struct lore_store_t handle;
+  // Keys to resolve and read; each runs independently and emits its own event sequence
+  struct lore_storage_get_resolved_item_array_t items;
+} lore_storage_get_resolved_args_t;
+
+// One put-resolved item — the buffer to store and the mutable key to publish it under.
+typedef struct lore_storage_put_resolved_item_t {
+  // Caller-chosen id echoed back in `PUT_ITEM_COMPLETE`
+  uint64_t id;
+  // Target partition; the zero/default partition rejects with `INVALID_ARGUMENTS`
+  struct lore_partition_t partition;
+  // Mutable key to publish the stored hash under; a zero key rejects with `INVALID_ARGUMENTS`
+  struct lore_hash_t key;
+  // Dedup tag stored alongside the content hash in the resulting address, and the context a
+  // later `get_resolved` must read the key at
+  struct lore_context_t context;
+  // Borrowed view into caller memory; bytes must live until `Complete` fires. A zero-length
+  // buffer removes the key's mapping instead of publishing one
+  struct lore_bytes_t data;
+  // Also publish the content and the mapping to the remote; ignored when the handle has no
+  // remote or the call is offline/local
+  uint8_t remote_write;
+  // Tag the fragment with `PayloadLocalCachePriority` so future remote reads always cache it
+  // locally
+  uint8_t local_cache;
+  // Leaf fragment size cap for large buffers; `0` lets the writer choose. Ignored for buffers
+  // under `FRAGMENT_SIZE_THRESHOLD`
+  uint64_t fixed_size_chunk;
+} lore_storage_put_resolved_item_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_storage_put_resolved_item_array_t {
+  // Pointer to the first element.
+  const struct lore_storage_put_resolved_item_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_storage_put_resolved_item_array_t;
+
+// Arguments for `lore_storage_put_resolved`.
+typedef struct lore_storage_put_resolved_args_t {
+  // Open storage handle
+  struct lore_store_t handle;
+  // Buffers to store and publish; each runs independently and emits its own
+  // `PUT_ITEM_COMPLETE`
+  struct lore_storage_put_resolved_item_array_t items;
+} lore_storage_put_resolved_args_t;
 
 // Arguments for `lore_storage_close`.
 typedef struct lore_storage_close_args_t {
@@ -4944,6 +5370,12 @@ typedef struct lore_storage_get_file_item_t {
   // Destination path; empty rejects with `INVALID_ARGUMENTS`. Multi-fragment writes
   // stage via `<path>.loretmp` then atomically rename
   struct lore_string_t path;
+  // First content byte to write, counted from the start of the decompressed content.
+  // Past the end of the content rejects with `INVALID_ARGUMENTS`
+  uint64_t offset;
+  // Content bytes to write from `offset`; `0` writes to the end. The file holds exactly the
+  // requested range starting at its own first byte, and is sized to it
+  uint64_t length;
   // Cache fetched fragments back to the local store, not just write them to `path`
   uint8_t local_cache;
 } lore_storage_get_file_item_t;
@@ -5201,6 +5633,33 @@ typedef struct lore_revision_tree_add_args_t {
   struct lore_revision_tree_add_entry_array_t entries;
 } lore_revision_tree_add_args_t;
 
+// One subtree to remove. The node must already exist and must not be the root.
+typedef struct lore_revision_tree_delete_entry_t {
+  // Caller-chosen id echoed back as `entry_id` on this entry's `DELETE_COMPLETE`
+  uint64_t entry_id;
+  // Root of the subtree to remove, including its transitive children
+  lore_node_id_t node_id;
+} lore_revision_tree_delete_entry_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_revision_tree_delete_entry_array_t {
+  // Pointer to the first element.
+  const struct lore_revision_tree_delete_entry_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_revision_tree_delete_entry_array_t;
+
+// Arguments for `lore_revision_tree_delete`.
+typedef struct lore_revision_tree_delete_args_t {
+  // Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`
+  uint64_t batch_id;
+  // Loaded revision-tree handle to mutate
+  struct lore_revision_tree_t handle;
+  // Subtrees to remove; each emits its own `DELETE_COMPLETE`
+  struct lore_revision_tree_delete_entry_array_t entries;
+} lore_revision_tree_delete_args_t;
+
 // One node to rewrite. The node must already exist and be a file.
 typedef struct lore_revision_tree_modify_entry_t {
   // Caller-chosen id echoed back as `entry_id` on this entry's `MODIFY_COMPLETE`
@@ -5233,6 +5692,37 @@ typedef struct lore_revision_tree_modify_args_t {
   // Nodes to rewrite; each emits its own `MODIFY_COMPLETE`
   struct lore_revision_tree_modify_entry_array_t entries;
 } lore_revision_tree_modify_args_t;
+
+// One node to move. The node must already exist and must not be the root.
+typedef struct lore_revision_tree_move_entry_t {
+  // Caller-chosen id echoed back as `entry_id` on this entry's `MOVE_COMPLETE`
+  uint64_t entry_id;
+  // Node to move; its `file_id` is preserved across the move
+  lore_node_id_t node_id;
+  // Parent node the moved node is reparented under; its current parent renames it
+  lore_node_id_t destination_parent_id;
+  // UTF-8 name the moved node takes at the destination
+  struct lore_string_t dst_name;
+} lore_revision_tree_move_entry_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_revision_tree_move_entry_array_t {
+  // Pointer to the first element.
+  const struct lore_revision_tree_move_entry_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_revision_tree_move_entry_array_t;
+
+// Arguments for `lore_revision_tree_move`.
+typedef struct lore_revision_tree_move_args_t {
+  // Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`
+  uint64_t batch_id;
+  // Loaded revision-tree handle to mutate
+  struct lore_revision_tree_t handle;
+  // Nodes to move; each emits its own `MOVE_COMPLETE`
+  struct lore_revision_tree_move_entry_array_t entries;
+} lore_revision_tree_move_args_t;
 
 // One metadata pair to record. `value` is a typed value that carries its own
 // kind, so there is no separate format tag and nothing to parse.
@@ -5321,30 +5811,6 @@ typedef struct lore_revision_tree_metadata_clear_args_t {
   struct lore_revision_tree_metadata_clear_entry_array_t entries;
 } lore_revision_tree_metadata_clear_args_t;
 
-// Arguments for `lore_revision_tree_delete`.
-typedef struct lore_revision_tree_delete_args_t {
-  // Per-call correlation id echoed back in events
-  uint64_t id;
-  // Loaded revision-tree handle to mutate
-  struct lore_revision_tree_t handle;
-  // Subtree root to mark deleted, including its transitive children
-  lore_node_id_t node_id;
-} lore_revision_tree_delete_args_t;
-
-// Arguments for `lore_revision_tree_move`.
-typedef struct lore_revision_tree_move_args_t {
-  // Per-call correlation id echoed back in events
-  uint64_t id;
-  // Loaded revision-tree handle to mutate
-  struct lore_revision_tree_t handle;
-  // Node to move; its `file_id` is preserved across the move
-  lore_node_id_t node_id;
-  // Parent node the moved node is reparented under
-  lore_node_id_t destination_parent_id;
-  // UTF-8 name the moved node takes at the destination
-  struct lore_string_t dst_name;
-} lore_revision_tree_move_args_t;
-
 // Tuneables for `lore_revision_tree_commit`.
 typedef struct lore_revision_tree_commit_options_t {
   // Also upload the new revision to remote (local-only by default)
@@ -5357,8 +5823,6 @@ typedef struct lore_revision_tree_commit_args_t {
   uint64_t id;
   // Loaded revision-tree handle to freeze and commit
   struct lore_revision_tree_t handle;
-  // Branch whose tip is atomically advanced to the new revision
-  lore_branch_id_t branch;
   // Commit tuneables (local-only vs remote-uploading)
   struct lore_revision_tree_commit_options_t options;
 } lore_revision_tree_commit_args_t;
@@ -5621,6 +6085,12 @@ void lore_auth_login_interactive_async(const struct lore_global_args_t *globals,
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_BRANCH_CREATE` | `lore_branch_create_event_data_t` | Emitted when the branch has been successfully created, includes branch name and id |
+//
+// ## Link Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LINK_BRANCH_CREATE` | `lore_link_branch_create_event_data_t` | Emitted once per linked repository mount, reporting whether its branch was created or an existing one reused |
 int32_t lore_branch_create(const struct lore_global_args_t *globals,
                            const struct lore_branch_create_args_t *args,
                            struct lore_event_callback_config_t callback);
@@ -5647,6 +6117,12 @@ int32_t lore_branch_create(const struct lore_global_args_t *globals,
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_BRANCH_CREATE` | `lore_branch_create_event_data_t` | Emitted when the branch has been successfully created, includes branch name and id |
+//
+// ## Link Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LINK_BRANCH_CREATE` | `lore_link_branch_create_event_data_t` | Emitted once per linked repository mount, reporting whether its branch was created or an existing one reused |
 void lore_branch_create_async(const struct lore_global_args_t *globals,
                               const struct lore_branch_create_args_t *args,
                               struct lore_event_callback_config_t callback);
@@ -8140,6 +8616,7 @@ void lore_lock_file_release_async(const struct lore_global_args_t *globals,
 // |-----|-----------|-------------|
 // | `LORE_EVENT_REPOSITORY_CLONE_BEGIN` | `lore_repository_clone_begin_event_data_t` | Emitted when cloning a linked repository begins |
 // | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted when cloning a linked repository completes |
+// | `LORE_EVENT_LINK_BRANCH_CREATE` | `lore_link_branch_create_event_data_t` | Emitted when branching is enabled, reporting whether the link's branch was created or an existing one reused |
 // | `LORE_EVENT_LINK_CHANGE` | `lore_link_change_event_data_t` | Emitted when the link has been added and saved |
 int32_t lore_link_add(const struct lore_global_args_t *globals,
                       const struct lore_link_add_args_t *args,
@@ -8168,6 +8645,7 @@ int32_t lore_link_add(const struct lore_global_args_t *globals,
 // |-----|-----------|-------------|
 // | `LORE_EVENT_REPOSITORY_CLONE_BEGIN` | `lore_repository_clone_begin_event_data_t` | Emitted when cloning a linked repository begins |
 // | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted when cloning a linked repository completes |
+// | `LORE_EVENT_LINK_BRANCH_CREATE` | `lore_link_branch_create_event_data_t` | Emitted when branching is enabled, reporting whether the link's branch was created or an existing one reused |
 // | `LORE_EVENT_LINK_CHANGE` | `lore_link_change_event_data_t` | Emitted when the link has been added and saved |
 void lore_link_add_async(const struct lore_global_args_t *globals,
                          const struct lore_link_add_args_t *args,
@@ -8224,6 +8702,58 @@ int32_t lore_link_remove(const struct lore_global_args_t *globals,
 void lore_link_remove_async(const struct lore_global_args_t *globals,
                             const struct lore_link_remove_args_t *args,
                             struct lore_event_callback_config_t callback);
+
+// Report detailed information about a single repository link.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Link Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LINK_INFO` | `lore_link_info_event_data_t` | Emitted once for the described link |
+int32_t lore_link_info(const struct lore_global_args_t *globals,
+                       const struct lore_link_info_args_t *args,
+                       struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_link_info`.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Link Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LINK_INFO` | `lore_link_info_event_data_t` | Emitted once for the described link |
+void lore_link_info_async(const struct lore_global_args_t *globals,
+                          const struct lore_link_info_args_t *args,
+                          struct lore_event_callback_config_t callback);
 
 // List all repository links configured in the current repository.
 //
@@ -10307,7 +10837,7 @@ void lore_storage_open_async(const struct lore_global_args_t *globals,
 //
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
-// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item — success or failure |
+// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item — success or failure; `stored_local`/`stored_remote` report where the content landed |
 // | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 // | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 int32_t lore_storage_put(const struct lore_global_args_t *globals,
@@ -10338,6 +10868,87 @@ int32_t lore_storage_get(const struct lore_global_args_t *globals,
 void lore_storage_get_async(const struct lore_global_args_t *globals,
                             const struct lore_storage_get_args_t *args,
                             struct lore_event_callback_config_t callback);
+
+// Resolve one or more mutable keys and read the content they name, in one round trip.
+//
+// `lore_storage_mutable_load` followed by `lore_storage_get`, performed by the server. The keys
+// are read under the `LORE_KEY_TYPE_RESOLVE` key type, which is what `lore_storage_put_resolved`
+// publishes; no other key type is resolvable this way.
+//
+// The `address` in every event is the *resolved* address, so a caller can learn the key-to-hash
+// mapping from the event stream. A key with no mapping, or one naming absent content, reports
+// `error_code = ADDRESS_NOT_FOUND`, and the terminal event then carries a zero address.
+//
+// Set `streaming` to receive one `LORE_EVENT_STORAGE_GET_DATA` per leaf fragment instead of a
+// single reassembled buffer, exactly as `lore_storage_get` does. Without it the whole content is
+// materialised in memory before the first byte reaches the callback, so a key naming something
+// large should set it.
+//
+// # Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_STORAGE_GET_HEADER` | `lore_storage_get_header_event_data_t` | Size of the item's reassembled content, emitted before any DATA events |
+// | `LORE_EVENT_STORAGE_GET_DATA` | `lore_storage_get_data_event_data_t` | Payload bytes — valid only during the callback invocation. One event per item, or one per leaf fragment when `streaming` is set |
+// | `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE` | `lore_storage_get_item_complete_event_data_t` | Terminal per-item event |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
+int32_t lore_storage_get_resolved(const struct lore_global_args_t *globals,
+                                  const struct lore_storage_get_resolved_args_t *args,
+                                  struct lore_event_callback_config_t callback);
+
+// Resolve one or more mutable keys and read the content they name (async variant).
+void lore_storage_get_resolved_async(const struct lore_global_args_t *globals,
+                                     const struct lore_storage_get_resolved_args_t *args,
+                                     struct lore_event_callback_config_t callback);
+
+// Store one or more buffers and publish a mutable key naming each, in one round trip.
+//
+// `lore_storage_put` followed by `lore_storage_mutable_store`, fused into one request when the
+// content fits a single fragment. The key is published under `LORE_KEY_TYPE_RESOLVE`, making it
+// readable by `lore_storage_get_resolved`, and the mapping is written only once the content is
+// stored — so a key published this way never resolves to content that is not there. Writing the
+// same key type directly with `lore_storage_mutable_store` carries no such guarantee.
+//
+// The local store always receives both the content and the mapping. `remote_write = 1` also
+// publishes them remotely, matching `lore_storage_put`; there is no local-then-remote fallback.
+// A zero `key` or a zero `partition` rejects with `INVALID_ARGUMENTS`.
+//
+// A zero-length `data` **removes** the key's mapping rather than publishing one: no content is
+// stored, the key is set to the zero hash, and `lore_storage_get_resolved` then reports
+// `ADDRESS_NOT_FOUND` for it. The terminal event carries the zero content hash and the caller's
+// context.
+//
+// With `remote_write = 0` this evicts only the locally cached mapping. The local mutable store
+// is a cache, not an authority, so a key published remotely resolves again on the next call.
+// Deleting a published key requires `remote_write = 1`.
+//
+// A remote content upload that fails still leaves a successful local write, so the key is not
+// published remotely and `stored_remote` is `0` while `error_code` stays `NONE`. Check
+// `stored_remote`, not `error_code`, to confirm the key is visible to other clients.
+//
+// Publishing is last-writer-wins. Two callers publishing the same key concurrently both
+// succeed, and the key ends up naming whichever content was published second — the first
+// publisher is not told it was overwritten. Callers needing to detect a lost update should
+// store the content with `lore_storage_put` and publish with
+// `lore_storage_mutable_compare_and_swap`, which costs the second round trip this operation
+// exists to avoid.
+//
+// # Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item; `address` is the content the key now resolves to, and `stored_local`/`stored_remote` report where it landed |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
+int32_t lore_storage_put_resolved(const struct lore_global_args_t *globals,
+                                  const struct lore_storage_put_resolved_args_t *args,
+                                  struct lore_event_callback_config_t callback);
+
+// Store one or more buffers and publish a mutable key naming each (async variant).
+void lore_storage_put_resolved_async(const struct lore_global_args_t *globals,
+                                     const struct lore_storage_put_resolved_args_t *args,
+                                     struct lore_event_callback_config_t callback);
 
 // Release a content-addressed storage handle.
 //
@@ -11024,6 +11635,51 @@ void lore_revision_tree_add_async(const struct lore_global_args_t *globals,
                                   const struct lore_revision_tree_add_args_t *args,
                                   struct lore_event_callback_config_t callback);
 
+// Remove a batch of subtrees from a loaded revision tree. Each entry names a
+// subtree root and removes it whole, transitive children included. Every entry
+// is checked before any node is touched, so one bad entry rejects the call and
+// leaves every subtree in place; the reason names the offending entry's batch
+// index, which a caller leaving `entry_id` at zero has no other way to
+// identify. A failure after those checks pass is internal and may leave part of
+// the batch removed.
+//
+// A node the loaded revision holds is **staged** for deletion and stays in the
+// tree: it keeps its name and its place among its siblings, still lists through
+// `lore_revision_tree_list_children`, and reports
+// `LORE_NODE_STAGED_ACTION_DELETE` in its `staged_action`. The commit that
+// freezes the tree is what drops it. A node added through this handle is in no
+// revision yet, so it is discarded outright instead, freeing its name and its
+// node id. A link is removed as one node — its subtree belongs to the linked
+// repository's tree.
+//
+// A staged deletion is reversible: `lore_revision_tree_add` of the same name
+// under the same parent with the same kind restores the node. A zero
+// `address.context` on that add preserves the node's `file_id`; supplying one
+// replaces it, as on `lore_revision_tree_modify`. Only the named node comes back
+// — restoring a directory leaves its children staged for deletion, so each has to
+// be added back in turn. A discarded node is not restorable, since its id is
+// gone.
+//
+// Staging fans out one depth level at a time; discarding an added node rewrites
+// sibling pointers and so runs serially, deepest first. Memory while the call
+// runs is proportional to the widest level of the subtrees being removed rather
+// than to the entry count, since a level is collected before it is staged. The
+// root cannot be deleted, and an entry whose ancestor another entry deletes is
+// rejected rather than removed twice.
+//
+// | Terminal event                              | Payload                                           | Notes                                                    |
+// |---------------------------------------------|---------------------------------------------------|----------------------------------------------------------|
+// | `LORE_EVENT_REVISION_TREE_DELETE_COMPLETE`  | `lore_revision_tree_delete_complete_event_data_t` | One per entry, carrying its `entry_id` and `node_count`   |
+// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE`   | `lore_revision_tree_batch_complete_event_data_t`  | Exactly one, carrying the `batch_id` and the call's outcome |
+int32_t lore_revision_tree_delete(const struct lore_global_args_t *globals,
+                                  const struct lore_revision_tree_delete_args_t *args,
+                                  struct lore_event_callback_config_t callback);
+
+// Remove a batch of subtrees from a loaded revision tree (async variant).
+void lore_revision_tree_delete_async(const struct lore_global_args_t *globals,
+                                     const struct lore_revision_tree_delete_args_t *args,
+                                     struct lore_event_callback_config_t callback);
+
 // Rewrite a batch of file nodes' `mode`, `size` and `address` in a loaded
 // revision tree. Every entry is checked before any node is rewritten, so one bad
 // entry rejects the call and leaves every target untouched; the reason names the
@@ -11050,6 +11706,51 @@ int32_t lore_revision_tree_modify(const struct lore_global_args_t *globals,
 void lore_revision_tree_modify_async(const struct lore_global_args_t *globals,
                                      const struct lore_revision_tree_modify_args_t *args,
                                      struct lore_event_callback_config_t callback);
+
+// Move a batch of nodes to new parents and/or new names in a loaded revision tree. An
+// entry naming the node's current parent renames it where it is. Every entry is checked
+// before any node is moved, so one bad entry rejects the call and leaves every node
+// where it was; the reason names the offending entry's batch index, which a caller
+// leaving `entry_id` at zero has no other way to identify. A failure after those checks
+// pass is internal and may leave earlier entries applied.
+//
+// A move keeps the node: its node id, its `file_id` and its children come along, and
+// the change is recorded as a move rather than as a deletion and an addition, so the
+// revision graph carries the node's history across it. The node reports
+// `LORE_NODE_STAGED_ACTION_MOVE` until the commit that freezes the tree, and so does
+// every node under a moved directory — their records do not change, but their paths do.
+// Two exceptions: a node added through this handle stays staged as an addition wherever
+// it lands, since it is in no revision a move could be recorded against; and a node
+// under the moved directory that is staged for deletion keeps its deletion, since it is
+// leaving the revision at the commit either way.
+//
+// Both batch-level rules read the tree the whole batch produces rather than the one in
+// front of them. A destination inside the moved node's own subtree is rejected, and so
+// is one that lands there once the batch is applied — moving A under B and B under A is
+// a loop neither entry shows on its own. A name a live child of the destination already
+// holds is rejected, but a name the batch itself vacates is not: moving `x` out of a
+// directory while moving another node to `x` in it succeeds, and two entries taking one
+// name under one destination reject even though neither collides with the tree.
+//
+// Entries apply one at a time, in batch order, because a move rewrites the parent and
+// sibling pointers of two child chains where `lore_revision_tree_add` only prepends to
+// one. For the same reason concurrent calls have more to lose here than on `add` or
+// `modify`: two calls moving nodes that share a parent chain can interleave their
+// unlinks, which the pre-commit validator then refuses. Moves that may touch one parent
+// chain belong in one call.
+//
+// | Terminal event                            | Payload                                          | Notes                                                       |
+// |-------------------------------------------|--------------------------------------------------|-------------------------------------------------------------|
+// | `LORE_EVENT_REVISION_TREE_MOVE_COMPLETE`  | `lore_revision_tree_move_complete_event_data_t`  | One per entry, carrying its `entry_id` and the moved node    |
+// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE` | `lore_revision_tree_batch_complete_event_data_t` | Exactly one, carrying the `batch_id` and the call's outcome  |
+int32_t lore_revision_tree_move(const struct lore_global_args_t *globals,
+                                const struct lore_revision_tree_move_args_t *args,
+                                struct lore_event_callback_config_t callback);
+
+// Move a batch of nodes in a loaded revision tree (async variant).
+void lore_revision_tree_move_async(const struct lore_global_args_t *globals,
+                                   const struct lore_revision_tree_move_args_t *args,
+                                   struct lore_event_callback_config_t callback);
 
 // Record a batch of `(key, value)` pairs on a loaded revision tree's in-progress
 // metadata.
@@ -11169,3 +11870,70 @@ int32_t lore_revision_tree_metadata_clear(const struct lore_global_args_t *globa
 void lore_revision_tree_metadata_clear_async(const struct lore_global_args_t *globals,
                                              const struct lore_revision_tree_metadata_clear_args_t *args,
                                              struct lore_event_callback_config_t callback);
+
+// Freeze a loaded revision tree into a new revision and advance its branch tip.
+//
+// **The branch is not an argument.** It is the revision's own, read from the
+// `branch` metadata key: set it with `lore_revision_tree_metadata_set` to start a
+// branch's history, and leave it unset to continue the loaded revision's branch. A
+// key that is set must name either the loaded revision's branch or a branch whose
+// branch point is exactly the loaded revision. A handle loaded from the zero
+// revision has no parent to read a branch from and must set the key.
+//
+// The revision records exactly the metadata set on the handle — nothing is
+// inherited from the revision it was loaded on — plus the three facts about the
+// commit the caller did not supply: the branch, the timestamp if unset, and
+// `created-by` / `committed-by` if unset. The commit message is caller metadata like
+// any other: set `"message"` before committing.
+//
+// On success the handle stays usable and now *is* the new revision: node ids
+// captured before the commit still resolve, and further edits commit on top. The
+// pending metadata is emptied, so the next revision starts fresh.
+//
+// **A commit is all-or-nothing against the handle.** Either it succeeds and the
+// handle is consistent on the new revision, or it fails and the handle is
+// consistent on the state it had before the call. A call rejected before any write
+// — nothing staged, an unusable branch, a tree the validator refuses, or a branch
+// tip that has already moved — writes nothing at all. A failure once the freeze has
+// begun leaves a part-frozen tree, which is discarded and rebuilt from a snapshot
+// taken before the freeze started, so the handle comes back on the revision it was
+// on with the edits still staged. Either way recovery is to fix what the terminal
+// reported and retry **on the same handle**: no close, no reload, no re-applying
+// edits. The one failure that still poisons the handle is a restore that itself
+// fails, which reports `INTERNAL` saying so. When the branch had advanced,
+// `new_tip_hash` on the terminal carries that tip, which is also how a caller tells
+// that failure apart: neither a tip collision nor an empty commit has a
+// `lore_error_code_t` of its own, so both report `INTERNAL` with the reason in the
+// completion detail — the same codes the file-system commit returns.
+//
+// `options.remote_write = 1` uploads within the call. It is a request, not a
+// guarantee: a store bound offline or local-only, or a call passing
+// `globals.local`, silently commits local-only. So does a store opened without a
+// remote configuration — there is nothing to upload to, and the commit still
+// reports success. Per-call flags contradicting the store's bound flags reject the
+// call.
+//
+// **The commit holds the handle for the length of the call.** No other call on the
+// same handle runs while the tree is frozen, so an edit issued concurrently lands
+// wholly before the commit reads the tree or wholly after it finishes, two commits
+// on one handle serialize, and `metadata_set` can no longer lose an edit to the
+// commit. A commit on a large tree therefore blocks reads on that handle for its
+// duration, and a callback that re-enters the API on the same handle deadlocks —
+// which the callback contract already forbids. Commits from *different* handles or
+// processes still race, and the branch tip compare-and-swap decides them.
+//
+// `remote_write` is resolved onto the handle's shared repository context, so the
+// value outlives the call: the handle carries whatever the last commit resolved.
+//
+// | Terminal event                                | Payload                                             | Notes                                                             |
+// |-----------------------------------------------|-----------------------------------------------------|-------------------------------------------------------------------|
+// | `LORE_EVENT_REVISION_TREE_COMMIT_COMPLETE`    | `lore_revision_tree_commit_complete_event_data_t`   | Exactly one; carries the new revision, or the new tip on collision |
+// | `LORE_EVENT_REVISION_COMMIT_REVISION`         | `lore_revision_commit_revision_event_data_t`        | On success, for continuity with file-system commit consumers       |
+int32_t lore_revision_tree_commit(const struct lore_global_args_t *globals,
+                                  const struct lore_revision_tree_commit_args_t *args,
+                                  struct lore_event_callback_config_t callback);
+
+// Freeze a loaded revision tree into a new revision (async variant).
+void lore_revision_tree_commit_async(const struct lore_global_args_t *globals,
+                                     const struct lore_revision_tree_commit_args_t *args,
+                                     struct lore_event_callback_config_t callback);

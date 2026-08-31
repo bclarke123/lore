@@ -88,6 +88,15 @@ message DiffChange {
   // links and non-link changes. Only meaningful on a LINK-typed entry; read
   // it from the entry for the mount path itself.
   bool tracking = 9;
+  // Full content address (hash + context) on the "from" side; unset when
+  // `content_from` is empty, and for link entries (whose `content_from`
+  // carries a revision signature, not a content address). Prefer this over
+  // `content_from` when fetching content: `ReadContent` / `ContentDiff`
+  // serve exact addresses only.
+  lore.model.v1.Address address_from = 10;
+  // Full content address on the "to" side; unset when `content_to` is
+  // empty, and for link entries.
+  lore.model.v1.Address address_to = 11;
 }
 
 // Pair of per-path changes describing a 3-way merge conflict at a single
@@ -210,6 +219,15 @@ message ContentDiffRequest {
   // the response header sets `truncated = true` and emits no chunks;
   // summary stats are still computed.
   optional uint64 max_diff_size = 7;
+  // Full content address of the "from" side (from `DiffChange.address_from`).
+  // Preferred over `address_from`: the server serves exact addresses only,
+  // and a hash-only request is answered NOT_FOUND when the exact association
+  // cannot be established.
+  lore.model.v1.Address full_address_from = 8;
+  // Full content address of the "to" side.
+  lore.model.v1.Address full_address_to = 9;
+  // Full content address of the common ancestor (3-way mode).
+  lore.model.v1.Address full_address_base = 10;
 }
 
 // Server-streamed response for ContentDiff. The first message MUST carry

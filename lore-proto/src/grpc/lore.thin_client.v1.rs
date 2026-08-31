@@ -42,6 +42,17 @@ pub struct DiffChange {
     /// it from the entry for the mount path itself.
     #[prost(bool, tag = "9")]
     pub tracking: bool,
+    /// Full content address (hash + context) on the "from" side; unset when
+    /// `content_from` is empty, and for link entries (whose `content_from`
+    /// carries a revision signature, not a content address). Prefer this over
+    /// `content_from` when fetching content: `ReadContent` / `ContentDiff`
+    /// serve exact addresses only.
+    #[prost(message, optional, tag = "10")]
+    pub address_from: ::core::option::Option<crate::lore::model::v1::Address>,
+    /// Full content address on the "to" side; unset when `content_to` is
+    /// empty, and for link entries.
+    #[prost(message, optional, tag = "11")]
+    pub address_to: ::core::option::Option<crate::lore::model::v1::Address>,
 }
 impl ::prost::Name for DiffChange {
     const NAME: &'static str = "DiffChange";
@@ -271,6 +282,18 @@ pub struct ContentDiffRequest {
     /// summary stats are still computed.
     #[prost(uint64, optional, tag = "7")]
     pub max_diff_size: ::core::option::Option<u64>,
+    /// Full content address of the "from" side (from `DiffChange.address_from`).
+    /// Preferred over `address_from`: the server serves exact addresses only,
+    /// and a hash-only request is answered NOT_FOUND when the exact association
+    /// cannot be established.
+    #[prost(message, optional, tag = "8")]
+    pub full_address_from: ::core::option::Option<crate::lore::model::v1::Address>,
+    /// Full content address of the "to" side.
+    #[prost(message, optional, tag = "9")]
+    pub full_address_to: ::core::option::Option<crate::lore::model::v1::Address>,
+    /// Full content address of the common ancestor (3-way mode).
+    #[prost(message, optional, tag = "10")]
+    pub full_address_base: ::core::option::Option<crate::lore::model::v1::Address>,
 }
 impl ::prost::Name for ContentDiffRequest {
     const NAME: &'static str = "ContentDiffRequest";

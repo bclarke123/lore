@@ -95,7 +95,7 @@ pub async fn handler(
             // yields the root fragment, whose `size_content` is the total
             // content size — reported alongside ranged reads so callers can
             // say "bytes X-Y of Z" without a second round-trip.
-            let (fragment, bytes) = match lore_storage::read(
+            let (fragment, bytes) = lore_storage::read(
                 immutable_store.clone(),
                 repository_id,
                 address,
@@ -104,36 +104,7 @@ pub async fn handler(
                 None, /* server has the data locally; no remote session */
             )
             .await
-            {
-                // Hash-only address (no context half): fall back to the
-                // store's MatchHash lookup, the same way ContentDiff reads
-                // `DiffChange.content_from`/`content_to`. This does not
-                // widen access — the lookup stays scoped to the caller's
-                // authorized partition, and the content hash itself proves
-                // the bytes. Callers holding a full (hash, context) address
-                // never take this path.
-                Err(lore_storage::StorageError::AddressNotFound(_))
-                    if address.context.is_zero() =>
-                {
-                    let mut fallback = ReadOptions::default().no_isolation();
-                    if range.is_none()
-                        && let Some(max) = req.max_bytes
-                    {
-                        fallback = fallback.with_max_content_size(max);
-                    }
-                    lore_storage::read(
-                        immutable_store,
-                        repository_id,
-                        address,
-                        range.clone(),
-                        fallback,
-                        None,
-                    )
-                    .await
-                    .map_err(map_read_error)?
-                }
-                other => other.map_err(map_read_error)?,
-            };
+            .map_err(map_read_error)?;
 
             // Open-ended range: the read was bounded to `max + 1` bytes, so
             // landing past `max` means the tail exceeds the cap.
@@ -209,11 +180,12 @@ mod tests {
             Bytes::copy_from_slice(content),
             WriteOptions::default().no_remote_write(),
             None,
-            None,
+            lore_storage::WriteContext::none(),
             None,
         )
         .await
         .expect("write blob")
+        .address
     }
 
     async fn read_all(

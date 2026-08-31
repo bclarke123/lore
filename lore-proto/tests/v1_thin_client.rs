@@ -79,6 +79,9 @@ fn v1_thin_client_field_shapes() {
         ignore_whitespace_eol: _,
         ignore_whitespace_inline: _,
         max_diff_size: _,
+        full_address_from: _,
+        full_address_to: _,
+        full_address_base: _,
     } = ContentDiffRequest::default();
     let ContentDiffResponse { payload: _ } = ContentDiffResponse::default();
     let _ = ContentDiffPayload::Header(Default::default());
@@ -113,6 +116,8 @@ fn v1_thin_client_field_shapes() {
         automerged: _,
         link_repository_index: _,
         tracking: _,
+        address_from: _,
+        address_to: _,
     } = DiffChange::default();
     let DiffConflict {
         change_from: _,

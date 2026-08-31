@@ -61,6 +61,8 @@ async fn resolve_token(remote_url: &str) -> Result<String, LoginError> {
             &auth_url,
             identity,
             tokens_only_for_recipient_domain(remote_domain.clone()),
+            "",
+            "",
         )
         .await
             && let Some(info) = lore_credential::user_info_from_token(token.clone())

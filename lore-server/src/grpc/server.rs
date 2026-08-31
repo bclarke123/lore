@@ -177,6 +177,13 @@ pub struct GrpcPublicServicesSettings {
     pub lock_service: GenericServiceSettings,
     #[serde(default)]
     pub notification_service: GenericServiceSettings,
+    /// The server-local auth family: the login/exchange door and the ReBAC
+    /// query surface. Registered only when server-local auth is configured.
+    #[serde(default)]
+    pub auth_service: GenericServiceSettings,
+    /// Grant administration for per-repository access control.
+    #[serde(default)]
+    pub access_service: GenericServiceSettings,
 
     /// Not a service. Configures forwarding for services that already register.
     pub forwarded_requests: Option<ForwardedRequestsSettings>,
@@ -634,6 +641,11 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             .layer(LoreTracingLayer {})
             .layer(metrics_layer)
             .layer(GrpcResponseTraceLayer {})
+            // Grants anonymous read access to public repositories by
+            // injecting a synthesized authorization the JWT interceptors
+            // honor; inert for requests carrying a bearer token or when
+            // access control is not installed.
+            .layer(crate::auth::anonymous::AnonymousReadLayer)
             // Empty routes turn the `Server` into a `Router` without mounting
             // anything; unmatched paths answer UNIMPLEMENTED.
             .add_routes(Routes::default());
@@ -713,38 +725,11 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             router = router.add_service(AdminServiceServer::new(admin_svc));
         }
 
-<<<<<<< HEAD
-        let mut admin_svc = self.0.admin_svc;
-        admin_svc.set_jwt_verifier(jwt_verifier.clone());
-        admin_svc.set_rpc_timeout(rpc_timeout);
-        let trace_layer_config = {
-            let mut config = TraceLayerConfig::default();
-            config.grpc_codes_as_success.push(GrpcCode::Unauthenticated);
-            config
-        };
-        let mut router = server
-            // Outermost, so everything inward runs on core: this stack is served
-            // from net.
-            .layer(CoreHopLayer)
-            .layer(
-                CorrelationIdLayerBuilder::new()
-                    .with_grpc_tracer(trace_layer_config)
-                    .build(),
-            )
-            .layer(LoreTracingLayer {})
-            .layer(metrics_layer)
-            .layer(GrpcResponseTraceLayer {})
-            // Grants anonymous read access to public repositories by
-            // injecting a synthesized authorization the JWT interceptors
-            // honor; inert for requests carrying a bearer token or when
-            // access control is not installed.
-            .layer(crate::auth::anonymous::AnonymousReadLayer);
-
-        let mut router = router.add_service(AdminServiceServer::new(admin_svc));
-
         // Server-local auth: serve the login/exchange protocol ourselves.
         // Registered without an interceptor — it is the login door.
-        if let Some(local_auth) = local_auth {
+        if let Some(local_auth) = local_auth
+            && check_enabled(&services.auth_service, "auth_service")
+        {
             info!("Enabling server-local auth service");
             router = router
                 .add_service(UrcAuthApiServer::new(LoreAuthService::new(
@@ -755,13 +740,13 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
 
         // Grant administration. Authenticates callers itself; answers
         // FailedPrecondition when access control is not installed.
-        router = router.add_service(AccessServiceServer::new(LoreAccessService::new(
-            self.0.immutable_store.clone(),
-            self.0.mutable_store.clone(),
-        )));
+        if check_enabled(&services.access_service, "access_service") {
+            router = router.add_service(AccessServiceServer::new(LoreAccessService::new(
+                self.0.immutable_store.clone(),
+                self.0.mutable_store.clone(),
+            )));
+        }
 
-=======
->>>>>>> main
         if let Some(jwt_verifier) = jwt_verifier.as_ref() {
             let jwt_interceptor = JWTInterceptor::new(jwt_verifier);
             // TODO(UCS-13506): Placeholder authn verifier until separate authz flow for repository service is in place

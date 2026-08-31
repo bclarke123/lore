@@ -260,15 +260,21 @@ pub(super) async fn node_change_to_diff_change(
         .as_ref()
         .map(|p| p.to_string())
         .unwrap_or_default();
-    let content_from = if action == thin_client_v1::Action::Add {
-        Bytes::new()
+    let (content_from, address_from) = if action == thin_client_v1::Action::Add {
+        (Bytes::new(), None)
     } else {
-        change.from.address.hash.into()
+        (
+            change.from.address.hash.into(),
+            Some(model_v1::Address::from(&change.from.address)),
+        )
     };
-    let content_to = if action == thin_client_v1::Action::Delete {
-        Bytes::new()
+    let (content_to, address_to) = if action == thin_client_v1::Action::Delete {
+        (Bytes::new(), None)
     } else {
-        change.to.address.hash.into()
+        (
+            change.to.address.hash.into(),
+            Some(model_v1::Address::from(&change.to.address)),
+        )
     };
     thin_client_v1::DiffChange {
         path: change.path.to_string(),
@@ -280,6 +286,8 @@ pub(super) async fn node_change_to_diff_change(
         automerged: change.flags.is_conflict_automerged(),
         link_repository_index,
         tracking: change.is_tracking_link().await,
+        address_from,
+        address_to,
     }
 }
 
@@ -299,6 +307,9 @@ pub(super) fn link_pin_change_to_diff_change(
         automerged: false,
         link_repository_index,
         tracking: pin_change.tracking_to,
+        // Revision signatures, not content addresses: nothing to fetch.
+        address_from: None,
+        address_to: None,
     }
 }
 

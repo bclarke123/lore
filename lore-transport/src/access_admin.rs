@@ -86,9 +86,10 @@ async fn client(
 
 fn with_bearer<T>(payload: T, token: &str) -> Result<tonic::Request<T>, ProtocolError> {
     let mut request = tonic::Request::new(payload);
-    let mut header: tonic::metadata::MetadataValue<_> = format!("Bearer {token}")
-        .parse()
-        .internal("invalid authorization header value")?;
+    let mut header: tonic::metadata::MetadataValue<_> =
+        format!("Bearer {token}").parse().map_err(|err| {
+            ProtocolError::internal(format!("invalid authorization header value: {err}"))
+        })?;
     header.set_sensitive(true);
     request.metadata_mut().insert("authorization", header);
     Ok(request)

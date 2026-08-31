@@ -61,12 +61,17 @@ pub async fn handler(
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner();
 
-    if req.address_base.as_ref().is_some_and(|b| !b.is_empty()) {
+    if req.address_base.as_ref().is_some_and(|b| !b.is_empty()) || req.full_address_base.is_some() {
         return Err(Status::unimplemented(
             "lore.thin_client.v1.ThinClientService.ContentDiff 3-way mode not yet implemented",
         ));
     }
-    if req.address_from.is_empty() && req.address_to.is_empty() {
+    // Full addresses when given; the legacy hash-only bytes resolve with a
+    // zero context, which the store refuses when it isolates partitions —
+    // those callers get NOT_FOUND rather than served bytes.
+    let address_from = side_address(req.full_address_from.as_ref(), &req.address_from);
+    let address_to = side_address(req.full_address_to.as_ref(), &req.address_to);
+    if address_from.is_none() && address_to.is_none() {
         return Err(Status::invalid_argument(
             "at least one of address_from / address_to must be set",
         ));
@@ -86,8 +91,8 @@ pub async fn handler(
             // Read both sides up front so failures surface as a unary Status
             // before the stream opens. `None` = empty side (add / delete);
             // oversized input short-circuits to a truncated header.
-            let from = read_side(&immutable_store, repository_id, &req.address_from).await?;
-            let to = read_side(&immutable_store, repository_id, &req.address_to).await?;
+            let from = read_side(&immutable_store, repository_id, address_from).await?;
+            let to = read_side(&immutable_store, repository_id, address_to).await?;
 
             let header;
             let mut text = String::new();
@@ -110,9 +115,8 @@ pub async fn handler(
                     // regardless of content size, since content is never
                     // read.
                     let table_from =
-                        chunk_table(&immutable_store, repository_id, &req.address_from).await?;
-                    let table_to =
-                        chunk_table(&immutable_store, repository_id, &req.address_to).await?;
+                        chunk_table(&immutable_store, repository_id, address_from).await?;
+                    let table_to = chunk_table(&immutable_store, repository_id, address_to).await?;
                     let (matched_runs, runs_truncated) =
                         match_tables(&table_from.chunks, &table_to.chunks);
                     header = ContentDiffHeader {
@@ -209,37 +213,34 @@ struct ChunkTable {
     chunks: Vec<Chunk>,
 }
 
-/// Load a side's FastCDC chunk table by content hash — metadata only, the
-/// chunk payloads are never read. Non-fragmented content is a single
-/// pseudo-chunk. The reference list is stored raw (not compressed, not a
-/// content-hash target), so decompress/verify are disabled, mirroring the
-/// chunk-reuse path in `lore-storage`'s write pipeline.
+/// Load a side's FastCDC chunk table — metadata only, the chunk payloads
+/// are never read. Non-fragmented content is a single pseudo-chunk. Child
+/// fragments are stored under their parent's context, so the walk carries
+/// the root's context into every child load. The reference list is stored
+/// raw (not compressed, not a content-hash target), so decompress/verify
+/// are disabled, mirroring the chunk-reuse path in `lore-storage`'s write
+/// pipeline.
 async fn chunk_table(
     immutable_store: &Arc<dyn lore_storage::ImmutableStore>,
     repository_id: lore_base::types::Partition,
-    hash_bytes: &[u8],
+    address: Option<Address>,
 ) -> Result<ChunkTable, Status> {
     let empty = ChunkTable {
         size_content: 0,
         chunks: Vec::new(),
     };
-    if hash_bytes.is_empty() {
+    let Some(root_address) = address else {
         return Ok(empty);
-    }
-    let root_hash = Hash::from(hash_bytes);
-    if root_hash.is_zero() {
-        return Ok(empty);
-    }
+    };
+    let root_hash = root_address.hash;
+    let context = root_address.context;
 
-    let options = ReadOptions::default()
-        .no_isolation()
-        .no_decompress()
-        .no_verify();
+    let options = ReadOptions::default().no_decompress().no_verify();
 
     // Worklist of (hash, absolute offset, length, depth) still to resolve
     // into leaves. Lengths above the fragmentation threshold may be
     // intermediate nodes whose payload is another reference list.
-    let root = load_table_entry(immutable_store, repository_id, root_hash, options).await?;
+    let root = load_table_entry(immutable_store, repository_id, root_address, options).await?;
     let size_content = root.0.size_content;
     let mut work: Vec<(Hash, u64, u64, usize)> = vec![(root_hash, 0, size_content, 0)];
     let mut chunks = Vec::new();
@@ -253,8 +254,13 @@ async fn chunk_table(
             chunks.push(Chunk { hash, offset, len });
             continue;
         }
-        let (fragment, payload) =
-            load_table_entry(immutable_store, repository_id, hash, options).await?;
+        let (fragment, payload) = load_table_entry(
+            immutable_store,
+            repository_id,
+            Address { hash, context },
+            options,
+        )
+        .await?;
         if fragment.flags & lore_base::types::FragmentFlags::PayloadFragmented.bits() == 0 {
             // Unfragmented content (small file, or an oversized-but-unsplit
             // chunk): one leaf.
@@ -305,13 +311,9 @@ async fn chunk_table(
 async fn load_table_entry(
     immutable_store: &Arc<dyn lore_storage::ImmutableStore>,
     repository_id: lore_base::types::Partition,
-    hash: Hash,
+    address: Address,
     options: ReadOptions,
 ) -> Result<(lore_base::types::Fragment, bytes::Bytes), Status> {
-    let address = Address {
-        hash,
-        context: Default::default(),
-    };
     lore_storage::load_fragment(
         immutable_store.clone(),
         repository_id,
@@ -458,33 +460,36 @@ impl Side {
     }
 }
 
-/// Read one side's content by its hash bytes. Empty bytes = no content.
-/// The hash-only address resolves through the store's `MatchHash`
-/// fallback (`DiffChange.content_from`/`content_to` carry hashes without
-/// the context half).
+/// Resolve one side of the request to a storage address. The full-address
+/// field wins when set; the legacy hash-only bytes resolve with a zero
+/// context. `None` = no content on this side (add / delete).
+fn side_address(
+    full: Option<&lore_proto::lore::model::v1::Address>,
+    hash_bytes: &[u8],
+) -> Option<Address> {
+    let address = match full {
+        Some(full) => Address::from(full),
+        None => Address {
+            hash: Hash::from(hash_bytes),
+            context: Default::default(),
+        },
+    };
+    if address.hash.is_zero() {
+        return None;
+    }
+    Some(address)
+}
+
+/// Read one side's content. `None` = no content on this side.
 async fn read_side(
     immutable_store: &Arc<dyn lore_storage::ImmutableStore>,
     repository_id: lore_base::types::Partition,
-    hash_bytes: &[u8],
+    address: Option<Address>,
 ) -> Result<Side, Status> {
-    if hash_bytes.is_empty() {
+    let Some(address) = address else {
         return Ok(Side::Empty);
-    }
-    let address = Address {
-        hash: Hash::from(hash_bytes),
-        context: Default::default(),
     };
-    if address.hash.is_zero() {
-        return Ok(Side::Empty);
-    }
-    // The server enables LOCAL_ISOLATION globally, which restricts reads
-    // to full (hash, context) matches — but DiffChange only carries the
-    // hash half, so the MatchHash fallback must be allowed. This does not
-    // widen access: the lookup is still scoped to the caller's authorized
-    // partition, and the content hash itself proves the bytes.
-    let options = ReadOptions::default()
-        .no_isolation()
-        .with_max_content_size(MAX_INPUT_BYTES);
+    let options = ReadOptions::default().with_max_content_size(MAX_INPUT_BYTES);
     match lore_storage::read(
         immutable_store.clone(),
         repository_id,
@@ -495,7 +500,7 @@ async fn read_side(
     )
     .await
     {
-        Ok(bytes) => Ok(Side::Content(bytes)),
+        Ok((_, bytes)) => Ok(Side::Content(bytes)),
         Err(lore_storage::StorageError::Oversized(_)) => {
             // Too large to reassemble in full — fetch just a leading
             // prefix (ranged read, no size cap) so text/binary sniffing
@@ -505,10 +510,11 @@ async fn read_side(
                 repository_id,
                 address,
                 Some(0..SNIFF_BYTES),
-                ReadOptions::default().no_isolation(),
+                ReadOptions::default(),
                 None,
             )
             .await
+            .map(|(_, bytes)| bytes)
             .unwrap_or_default();
             Ok(Side::Oversized { prefix })
         }
@@ -550,40 +556,43 @@ mod tests {
         store: &Arc<dyn lore_storage::ImmutableStore>,
         partition: lore_base::types::Partition,
         content: &[u8],
-    ) -> bytes::Bytes {
-        // Non-default context: the handler only receives the hash half, so
-        // this forces the MatchHash fallback path (a full-address match
-        // misses), mirroring production DiffChange addresses.
-        let address = lore_storage::write_content(
+    ) -> Option<lore_proto::lore::model::v1::Address> {
+        // Non-default context: exact (hash, context) addressing is exercised
+        // end to end, mirroring production DiffChange addresses against an
+        // isolating store.
+        let result = lore_storage::write_content(
             store.clone(),
             partition,
             Context::from([7u8; 16].as_ref()),
             bytes::Bytes::copy_from_slice(content),
             WriteOptions::default().no_remote_write(),
             None,
-            None,
+            lore_storage::WriteContext::none(),
             None,
         )
         .await
         .expect("write blob");
-        bytes::Bytes::copy_from_slice(address.hash.as_ref())
+        Some(lore_proto::lore::model::v1::Address::from(&result.address))
     }
 
     async fn run_diff(
         store: Arc<dyn lore_storage::ImmutableStore>,
         partition: lore_base::types::Partition,
-        from: bytes::Bytes,
-        to: bytes::Bytes,
+        from: Option<lore_proto::lore::model::v1::Address>,
+        to: Option<lore_proto::lore::model::v1::Address>,
         max_diff_size: Option<u64>,
     ) -> (ContentDiffHeader, String) {
         let mut request = Request::new(ContentDiffRequest {
-            address_from: from,
-            address_to: to,
+            address_from: bytes::Bytes::new(),
+            address_to: bytes::Bytes::new(),
             address_base: None,
             context_lines: None,
             ignore_whitespace_eol: false,
             ignore_whitespace_inline: false,
             max_diff_size,
+            full_address_from: from,
+            full_address_to: to,
+            full_address_base: None,
         });
         request.metadata_mut().insert_bin(
             "urc-repository-id-bin",
@@ -622,27 +631,13 @@ mod tests {
             assert!(text.contains("+delta\n"));
 
             // Add: empty from side.
-            let (header, text) = run_diff(
-                store.clone(),
-                partition,
-                bytes::Bytes::new(),
-                new.clone(),
-                None,
-            )
-            .await;
+            let (header, text) = run_diff(store.clone(), partition, None, new.clone(), None).await;
             assert_eq!(header.lines_added, 4);
             assert_eq!(header.lines_deleted, 0);
             assert!(text.contains("+alpha\n"));
 
             // Delete: empty to side.
-            let (header, _text) = run_diff(
-                store.clone(),
-                partition,
-                old.clone(),
-                bytes::Bytes::new(),
-                None,
-            )
-            .await;
+            let (header, _text) = run_diff(store.clone(), partition, old.clone(), None, None).await;
             assert_eq!(header.lines_added, 0);
             assert_eq!(header.lines_deleted, 3);
 

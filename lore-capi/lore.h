@@ -205,6 +205,8 @@ typedef enum lore_key_type_t {
   // because this is the only one they operate on; a publish large enough to fragment falls
   // back to an ordinary mutable store write, which does carry it like any other type.
   LORE_KEY_TYPE_RESOLVE = 7,
+  // Key refers to per-repository access-control grants.
+  LORE_KEY_TYPE_ACCESS_CONTROL = 8,
 } lore_key_type_t;
 
 // The change staged on a node for the next revision. `None` is a node the

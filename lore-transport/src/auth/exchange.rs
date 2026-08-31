@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -194,8 +195,12 @@ pub async fn exchange(
     // instead of sending a token the server is guaranteed to reject.
     // Mirrors `auth_exchange_for_identity`; without this, working copies
     // with a configured identity error out once the authn TTL passes.
+    // Only store-resolved identities refresh: a supplied credential is not
+    // ours to renew — it is handed over as-is, expired or not, so its
+    // rejection surfaces to the caller and nothing derived from it ever
+    // touches the token store.
     let mut authn_token = auth_service_only_token.token;
-    if is_expired(auth_service_only_token.expires) {
+    if !supplied_credentials && is_expired(auth_service_only_token.expires) {
         match refresh_authentication_token(&auth_url, identity).await {
             Some(refreshed) => {
                 lore_debug!("Refreshed expired authn token for {identity}");
@@ -228,6 +233,7 @@ pub async fn exchange(
     // before surfacing the failure. The local-expiry check above cannot
     // catch these — only the server knows the token is invalid.
     if result.is_err()
+        && !supplied_credentials
         && let Some(refreshed) = refresh_authentication_token(&auth_url, identity).await
         && refreshed != authn_token
     {
@@ -520,11 +526,52 @@ pub async fn auth_exchange(
     (String::new(), String::new(), String::new())
 }
 
+/// A recently redeemed token per identity, behind a lock that admits one
+/// redemption at a time.
+type RefreshSlot = Arc<Mutex<Option<(Instant, String)>>>;
+
+static REFRESH_SLOTS: std::sync::OnceLock<Mutex<HashMap<(AuthUrl, Identity), RefreshSlot>>> =
+    std::sync::OnceLock::new();
+
+fn refresh_slots() -> &'static Mutex<HashMap<(AuthUrl, Identity), RefreshSlot>> {
+    REFRESH_SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// How long a redeemed token answers follow-up refresh requests for the same
+/// identity. Long enough to absorb a burst of concurrent refreshers waking on
+/// one rotation; well under the server's redemption reuse grace window, so a
+/// caller that genuinely needs a second redemption is never handed a token the
+/// server has moved past.
+const REFRESH_REUSE_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Redeem the identity's stored refresh token for a new authentication
 /// token, persisting both the new token and the rotated refresh token.
 /// Returns `None` when no refresh token is stored, the server does not
 /// support refresh, or the refresh is rejected.
+///
+/// Redemptions are serialized per `(auth_url, identity)` and their result is
+/// briefly reused: every persistent connection runs an interval refresher and
+/// a credential rotation wakes them all at once, but each redemption *spends*
+/// the stored refresh token — concurrent redemptions would present the same
+/// spent token, which a rotating server reads as replay and answers by
+/// revoking the whole token family. The first caller redeems; callers queued
+/// behind it take its result.
 async fn refresh_authentication_token(auth_url: &str, identity: &str) -> Option<String> {
+    let slot = {
+        let mut slots = refresh_slots().lock().await;
+        slots
+            .entry((auth_url.to_string(), identity.to_string()))
+            .or_default()
+            .clone()
+    };
+    let mut last = slot.lock().await;
+    if let Some((when, token)) = last.as_ref()
+        && when.elapsed() < REFRESH_REUSE_WINDOW
+    {
+        lore_debug!("Reusing just-redeemed authn token for {identity}");
+        return Some(token.clone());
+    }
+
     let refresh_token = token_store::load_refresh_token(auth_url, identity)
         .await
         .ok()?;
@@ -551,6 +598,7 @@ async fn refresh_authentication_token(auth_url: &str, identity: &str) -> Option<
             .await
             .inspect_err(|err| lore_debug!("Failed to store rotated refresh token: {err}"));
     }
+    *last = Some((Instant::now(), refreshed.token.clone()));
     Some(refreshed.token)
 }
 
@@ -562,11 +610,7 @@ async fn auth_exchange_for_identity(
     identity_token: &str,
     access_token: &str,
 ) -> (String, String, String) {
-<<<<<<< HEAD
-    let Ok(mut authentication_token) = token_store::load_user_token(
-=======
-    let authentication_token = token_store::load_user_token(
->>>>>>> main
+    let mut authentication_token = token_store::load_user_token(
         auth_url,
         identity,
         tokens_only_for_recipient_domain(remote_domain.to_string()),
@@ -584,22 +628,17 @@ async fn auth_exchange_for_identity(
         return (String::new(), String::new(), String::new());
     }
 
-<<<<<<< HEAD
-    // Expired authn token: attempt a refresh before giving up on the
-    // identity. Servers without refresh support (or without a stored
-    // refresh token) fall through to the previous behavior.
-    if let Some(info) = lore_credential::user_info_from_token(authentication_token.clone())
-=======
     // Reject expired authn tokens, but only ones resolved from the store. That
     // check is there to skip a stale stored identity while picking one; a
     // credential the caller supplied is not a candidate to skip, it is an
     // instruction. An expired supplied token is handed over for the server to
     // reject, so the caller sees an authentication failure rather than requests
-    // going out carrying no credential at all.
+    // going out carrying no credential at all. A store-resolved expired token
+    // is first given a chance to refresh; servers without refresh support (or
+    // without a stored refresh token) fall through to skipping the identity.
     if identity_token.is_empty()
         && access_token.is_empty()
         && let Some(info) = lore_credential::user_info_from_token(authentication_token.clone())
->>>>>>> main
         && is_expired(info.expires)
     {
         match refresh_authentication_token(auth_url, identity).await {
@@ -742,7 +781,7 @@ async fn auth_exchange_custom_resource_for_identity(
     identity_token: &str,
     access_token: &str,
 ) -> (String, String, String) {
-    let authentication_token = token_store::load_user_token(
+    let mut authentication_token = token_store::load_user_token(
         auth_url,
         identity,
         tokens_only_for_recipient_domain(remote_domain.to_string()),
@@ -760,16 +799,12 @@ async fn auth_exchange_custom_resource_for_identity(
         return (String::new(), String::new(), String::new());
     }
 
-<<<<<<< HEAD
-    let mut authentication_token = authentication_token;
-    if let Some(info) = lore_credential::user_info_from_token(authentication_token.clone())
-=======
     // As in `auth_exchange_for_identity`: only a store-resolved identity is
-    // skipped for expiry. A supplied credential is handed over regardless.
+    // skipped for expiry — and first given a chance to refresh. A supplied
+    // credential is handed over regardless.
     if identity_token.is_empty()
         && access_token.is_empty()
         && let Some(info) = lore_credential::user_info_from_token(authentication_token.clone())
->>>>>>> main
         && is_expired(info.expires)
     {
         match refresh_authentication_token(auth_url, identity).await {

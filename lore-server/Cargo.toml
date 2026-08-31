@@ -82,7 +82,6 @@ vergen = { workspace = true }
 [dev-dependencies]
 ctor = { workspace = true }
 lore-credential = { workspace = true }
-tempfile = "3"
 axum-test = "18.1.0"
 rcgen = { workspace = true }
 tempfile = "3.21"

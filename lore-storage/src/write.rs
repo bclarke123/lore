@@ -812,18 +812,12 @@ fn stored_flags(resolved: &StoreMatchResult) -> (bool, bool) {
 }
 
 fn is_fully_satisfied(
-<<<<<<< HEAD
-    query: &StoreQueryResult,
-    _cache_local: bool,
-=======
     resolved: &StoreMatchResult,
-    cache_local: bool,
->>>>>>> main
+    _cache_local: bool,
     stored_local: bool,
     remote_session: &Option<Arc<StorageSession>>,
     stored_durable: bool,
 ) -> bool {
-<<<<<<< HEAD
     // A write is only satisfiable by an existing entry if that entry still
     // physically holds the payload. An entry whose payload was evicted on
     // the strength of a durable flag must NOT satisfy a write that is
@@ -831,12 +825,8 @@ fn is_fully_satisfied(
     // data), and the write is the cheapest possible moment to restore the
     // payload. Without this, an evicted payload is unrecoverable even
     // when the identical content is re-staged from the working tree.
-    query.match_made == StoreMatch::MatchFull
-        && stored_local
-=======
     resolved.match_made == StoreMatch::MatchFull
-        && (!cache_local || stored_local)
->>>>>>> main
+        && stored_local
         && (remote_session.is_none() || stored_durable)
 }
 

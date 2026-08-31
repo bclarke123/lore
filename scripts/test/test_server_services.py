@@ -404,20 +404,22 @@ class TestThinClientServesData:
         assert status == grpc.StatusCode.OK, f"RevisionDiff failed: {status} {details}"
         assert messages, "RevisionDiff streamed nothing between two differing revisions"
 
-    def test_content_diff_is_mounted_but_unimplemented(
+    def test_content_diff_is_mounted_and_implemented(
         self, thin_services_in_effect, thin_target, pushed_revisions
     ):
         """Distinguish the mounted handler from an absent route.
 
-        Both return UNIMPLEMENTED. The handler in `thinclient/v1/service.rs`
-        includes a message, while tonic's fallback does not.
+        Upstream stubs ContentDiff as UNIMPLEMENTED; this fork implements it,
+        so an empty request is refused by the handler's own argument
+        validation. Tonic's fallback for an unmounted route carries no
+        message at all.
         """
         repo_id, _first, _second = pushed_revisions
         details = method_details(
             thin_target, CONTENT_DIFF, b"", repository_metadata(repo_id)
         )
 
-        assert "not yet implemented" in details, (
-            f"expected the handler's own message, got {details!r} -- an empty "
-            "message would mean ContentDiff is not mounted at all"
+        assert "address_from" in details, (
+            f"expected the handler's own validation message, got {details!r} "
+            "-- an empty message would mean ContentDiff is not mounted at all"
         )

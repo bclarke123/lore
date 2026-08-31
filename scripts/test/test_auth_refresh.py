@@ -117,19 +117,23 @@ def test_refresh_keeps_session_alive_past_token_expiry(refresh_server):
     exchange_for_resources(refresh_server["grpc"], refreshed.user_token, [PROJECT])
 
 
-def test_refresh_reuse_revokes_the_family(refresh_server):
+def test_refresh_replay_within_grace_converges(refresh_server):
     token = login(refresh_server)
     first = refresh_auth_session(refresh_server["grpc"], token.refresh_token)
 
-    # Replaying the original (rotated) refresh token is reuse...
-    with pytest.raises(grpc.RpcError) as error:
-        refresh_auth_session(refresh_server["grpc"], token.refresh_token)
-    assert error.value.code() == grpc.StatusCode.UNAUTHENTICATED
+    # Replaying the rotated token inside the reuse grace window is a racing
+    # legitimate client (several processes share one credential store): it
+    # idempotently receives the same successor instead of an error, so every
+    # process converges on one token.
+    replayed = refresh_auth_session(refresh_server["grpc"], token.refresh_token)
+    assert replayed.refresh_token == first.refresh_token
 
-    # ...which also kills the successor.
-    with pytest.raises(grpc.RpcError) as error:
-        refresh_auth_session(refresh_server["grpc"], first.refresh_token)
-    assert error.value.code() == grpc.StatusCode.UNAUTHENTICATED
+    # The family is intact: the successor still redeems.
+    second = refresh_auth_session(refresh_server["grpc"], first.refresh_token)
+    assert second.refresh_token != first.refresh_token
+    # Replay *past* the grace window revokes the whole family; that branch is
+    # covered by the refresh store's unit tests, which zero the grace window
+    # (`with_reuse_grace_ms(0)` in lore-server/src/auth/refresh.rs).
 
 
 def test_garbage_refresh_token_is_refused(refresh_server):

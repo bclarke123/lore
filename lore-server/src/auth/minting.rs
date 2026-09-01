@@ -283,6 +283,10 @@ impl TokenMinter {
             groups: None,
             is_service_account: Some(false),
             idp: identity.idp.clone(),
+            // The audience entries are the server's domain(s); advertising
+            // them under the dedicated claim as well keeps the client-side
+            // send-check working if `aud` ever becomes a URI (upstream D5).
+            root_domains: Some(self.audience.clone()),
         };
 
         Ok(MintedLogin {

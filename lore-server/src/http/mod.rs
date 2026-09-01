@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 pub mod auth_login;
 pub mod health_check;
+pub mod oauth;
 pub mod presign_token;
 pub mod presigned;
 pub mod repositories;

@@ -10,4 +10,5 @@ pub mod local_jwk;
 pub mod minting;
 pub mod provider;
 pub mod refresh;
+pub mod resource_exchange;
 pub mod session;

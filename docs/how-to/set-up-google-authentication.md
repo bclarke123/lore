@@ -34,6 +34,10 @@ Add the auth sections to your server configuration (for example `lore-server/con
 # start when generate_signing_key is true; keep the file private.
 signing_key_path = "/etc/lore/signing-key.pem"
 generate_signing_key = true
+# The issuer must be the server's externally reachable base URL: it is
+# what minted tokens carry as `iss`, and the standard OAuth endpoints
+# (OIDC discovery, device authorization, token endpoint) derive their
+# advertised locations from it. A non-URL issuer disables those endpoints.
 issuer = "https://lore.example.com"
 # Audience entries double as the root domains the client trusts the token
 # to; use your server's domain.
@@ -73,6 +77,28 @@ lore auth list
 ```
 
 The identity is reported as `google:<subject>` with your Google display name.
+
+## Standard OAuth endpoints
+
+Alongside the gRPC auth service, the server serves the same flows through
+standard OAuth 2.0 / OIDC endpoints, discoverable at
+`https://lore.example.com/.well-known/openid-configuration`:
+
+- the RFC 8628 device-authorization grant (`/auth/device_authorization`
+  plus the `/auth/device` verification page) — the standard shape of the
+  `lore auth login` session flow;
+- the `refresh_token` grant at `/auth/token`, redeeming the same rotating
+  refresh tokens;
+- RFC 8693 token exchange at `/auth/token`, both for narrowing a user
+  token to per-repository resources (RFC 8707 `resource` indicators or the
+  legacy `urc-<id>` form) and for exchanging a trusted external OIDC ID
+  token (`subject_token_type` `urn:ietf:params:oauth:token-type:id_token`);
+- the signing keys at `/auth/.well-known/jwks.json`.
+
+Any standard OAuth client or tooling can drive these; existing Lore
+clients continue on the gRPC path. This tracks the upstream proposal
+`docs/proposals/2026-08-20-oidc-oauth2-authentication.md`, which migrates
+clients onto exactly these shapes.
 
 ## Test the whole flow locally
 

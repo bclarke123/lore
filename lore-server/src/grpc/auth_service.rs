@@ -29,29 +29,13 @@ use tracing::info;
 use tracing::instrument;
 
 use crate::auth::jwt::AuthorizationToken;
-use crate::auth::jwt::ResourcePermission;
 use crate::auth::jwt_interceptor::extract_bearer_token;
 use crate::auth::local_auth::LocalAuth;
+use crate::auth::resource_exchange::ResourceRequest;
+use crate::auth::resource_exchange::default_permissions;
+use crate::auth::resource_exchange::parse_repository_resource;
+use crate::auth::resource_exchange::resolve_resource_permissions;
 use crate::auth::session::SessionError;
-
-/// Permissions granted to any authenticated user until the per-repository
-/// access store provides real grants.
-const DEFAULT_PERMISSIONS: [&str; 2] = ["read", "write"];
-
-fn default_permissions() -> Vec<String> {
-    DEFAULT_PERMISSIONS
-        .iter()
-        .map(ToString::to_string)
-        .collect()
-}
-
-/// Parse a `urc-<repository-id>` resource id. Wildcards and non-repository
-/// resources yield `None`.
-fn parse_repository_resource(resource_id: &str) -> Option<lore_revision::lore::RepositoryId> {
-    use std::str::FromStr;
-    let hex = resource_id.strip_prefix("urc-")?;
-    lore_revision::lore::RepositoryId::from_str(hex).ok()
-}
 
 pub struct LoreAuthService {
     auth: Arc<LocalAuth>,
@@ -277,39 +261,14 @@ impl UrcAuthApi for LoreAuthService {
             return Err(Status::invalid_argument("no resource ids requested"));
         }
 
-        let resources = if let Some(access) = crate::access::installed() {
-            let principals = crate::access::Principals::from_claims(&user_claims);
-            let mut resources = Vec::with_capacity(resource_ids.len());
-            for resource_id in resource_ids {
-                let role = match parse_repository_resource(&resource_id) {
-                    Some(repository) => access
-                        .role_for(&principals, repository)
-                        .await
-                        .map_err(|e| Status::internal(format!("Access lookup failed: {e}")))?,
-                    // Wildcards and non-repository resources are never
-                    // granted to users.
-                    None => None,
-                };
-                let Some(role) = role else {
-                    return Err(Status::permission_denied(format!(
-                        "No access granted for {resource_id}"
-                    )));
-                };
-                resources.push(ResourcePermission {
-                    resource_id,
-                    permission: role.verbs().iter().map(ToString::to_string).collect(),
-                });
-            }
-            resources
-        } else {
-            resource_ids
-                .into_iter()
-                .map(|resource_id| ResourcePermission {
-                    resource_id,
-                    permission: default_permissions(),
-                })
-                .collect()
-        };
+        let requests = resource_ids
+            .into_iter()
+            .map(|resource_id| ResourceRequest {
+                repository: parse_repository_resource(&resource_id),
+                resource_id,
+            })
+            .collect();
+        let resources = resolve_resource_permissions(&user_claims, requests).await?;
 
         let minted = self
             .auth

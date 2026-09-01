@@ -17,8 +17,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 /// How long a login session may stay pending before it expires. Generous
-/// enough for a first-time provider consent screen.
-const SESSION_TTL: Duration = Duration::from_secs(10 * 60);
+/// enough for a first-time provider consent screen. Advertised as
+/// `expires_in` by the device-authorization endpoint.
+pub(crate) const SESSION_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// Upper bound on concurrently pending sessions. Purely a memory backstop;
 /// expired sessions are purged lazily on every access.
@@ -66,6 +67,9 @@ pub struct PendingSession {
     pub pkce_verifier: String,
     /// OIDC replay-protection nonce, generated for every session.
     pub nonce: String,
+    /// Short human-typeable code for the RFC 8628 device-authorization
+    /// flow, shown by the client and entered at `/auth/device`.
+    pub user_code: String,
     created: Instant,
 }
 
@@ -86,6 +90,8 @@ struct SessionMap {
     by_code: HashMap<String, SessionEntry>,
     /// `csrf_state` → `session_code` index for callback resolution.
     by_state: HashMap<String, String>,
+    /// Normalized `user_code` → `session_code` index for the device flow.
+    by_user_code: HashMap<String, String>,
 }
 
 /// Thread-safe store of pending login sessions.
@@ -99,6 +105,24 @@ fn random_value() -> String {
     Uuid::new_v4().simple().to_string()
 }
 
+/// Short display code for the device flow, `XXXX-XXXX` over uppercase hex.
+/// 32 bits is plenty against online guessing across at most
+/// [`MAX_PENDING_SESSIONS`] short-lived sessions.
+fn random_user_code() -> String {
+    let hex = random_value().to_uppercase();
+    format!("{}-{}", &hex[..4], &hex[4..8])
+}
+
+/// Case- and separator-insensitive form used to index and look up user
+/// codes, so `abcd-1234`, `ABCD1234` and `ABCD-1234` all match.
+fn normalize_user_code(user_code: &str) -> String {
+    user_code
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_uppercase()
+}
+
 impl SessionManager {
     pub fn new() -> Self {
         Self::default()
@@ -106,6 +130,25 @@ impl SessionManager {
 
     /// Create a new pending session for a client-supplied `client_state`.
     pub fn create(&self, client_state: &str) -> Result<PendingSession, SessionError> {
+        let mut map = self.sessions.lock();
+        Self::purge_expired(&mut map);
+        if map.by_code.len() >= MAX_PENDING_SESSIONS {
+            return Err(SessionError::Exhausted);
+        }
+
+        // The short user code can collide across pending sessions; retry
+        // until it is free (32 bits against ≤4096 sessions terminates
+        // immediately in practice).
+        let user_code = loop {
+            let candidate = random_user_code();
+            if !map
+                .by_user_code
+                .contains_key(&normalize_user_code(&candidate))
+            {
+                break candidate;
+            }
+        };
+
         let session = PendingSession {
             session_code: random_value(),
             client_state: client_state.to_string(),
@@ -114,16 +157,16 @@ impl SessionManager {
             // concatenated 32-char values give 64.
             pkce_verifier: format!("{}{}", random_value(), random_value()),
             nonce: random_value(),
+            user_code,
             created: Instant::now(),
         };
 
-        let mut map = self.sessions.lock();
-        Self::purge_expired(&mut map);
-        if map.by_code.len() >= MAX_PENDING_SESSIONS {
-            return Err(SessionError::Exhausted);
-        }
         map.by_state
             .insert(session.csrf_state.clone(), session.session_code.clone());
+        map.by_user_code.insert(
+            normalize_user_code(&session.user_code),
+            session.session_code.clone(),
+        );
         map.by_code.insert(
             session.session_code.clone(),
             SessionEntry {
@@ -132,6 +175,22 @@ impl SessionManager {
             },
         );
         Ok(session)
+    }
+
+    /// Resolve a still-pending session from a user-typed device code
+    /// (case- and separator-insensitive).
+    pub fn for_user_code(&self, user_code: &str) -> Result<PendingSession, SessionError> {
+        let mut map = self.sessions.lock();
+        Self::purge_expired(&mut map);
+        let code = map
+            .by_user_code
+            .get(&normalize_user_code(user_code))
+            .ok_or(SessionError::NotFound)?;
+        let entry = map.by_code.get(code).ok_or(SessionError::NotFound)?;
+        if entry.outcome.is_some() {
+            return Err(SessionError::AlreadyCompleted);
+        }
+        Ok(entry.session.clone())
     }
 
     /// Resolve the pending session for a callback's `state` parameter.
@@ -200,6 +259,8 @@ impl SessionManager {
             .remove(session_code)
             .ok_or(SessionError::NotFound)?;
         map.by_state.remove(&entry.session.csrf_state);
+        map.by_user_code
+            .remove(&normalize_user_code(&entry.session.user_code));
         match entry.outcome {
             Some(Ok(minted)) => Ok(Some(minted)),
             Some(Err(reason)) => Err(SessionError::LoginFailed(reason)),
@@ -218,6 +279,8 @@ impl SessionManager {
         for code in expired {
             if let Some(entry) = map.by_code.remove(&code) {
                 map.by_state.remove(&entry.session.csrf_state);
+                map.by_user_code
+                    .remove(&normalize_user_code(&entry.session.user_code));
             }
         }
     }
@@ -375,5 +438,38 @@ mod tests {
         assert_ne!(first.csrf_state, second.csrf_state);
         assert_ne!(first.pkce_verifier, second.pkce_verifier);
         assert_ne!(first.nonce, second.nonce);
+        assert_ne!(first.user_code, second.user_code);
+    }
+
+    #[test]
+    fn user_code_resolves_pending_session_insensitively() {
+        let manager = SessionManager::new();
+        let session = manager.create("cs-1").expect("create");
+        assert_eq!(session.user_code.len(), 9, "XXXX-XXXX");
+
+        let typed = session.user_code.to_lowercase().replace('-', "");
+        let found = manager.for_user_code(&typed).expect("lookup");
+        assert_eq!(found.session_code, session.session_code);
+
+        assert_eq!(
+            manager.for_user_code("XXXX-XXXX").unwrap_err(),
+            SessionError::NotFound
+        );
+
+        // A completed session no longer answers to its user code.
+        manager
+            .complete_by_state(&session.csrf_state, Ok(minted()))
+            .expect("complete");
+        assert_eq!(
+            manager.for_user_code(&session.user_code).unwrap_err(),
+            SessionError::AlreadyCompleted
+        );
+        manager
+            .take_if_ready(&session.session_code, "cs-1")
+            .expect("consume");
+        assert_eq!(
+            manager.for_user_code(&session.user_code).unwrap_err(),
+            SessionError::NotFound
+        );
     }
 }

@@ -163,9 +163,13 @@ pub fn create_router(
         .nest("/v1", authenticated_router);
 
     // Server-local auth: the browser login callback endpoints (the login
-    // door — unauthenticated by design).
+    // door — unauthenticated by design), plus the standard OAuth 2.0 / OIDC
+    // endpoints serving the same flows for standards-based clients.
     if let Some(local_auth) = shared_state.local_auth.clone() {
-        router = router.merge(crate::http::auth_login::create_router(local_auth));
+        router = router.merge(crate::http::auth_login::create_router(local_auth.clone()));
+        if let Some(oauth_router) = crate::http::oauth::create_router(local_auth) {
+            router = router.merge(oauth_router);
+        }
     }
 
     if shared_state.presign_config.is_some() {

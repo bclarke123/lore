@@ -59,7 +59,18 @@ impl AccessRole {
         match self {
             AccessRole::Read => &["read"],
             AccessRole::Write => &["read", "write"],
-            AccessRole::Admin => &["read", "write", "admin", "owner", "obliterate", "migrate"],
+            AccessRole::Admin => &[
+                "read",
+                "write",
+                "admin",
+                "owner",
+                "obliterate",
+                "migrate",
+                // Actions from the upstream OIDC proposal's vocabulary (D4):
+                // bypass branch protection, and issue presigned URLs.
+                "push-protected",
+                "presign",
+            ],
         }
     }
 

@@ -213,6 +213,7 @@ mod tests {
             groups: None,
             is_service_account: Some(false),
             idp: "test".to_string(),
+            root_domains: None,
         };
         let key = EncodingKey::from_secret(SIGNING_SECRET.as_ref());
         let mut header = Header::new(ALGORITHM);

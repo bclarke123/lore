@@ -76,6 +76,12 @@ pub struct AuthorizationToken {
     pub groups: Option<Vec<String>>,
     pub is_service_account: Option<bool>,
     pub idp: String,
+    /// Root-domain suffixes the issuer permits this token to be sent to.
+    /// The upstream OIDC proposal (D5) reads the send-check list from this
+    /// claim before falling back to domain-shaped `aud` entries; minted
+    /// tokens carry it so clients keep working when `aud` becomes a URI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_domains: Option<Vec<String>>,
 }
 
 #[derive(Debug, Error)]
@@ -219,6 +225,7 @@ impl JwtVerifier {
                 groups: None,
                 is_service_account: token.is_service_account,
                 idp: String::default(),
+                root_domains: None,
             })
         }
     }
@@ -296,6 +303,7 @@ mod tests {
             expires: 1234,
             user_id: "test".to_string(),
             idp: "test".to_string(),
+            root_domains: None,
             issuer: "test".to_string(),
             name: "test".to_string(),
             preferred_username: "test".to_string(),
@@ -328,6 +336,7 @@ mod tests {
             expires: 1234,
             user_id: "test".to_string(),
             idp: "test".to_string(),
+            root_domains: None,
             issuer: "test".to_string(),
             name: "test".to_string(),
             preferred_username: "test".to_string(),
@@ -802,6 +811,7 @@ mod tests {
                     .add(Duration::from_secs(5))
                     .as_secs(),
                 idp: "the idp".to_string(),
+                root_domains: None,
             }
         }
 

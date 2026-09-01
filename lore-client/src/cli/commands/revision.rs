@@ -305,6 +305,12 @@ pub struct RevisionCherryPickArgs {
     /// Disable auto commits even if no conflicts arise from the cherry-pick.
     #[clap(long, action)]
     no_commit: bool,
+
+    /// Carry this metadata key from the picked revision onto the revision this
+    /// creates. Repeatable. Pass `*` to carry every key that is not reserved
+    /// to the cherry-pick itself. Carries nothing when not given.
+    #[clap(long = "inherit-metadata", value_name = "KEY")]
+    inherit_metadata: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -1559,13 +1565,24 @@ pub fn handle_revision_diff(globals: LoreGlobalArgs, args: &RevisionDiffArgs) ->
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::RevisionDiffFile(data) => {
-                println!(
-                    "{}{}{} {}",
-                    FileActionStyle::from_action(data.action),
-                    data.action_as_string_short(),
-                    anstyle::Reset,
-                    display_path(data.path.as_str())
-                );
+                if data.from_path.is_empty() {
+                    println!(
+                        "{}{}{} {}",
+                        FileActionStyle::from_action(data.action),
+                        data.action_as_string_short(),
+                        anstyle::Reset,
+                        display_path(data.path.as_str())
+                    );
+                } else {
+                    println!(
+                        "{}{}{} {} -> {}",
+                        FileActionStyle::from_action(data.action),
+                        data.action_as_string_short(),
+                        anstyle::Reset,
+                        display_path(data.from_path.as_str()),
+                        display_path(data.path.as_str())
+                    );
+                }
             }
             LoreEvent::Complete(_) => {}
             LoreEvent::Maintenance(data) => {
@@ -1696,6 +1713,9 @@ pub fn handle_revision_cherry_pick(globals: LoreGlobalArgs, args: &RevisionCherr
             revision: LoreString::from(&args.revision),
             message: LoreString::from(&args.message),
             no_commit: args.no_commit as u8,
+            inherit_metadata: LoreArray::from_vec(util::convert_to_lore_string_vec(
+                &args.inherit_metadata,
+            )),
         };
 
         let debug = progress_debug();

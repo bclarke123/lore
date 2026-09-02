@@ -235,6 +235,11 @@ pub struct AuthSettings {
     /// with server-local auth.
     #[serde(default)]
     pub server_admins: Vec<String>,
+    /// Machine identities for the OAuth 2.0 `client_credentials` grant
+    /// (CI, services). Each authenticates as `client:<client_id>` and
+    /// holds only the grants given to that principal. Requires `token`.
+    #[serde(default)]
+    pub clients: Vec<crate::auth::local_auth::ClientCredentialSettings>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

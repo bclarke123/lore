@@ -93,6 +93,19 @@ standard OAuth 2.0 / OIDC endpoints, discoverable at
   token to per-repository resources (RFC 8707 `resource` indicators or the
   legacy `urc-<id>` form) and for exchanging a trusted external OIDC ID
   token (`subject_token_type` `urn:ietf:params:oauth:token-type:id_token`);
+- the `client_credentials` grant at `/auth/token`, for machine identities
+  (CI, services) registered in the server config:
+
+  ```toml
+  [[server.auth.clients]]
+  client_id = "ci-builder"
+  secret_path = "/etc/lore/ci-builder-secret"   # or inline: secret = "..."
+  name = "CI Builder"
+  ```
+
+  The machine authenticates as the principal `client:ci-builder` and holds
+  only the grants given to it (`lore access grant client:ci-builder ...`);
+  no refresh token is issued — the client re-requests with its credentials;
 - the signing keys at `/auth/.well-known/jwks.json`.
 
 Any standard OAuth client or tooling can drive these; existing Lore

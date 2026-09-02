@@ -52,6 +52,7 @@ use crate::auth::session::SESSION_TTL;
 use crate::auth::session::SessionError;
 
 const GRANT_TYPE_DEVICE_CODE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+const GRANT_TYPE_CLIENT_CREDENTIALS: &str = "client_credentials";
 const GRANT_TYPE_REFRESH_TOKEN: &str = "refresh_token";
 const GRANT_TYPE_TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const TOKEN_TYPE_ACCESS_TOKEN: &str = "urn:ietf:params:oauth:token-type:access_token";
@@ -151,6 +152,7 @@ async fn discovery(State(state): State<OAuthState>) -> Response {
             "jwks_uri": state.jwks_uri,
             "grant_types_supported": [
                 GRANT_TYPE_DEVICE_CODE,
+                GRANT_TYPE_CLIENT_CREDENTIALS,
                 GRANT_TYPE_REFRESH_TOKEN,
                 GRANT_TYPE_TOKEN_EXCHANGE,
             ],
@@ -253,6 +255,7 @@ async fn token(State(state): State<OAuthState>, body: axum::body::Bytes) -> Resp
     let form = parse_form(&body);
     match single(&form, "grant_type") {
         Some(GRANT_TYPE_DEVICE_CODE) => device_code_grant(&state, &form).await,
+        Some(GRANT_TYPE_CLIENT_CREDENTIALS) => client_credentials_grant(&state, &form),
         Some(GRANT_TYPE_REFRESH_TOKEN) => refresh_grant(&state, &form).await,
         Some(GRANT_TYPE_TOKEN_EXCHANGE) => token_exchange_grant(&state, &form).await,
         Some(other) => oauth_error(
@@ -303,6 +306,37 @@ async fn device_code_grant(state: &OAuthState, form: &Form) -> Response {
             oauth_error(StatusCode::BAD_REQUEST, "access_denied", &reason)
         }
         Err(other) => internal_error(&other),
+    }
+}
+
+/// RFC 6749 §4.4: a registered machine identity authenticates as itself.
+/// No user, no session, and no refresh token — the client re-requests
+/// with its credentials whenever the short-lived token expires. Grants are
+/// held by the `client:<client_id>` principal like any other.
+fn client_credentials_grant(state: &OAuthState, form: &Form) -> Response {
+    let (Some(client_id), Some(client_secret)) =
+        (single(form, "client_id"), single(form, "client_secret"))
+    else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "client_id and client_secret are required",
+        );
+    };
+    let Some(identity) = state.auth.verify_client(client_id, client_secret) else {
+        // One message for unknown client and wrong secret alike.
+        return oauth_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            "client authentication failed",
+        );
+    };
+    match state.auth.minter.mint_user_token(&identity) {
+        Ok(minted) => {
+            info!(user_id = minted.user_id, "Client credentials grant");
+            token_response(minted, None)
+        }
+        Err(error) => internal_error(&error),
     }
 }
 
@@ -735,6 +769,71 @@ mod tests {
         let (status, body) = get(&router, "/auth/device?user_code=XXXX-XXXX").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("unknown or has expired"));
+    }
+
+    #[tokio::test]
+    async fn client_credentials_grant_mints_a_machine_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut settings = crate::auth::local_auth::tests::test_auth_settings(dir.path());
+        settings
+            .clients
+            .push(crate::auth::local_auth::ClientCredentialSettings {
+                client_id: "ci-builder".to_string(),
+                secret_path: None,
+                secret: Some("machine-s3cret".to_string()),
+                name: Some("CI Builder".to_string()),
+            });
+        let auth = Arc::new(
+            LocalAuth::from_settings(Some(&settings))
+                .expect("build")
+                .expect("enabled"),
+        );
+        let router = create_router(auth.clone()).expect("oauth router");
+
+        let (status, body) = post_form(
+            &router,
+            "/auth/token",
+            "grant_type=client_credentials&client_id=ci-builder&client_secret=machine-s3cret",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let response = json(&body);
+        assert_eq!(response["token_type"], "Bearer");
+        // No refresh token: the client re-authenticates with its secret.
+        assert!(response.get("refresh_token").is_none());
+        let claims = auth
+            .verifier
+            .verify_token(response["access_token"].as_str().expect("token"))
+            .await
+            .expect("verify");
+        assert_eq!(claims.user_id, "client:ci-builder");
+        assert_eq!(claims.name, "CI Builder");
+
+        // Wrong secret and unknown client answer identically.
+        for form in [
+            "grant_type=client_credentials&client_id=ci-builder&client_secret=wrong",
+            "grant_type=client_credentials&client_id=nobody&client_secret=machine-s3cret",
+        ] {
+            let (status, body) = post_form(&router, "/auth/token", form).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(json(&body)["error"], "invalid_client");
+        }
+
+        // Missing credentials are a malformed request.
+        let (status, body) =
+            post_form(&router, "/auth/token", "grant_type=client_credentials").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json(&body)["error"], "invalid_request");
+
+        // Discovery advertises the grant.
+        let (_, body) = get(&router, "/.well-known/openid-configuration").await;
+        assert!(
+            json(&body)["grant_types_supported"]
+                .as_array()
+                .expect("grants")
+                .iter()
+                .any(|g| g == GRANT_TYPE_CLIENT_CREDENTIALS)
+        );
     }
 
     #[tokio::test]

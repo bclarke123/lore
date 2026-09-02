@@ -27,6 +27,7 @@ pytestmark = pytest.mark.xdist_group("oauth_server")
 
 USER = "alice"
 SECRET = "s3cret-for-tests"
+CLIENT_SECRET = "machine-s3cret-for-tests"
 
 GRANT_DEVICE = "urn:ietf:params:oauth:grant-type:device_code"
 GRANT_REFRESH = "refresh_token"
@@ -59,6 +60,11 @@ user = "{user}"
 secret = "{secret}"
 name = "Alice Example"
 email = "alice@example.com"
+
+[[server.auth.clients]]
+client_id = "ci-builder"
+secret = "{client_secret}"
+name = "CI Builder"
 """
 
 
@@ -82,6 +88,7 @@ def oauth_server(request, tmp_path_factory):
                 http_port=ports["http"],
                 user=USER,
                 secret=SECRET,
+                client_secret=CLIENT_SECRET,
             )
         )
 
@@ -270,6 +277,50 @@ def test_token_exchange_scopes_to_granted_resources(oauth_server):
         },
     )
     assert status == 400 and invalid["error"] == "invalid_target"
+
+
+def test_client_credentials_grant(oauth_server):
+    # A registered machine authenticates as itself: no browser, no refresh
+    # token, short-lived access token for the client:<id> principal.
+    status, token = http_post_form(
+        f"{oauth_server['http']}/auth/token",
+        {
+            "grant_type": "client_credentials",
+            "client_id": "ci-builder",
+            "client_secret": CLIENT_SECRET,
+        },
+    )
+    assert status == 200, token
+    assert token["token_type"] == "Bearer"
+    assert "refresh_token" not in token
+
+    from test_auth_login import decode_jwt_claims
+
+    claims = decode_jwt_claims(token["access_token"])
+    assert claims["sub"] == "client:ci-builder"
+
+    # Deny-by-default: the machine holds no repository grants yet.
+    status, denied = http_post_form(
+        f"{oauth_server['http']}/auth/token",
+        {
+            "grant_type": GRANT_EXCHANGE,
+            "subject_token": token["access_token"],
+            "subject_token_type": TOKEN_TYPE_ACCESS,
+            "resource": f"urc-{FOREIGN_HEX}",
+        },
+    )
+    assert status == 403 and denied["error"] == "access_denied", denied
+
+    # A wrong secret is refused with the standard error.
+    status, refused = http_post_form(
+        f"{oauth_server['http']}/auth/token",
+        {
+            "grant_type": "client_credentials",
+            "client_id": "ci-builder",
+            "client_secret": "wrong",
+        },
+    )
+    assert status == 401 and refused["error"] == "invalid_client"
 
 
 def test_unknown_grant_type_is_rejected(oauth_server):

@@ -847,15 +847,12 @@ mod tests {
             .expect("enabled");
         let mut config = test_support::config();
         config.trusted_external_audiences = vec!["lorehub-client-id".to_string()];
-        let auth = Arc::new(LocalAuth {
-            provider: Arc::new(crate::auth::provider::oidc::OidcProvider::new(
+        let auth = Arc::new(base.with_provider(Arc::new(
+            crate::auth::provider::oidc::OidcProvider::new(
                 config,
                 Arc::new(test_support::MockBackend::new()),
-            )),
-            minter: base.minter.clone(),
-            sessions: base.sessions.clone(),
-            verifier: base.verifier.clone(),
-        });
+            ),
+        )));
         let service = LoreAuthService::new(auth.clone());
 
         // A hub-obtained ID token: aud = hub client id, no nonce.

@@ -23,6 +23,7 @@ use crate::auth::minting::TokenMinter;
 use crate::auth::provider::AuthProvider;
 use crate::auth::provider::AuthProviderError;
 use crate::auth::provider::CallbackParams;
+use crate::auth::provider::ExternalIdentity;
 use crate::auth::provider::google::OidcProviderSettings;
 use crate::auth::provider::google::OidcSettingsError;
 use crate::auth::provider::google::generic_oidc_provider;
@@ -50,10 +51,41 @@ pub struct AuthProviderSettings {
     pub oidc: Option<OidcProviderSettings>,
 }
 
+/// One machine identity for the OAuth 2.0 `client_credentials` grant.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ClientCredentialSettings {
+    /// The `client_id` the machine presents; it authenticates as the
+    /// principal `client:<client_id>`, which grants are assigned to like
+    /// any other principal.
+    pub client_id: String,
+    /// Path to a file holding the client secret (preferred in production;
+    /// keep the file private).
+    pub secret_path: Option<String>,
+    /// Inline client secret, for development and tests.
+    pub secret: Option<String>,
+    /// Optional display name recorded as the token's `name` claim.
+    pub name: Option<String>,
+}
+
+/// A resolved machine credential: settings with the secret loaded.
+#[derive(Clone)]
+struct ClientCredential {
+    client_id: String,
+    secret: String,
+    name: Option<String>,
+}
+
+/// The `idp` component of machine principals (`client:<client_id>`).
+pub const CLIENT_IDP: &str = "client";
+
 #[derive(Debug, Error)]
 pub enum LocalAuthError {
     #[error("auth.provider requires auth.token (token minting) to be configured")]
     MissingTokenSettings,
+    #[error("auth.clients requires auth.token (token minting) to be configured")]
+    ClientsRequireTokenSettings,
+    #[error("Invalid [server.auth.clients] entry: {0}")]
+    InvalidClientCredential(String),
     #[error("auth.token requires auth.provider to be configured")]
     MissingProviderSettings,
     #[error("auth.jwk (external JWKS) and auth.token (local minting) are mutually exclusive")]
@@ -80,6 +112,8 @@ pub struct LocalAuth {
     pub minter: Arc<TokenMinter>,
     pub sessions: Arc<SessionManager>,
     pub verifier: JwtVerifier,
+    /// Machine credentials for the `client_credentials` grant.
+    clients: Vec<ClientCredential>,
 }
 
 impl LocalAuth {
@@ -89,7 +123,8 @@ impl LocalAuth {
         let Some(auth) = auth else { return Ok(None) };
 
         match (auth.provider.as_ref(), auth.token.as_ref()) {
-            (None, None) => return Ok(None),
+            (None, None) if auth.clients.is_empty() => return Ok(None),
+            (None, None) => return Err(LocalAuthError::ClientsRequireTokenSettings),
             (Some(_), None) => return Err(LocalAuthError::MissingTokenSettings),
             (None, Some(_)) => return Err(LocalAuthError::MissingProviderSettings),
             (Some(_), Some(_)) => {}
@@ -134,7 +169,78 @@ impl LocalAuth {
             minter: Arc::new(minter),
             sessions: Arc::new(SessionManager::new()),
             verifier,
+            clients: Self::resolve_clients(&auth.clients)?,
         }))
+    }
+
+    fn resolve_clients(
+        settings: &[ClientCredentialSettings],
+    ) -> Result<Vec<ClientCredential>, LocalAuthError> {
+        let mut clients: Vec<ClientCredential> = Vec::with_capacity(settings.len());
+        for entry in settings {
+            if entry.client_id.is_empty() {
+                return Err(LocalAuthError::InvalidClientCredential(
+                    "client_id must not be empty".to_string(),
+                ));
+            }
+            if clients.iter().any(|c| c.client_id == entry.client_id) {
+                return Err(LocalAuthError::InvalidClientCredential(format!(
+                    "duplicate client_id '{}'",
+                    entry.client_id
+                )));
+            }
+            let secret = match (entry.secret_path.as_deref(), entry.secret.as_deref()) {
+                (Some(path), None) => std::fs::read_to_string(path)
+                    .map_err(|e| {
+                        LocalAuthError::InvalidClientCredential(format!(
+                            "client '{}': failed to read secret_path {path}: {e}",
+                            entry.client_id
+                        ))
+                    })?
+                    .trim()
+                    .to_string(),
+                (None, Some(secret)) => secret.to_string(),
+                _ => {
+                    return Err(LocalAuthError::InvalidClientCredential(format!(
+                        "client '{}': set exactly one of secret_path and secret",
+                        entry.client_id
+                    )));
+                }
+            };
+            if secret.is_empty() {
+                return Err(LocalAuthError::InvalidClientCredential(format!(
+                    "client '{}': secret is empty",
+                    entry.client_id
+                )));
+            }
+            clients.push(ClientCredential {
+                client_id: entry.client_id.clone(),
+                secret,
+                name: entry.name.clone(),
+            });
+        }
+        Ok(clients)
+    }
+
+    /// Verify a `client_credentials` grant. Returns the machine identity
+    /// (`client:<client_id>`) on a matching id and secret, `None`
+    /// otherwise — the caller must not distinguish an unknown client from
+    /// a wrong secret.
+    pub fn verify_client(&self, client_id: &str, client_secret: &str) -> Option<ExternalIdentity> {
+        let client = self.clients.iter().find(|c| c.client_id == client_id)?;
+        // Compare digests rather than the secrets themselves: a plain
+        // comparison's early exit would leak the matching prefix length,
+        // while digest bytes are unpredictable to the caller.
+        let digest = |value: &str| ring::digest::digest(&ring::digest::SHA256, value.as_bytes());
+        if digest(&client.secret).as_ref() != digest(client_secret).as_ref() {
+            return None;
+        }
+        Some(ExternalIdentity {
+            subject: client.client_id.clone(),
+            email: None,
+            display_name: client.name.clone(),
+            idp: CLIENT_IDP.to_string(),
+        })
     }
 
     fn build_provider(
@@ -182,6 +288,18 @@ impl LocalAuth {
             .join("/auth/callback")
             .map_err(|e| LocalAuthError::InvalidCallbackBase(e.to_string()))?;
         Ok(callback.to_string())
+    }
+
+    /// Rebuild with a different identity provider, sharing everything
+    /// else. For tests that swap in a mock provider backend.
+    pub fn with_provider(&self, provider: Arc<dyn AuthProvider>) -> Self {
+        Self {
+            provider,
+            minter: self.minter.clone(),
+            sessions: self.sessions.clone(),
+            verifier: self.verifier.clone(),
+            clients: self.clients.clone(),
+        }
     }
 
     /// Complete a browser login: resolve the pending session for the
@@ -278,6 +396,7 @@ pub(crate) mod tests {
                 oidc: None,
             }),
             server_admins: Vec::new(),
+            clients: Vec::new(),
         }
     }
 
@@ -300,6 +419,7 @@ pub(crate) mod tests {
             token: None,
             provider: None,
             server_admins: Vec::new(),
+            clients: Vec::new(),
         };
         assert!(
             LocalAuth::from_settings(Some(&bare))
@@ -391,6 +511,75 @@ pub(crate) mod tests {
             .expect("build")
             .expect("enabled");
         assert_eq!(auth.provider.name(), "google");
+    }
+
+    fn client(
+        id: &str,
+        secret: Option<&str>,
+        secret_path: Option<&str>,
+    ) -> ClientCredentialSettings {
+        ClientCredentialSettings {
+            client_id: id.to_string(),
+            secret_path: secret_path.map(str::to_string),
+            secret: secret.map(str::to_string),
+            name: Some("CI".to_string()),
+        }
+    }
+
+    #[test]
+    fn client_credentials_verify_and_validation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut settings = test_auth_settings(dir.path());
+        let secret_file = dir.path().join("ci-secret");
+        std::fs::write(&secret_file, "from-file\n").expect("write");
+        settings.clients = vec![
+            client("ci-inline", Some("s3cret"), None),
+            client("ci-file", None, Some(&secret_file.to_string_lossy())),
+        ];
+        let auth = LocalAuth::from_settings(Some(&settings))
+            .expect("build")
+            .expect("enabled");
+
+        let identity = auth.verify_client("ci-inline", "s3cret").expect("verify");
+        assert_eq!(identity.user_id(), "client:ci-inline");
+        assert_eq!(identity.idp, CLIENT_IDP);
+        // File secrets are trimmed of the trailing newline.
+        assert!(auth.verify_client("ci-file", "from-file").is_some());
+
+        assert!(auth.verify_client("ci-inline", "wrong").is_none());
+        assert!(auth.verify_client("unknown", "s3cret").is_none());
+
+        // Validation failures.
+        let reject = |clients: Vec<ClientCredentialSettings>| {
+            let mut bad = test_auth_settings(dir.path());
+            bad.clients = clients;
+            assert!(matches!(
+                LocalAuth::from_settings(Some(&bad)),
+                Err(LocalAuthError::InvalidClientCredential(_))
+            ));
+        };
+        reject(vec![client("ci", None, None)]);
+        reject(vec![client(
+            "ci",
+            Some("both"),
+            Some(&secret_file.to_string_lossy()),
+        )]);
+        reject(vec![client("", Some("s3cret"), None)]);
+        reject(vec![client("ci", Some(""), None)]);
+        reject(vec![
+            client("ci", Some("a"), None),
+            client("ci", Some("b"), None),
+        ]);
+
+        // Clients without token minting is a startup error, not a no-op.
+        let mut clients_only = test_auth_settings(dir.path());
+        clients_only.token = None;
+        clients_only.provider = None;
+        clients_only.clients = vec![client("ci", Some("s3cret"), None)];
+        assert!(matches!(
+            LocalAuth::from_settings(Some(&clients_only)),
+            Err(LocalAuthError::ClientsRequireTokenSettings)
+        ));
     }
 
     #[tokio::test]

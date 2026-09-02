@@ -47,6 +47,7 @@ pub mod copy;
 pub mod flush;
 pub mod get;
 pub mod get_file;
+pub mod get_file_resolved;
 pub mod get_metadata;
 pub mod get_resolved;
 pub mod handle;
@@ -58,6 +59,7 @@ pub mod obliterate;
 pub mod open;
 pub mod put;
 pub mod put_file;
+pub mod put_file_resolved;
 pub mod put_resolved;
 pub(crate) mod remote;
 pub(crate) mod store;
@@ -100,7 +102,9 @@ pub async fn close_all_handles() {
 /// IPC buffer-bearing args policy: `lore_storage_put` and `lore_storage_put_resolved` carry a
 /// `LoreBytes` view into caller memory in their *args*, which has no natural cross-process
 /// representation. `LoreBytes::deserialize` always errors, so those args cannot be reconstructed
-/// on the server side of the IPC boundary.
+/// on the server side of the IPC boundary. `lore_storage_put_file` and
+/// `lore_storage_put_file_resolved` name a path instead, so they carry across it unchanged and are
+/// the delegable way to write content a service holds on disk.
 ///
 /// Two caveats worth knowing before relying on this. Nothing enforces it: every op goes through
 /// `dispatch_call` and is delegated whenever service mode is active, and the failure surfaces as
@@ -165,9 +169,10 @@ pub(crate) fn item_content_range(offset: u64, length: u64) -> Option<std::ops::R
 
 /// What writing one item produced, in the shape `PUT_ITEM_COMPLETE` reports it.
 ///
-/// Shared by `put`, `put_file` and `put_resolved`: each resolves an item to exactly this and then
-/// emits one `LoreStoragePutItemCompleteEventData` from it. One type rather than three identical
-/// tuples, so a field cannot be read out of position and a new field lands in every op at once.
+/// Shared by `put`, `put_file`, `put_resolved` and `put_file_resolved`: each resolves an item to
+/// exactly this and then emits one `LoreStoragePutItemCompleteEventData` from it. One type rather
+/// than four identical tuples, so a field cannot be read out of position and a new field lands in
+/// every op at once.
 pub(crate) struct PutItemOutcome {
     /// Address the content is stored under, or `Address::default()` when nothing was stored.
     pub(crate) address: Address,
@@ -211,13 +216,13 @@ impl PutItemOutcome {
 
 /// Map a `StorageError` to the external `LoreErrorCode` surface used by per-item completion
 /// events. Shared by every op that goes through the higher-level storage pipeline so the
-/// translation stays consistent. `SlowDown` surfaces back-pressure; oversized writes are
-/// caller-fixable and reported as `InvalidArguments`; an address lookup miss maps to
-/// `AddressNotFound`; everything else is `Internal`.
+/// translation stays consistent. `SlowDown` surfaces back-pressure; a rejected argument and an
+/// oversized write are both caller-fixable and reported as `InvalidArguments`; an address lookup
+/// miss maps to `AddressNotFound`; everything else is `Internal`.
 pub(crate) fn storage_error_to_code(err: &StorageError) -> LoreErrorCode {
     if err.is_slow_down() {
         LoreErrorCode::SlowDown
-    } else if err.is_oversized() {
+    } else if err.is_invalid_arguments() || err.is_oversized() {
         LoreErrorCode::InvalidArguments
     } else if err.is_address_not_found() || err.is_payload_not_found() {
         LoreErrorCode::AddressNotFound

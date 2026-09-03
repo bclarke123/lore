@@ -726,9 +726,15 @@ async fn verify_fragments(
     // Query batches in flight at once. Each one is a store round trip holding its
     // addresses and, on a remote store, an HTTP request with its buffers; spawning
     // every batch of a large push at once made server memory and CPU scale with the
-    // push size. Batches that answered SlowDown wait for the retry back-off together
+    // push size. The budget scales with the host, since what a batch costs is CPU and
+    // memory. Batches that answered SlowDown wait for the retry back-off together
     // rather than being reissued straight away.
-    const MAX_QUERY_BATCHES_IN_FLIGHT: usize = 16;
+    const QUERY_BATCHES_IN_FLIGHT_PER_CPU: usize = 8;
+    const MIN_QUERY_BATCHES_IN_FLIGHT: usize = 16;
+    const MAX_QUERY_BATCHES_IN_FLIGHT: usize = 128;
+    let max_batches_in_flight = (std::thread::available_parallelism().map_or(1, |n| n.get())
+        * QUERY_BATCHES_IN_FLIGHT_PER_CPU)
+        .clamp(MIN_QUERY_BATCHES_IN_FLIGHT, MAX_QUERY_BATCHES_IN_FLIGHT);
 
     let mut tasks = JoinSet::new();
     let mut slowed_down: Vec<Address> = Vec::new();
@@ -742,7 +748,7 @@ async fn verify_fragments(
         );
 
         batch_span.in_scope(|| {
-            while !new_fragments.is_empty() && tasks.len() < MAX_QUERY_BATCHES_IN_FLIGHT {
+            while !new_fragments.is_empty() && tasks.len() < max_batches_in_flight {
                 let repository = repository.clone();
                 let batch =
                     new_fragments.split_off(new_fragments.len().saturating_sub(max_batch_size));

@@ -9419,6 +9419,20 @@ async fn collect_new_node_metadata_fragments(
     Ok(addresses)
 }
 
+/// Immutable-store lookups `collect_new_addresses` may have in flight at once, shared by
+/// every level of its recursion. Each `JoinSet` caps only its own tasks, and the recursion
+/// nests one set per fragmented file, so without a shared budget a large push fans out to
+/// thousands of concurrent store requests — on a remote store, thousands of in-flight HTTP
+/// requests with their buffers, which is what makes server memory and CPU scale with push
+/// size. Lookups are latency-bound, so this many keeps the store busy without the pile-up.
+const MAX_STORE_LOOKUPS_IN_FLIGHT: usize = 128;
+
+static STORE_LOOKUP_LIMITER: OnceLock<Semaphore> = OnceLock::new();
+
+fn store_lookup_limiter() -> &'static Semaphore {
+    STORE_LOOKUP_LIMITER.get_or_init(|| Semaphore::new(MAX_STORE_LOOKUPS_IN_FLIGHT))
+}
+
 async fn collect_new_addresses(
     repository: Arc<RepositoryContext>,
     addresses: &[Address],
@@ -9437,20 +9451,31 @@ async fn collect_new_addresses(
         let repository = repository.clone();
         lore_spawn!(task, {
             async move {
-                if let Ok(query) = repository
+                // The permit covers the store reads only. It must be released before
+                // recursing: a parent holding a permit while waiting on children that
+                // need one would deadlock the shared budget.
+                let permit = store_lookup_limiter().acquire().await.ok();
+                let query = repository
                     .immutable_store()
                     .get_metadata(repository.id, address)
-                    .await
-                {
+                    .await;
+                if let Ok(query) = query {
                     let mut addresses = vec![];
-                    if query.fragment.flags & FragmentFlags::PayloadFragmented != 0
-                        && let Ok((_fragment, buffer)) = immutable::load_raw(
-                            repository.clone(),
-                            address,
-                            immutable::read_options_from_repository(&repository),
-                        )
-                        .await
-                    {
+                    let fragment_list =
+                        if query.fragment.flags & FragmentFlags::PayloadFragmented != 0 {
+                            immutable::load_raw(
+                                repository.clone(),
+                                address,
+                                immutable::read_options_from_repository(&repository),
+                            )
+                            .await
+                            .ok()
+                        } else {
+                            None
+                        };
+                    drop(permit);
+
+                    if let Some((_fragment, buffer)) = fragment_list {
                         let buffer = buffer.to_aligned::<FragmentReference>();
                         let mut subaddress =
                             Vec::with_capacity(buffer.count::<FragmentReference>());

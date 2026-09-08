@@ -807,7 +807,7 @@ mod tests {
             .await
             .expect("verify");
         assert_eq!(claims.user_id, "client:ci-builder");
-        assert_eq!(claims.name, "CI Builder");
+        assert_eq!(claims.name.as_deref(), Some("CI Builder"));
 
         // Wrong secret and unknown client answer identically.
         for form in [

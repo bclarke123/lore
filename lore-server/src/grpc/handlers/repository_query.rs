@@ -23,6 +23,7 @@ use tracing::warn;
 
 use crate::authnz::repository_authorizer::AuthClientAuthorizer;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
@@ -63,6 +64,7 @@ pub async fn handler(
                     let id: RepositoryId = Context::from(id).into();
                     repository_query_id(repository.clone(), id, auth_url, authorization)
                         .await
+                        .filter_slow_down()?
                         .map_err(|err| {
                             warn!("Repository ID {id} not known: {err}",);
                             Status::not_found(err.to_string())
@@ -75,6 +77,7 @@ pub async fn handler(
                     authorization,
                 )
                 .await
+                .filter_slow_down()?
                 .map_err(|err| {
                     warn!("Repository name {name} not known: {err}");
                     Status::not_found(err.to_string())
@@ -134,6 +137,8 @@ pub async fn repository_query_id(
                 "Repairing missing name -> ID mapping: {} -> {}",
                 metadata.name, id
             );
+            // no filter_slow_down()? usage here: repairing the name mapping is
+            // best-effort, and the repository has already been resolved.
             let _ = repository::store_name_to_id(repository.clone(), &metadata.name, id)
                 .await
                 .inspect_err(|err| warn!("Failed to repair name -> ID mapping: {err}"));

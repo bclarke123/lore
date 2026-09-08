@@ -151,6 +151,9 @@ class LinkNotFoundError(LoreException): ...
 class LinkPinDivergedError(LoreException): ...
 
 
+class OverlappingLinkError(LoreException): ...
+
+
 class NotALayerError(LoreException): ...
 
 
@@ -172,6 +175,9 @@ class NotSupportedError(LoreException):
     """Raised when an operation is not supported in the current environment,
     e.g. an auth command run against a server with no auth endpoint
     configured."""
+
+
+class SwfsOutsideServiceError(LoreException): ...
 
 
 ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
@@ -231,12 +237,17 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("Path is not a link", NotALinkError),
     ("Link not found", LinkNotFoundError),
     ("Link pin conflict at", LinkPinDivergedError),
+    ("overlaps the link already mounted at", OverlappingLinkError),
     ("Path is not a layer", NotALayerError),
     ("Failed to connect to remote URL", BadSharedStoreRemoteUrl),
     ("Local modifications prevent synchronization", LocalModificationsError),
     ("No commit identity configured", MissingIdentityError),
     ("Operation not supported", NotSupportedError),
     ("Not authenticated", NotAuthenticatedError),
+    (
+        "Attempting to create an SWFS instance outside the service",
+        SwfsOutsideServiceError,
+    ),
 ]
 
 

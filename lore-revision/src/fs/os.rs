@@ -15,6 +15,7 @@ use lore_base::types::Hash;
 use lore_error_set::prelude::*;
 
 use super::filesystem_provider::FileInfo;
+use super::filesystem_provider::FilesystemDiffContext;
 use super::filesystem_provider::FilesystemPath;
 use super::filesystem_provider::FilesystemProvider;
 use super::filesystem_provider::FsError;
@@ -22,36 +23,33 @@ use super::filesystem_provider::InstanceOperation;
 use super::filesystem_provider::InstanceOperationImpl;
 use super::filesystem_provider::StaticDispatchInstanceOperation;
 use crate::change::NodeChange;
-use crate::filter::FilterMode;
 use crate::immutable;
 use crate::merge::MergeTextMode;
 use crate::merge::merge3_text_by_path;
 use crate::node::Node;
-use crate::node::NodeID;
 use crate::repository::RepositoryContext;
 use crate::state::FilesystemDiffStats;
 use crate::state::NodeComparison;
-use crate::state::State;
 use crate::util;
 use crate::util::path::RelativePath;
 
 /// OS-backed filesystem provider.
 pub struct OsFilesystem {
-    repo_path: PathBuf,
+    filesystem_root: PathBuf,
 }
 
 impl OsFilesystem {
     /// Create a new OS-backed filesystem provider.
-    pub fn new(repo_path: impl AsRef<Path>) -> Self {
+    pub fn new(filesystem_root: impl AsRef<Path>) -> Self {
         Self {
-            repo_path: repo_path.as_ref().to_path_buf(),
+            filesystem_root: filesystem_root.as_ref().to_path_buf(),
         }
     }
 
     fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError> {
         Ok(Arc::new(InstanceOperationImpl::new(
             StaticDispatchInstanceOperation::Os(OsOperation {
-                repo_path: self.repo_path.clone(),
+                filesystem_root: self.filesystem_root.clone(),
             }),
         )))
     }
@@ -66,44 +64,38 @@ impl FilesystemProvider for OsFilesystem {
 
 /// OS-backed filesystem operation context.
 pub struct OsOperation {
-    repo_path: PathBuf,
+    /// Where the mounted filesystem starts, which every repository in it shares: a link
+    /// or layer context inherits its parent's path, so this is not a repository's root.
+    filesystem_root: PathBuf,
 }
 
 /// All operations delegate to the regular OS file system.
 impl InstanceOperation for OsOperation {
     async fn changes_from_filesystem_to_state(
         &self,
-        repository_from: Arc<RepositoryContext>,
-        state_from: Arc<State>,
-        repository_current: Arc<RepositoryContext>,
-        state_current: Arc<State>,
-        node_path: RelativePath,
-        root_node_from: NodeID,
-        root_node_to: NodeID,
-        filter_mode: FilterMode,
-    ) -> Result<(Vec<NodeChange>, FilesystemDiffStats), FsError> {
-        crate::state::diff_filesystem_subtree(
-            repository_from,
-            state_from,
-            repository_current,
-            state_current,
-            node_path,
-            root_node_from,
-            root_node_to,
-            filter_mode,
-            std::sync::Arc::new(Vec::new()),
-        )
-        .await
-        .forward_any::<FsError>("Failed to diff filesystem")
+        diff: FilesystemDiffContext,
+        changes: &mut Vec<NodeChange>,
+    ) -> Result<FilesystemDiffStats, FsError> {
+        crate::state::diff_os_filesystem(diff, changes)
+            .await
+            .forward_any::<FsError>("Failed to diff filesystem")
     }
 
+    /// A path mid-deletion stats as `PermissionDenied` on Windows rather than
+    /// `NotFound`, so both report a non-existent path.
     async fn file_info(&self, path: FilesystemPath<'_>) -> Result<FileInfo, FsError> {
         match lore_io::IoDriver::global()
             .metadata(path.as_absolute_path())
             .await
         {
-            Ok(metadata) => Ok(FileInfo::from_metadata(metadata)),
+            Ok(metadata) => Ok(FileInfo::from_metadata(&metadata)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileInfo::default()),
+            Err(e)
+                if cfg!(target_family = "windows")
+                    && e.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                Ok(FileInfo::default())
+            }
             Err(e) => Err(e.into()),
         }
     }
@@ -231,7 +223,7 @@ impl InstanceOperation for OsOperation {
         )
         .await
         .forward_any::<FsError>("Failed to read file")?;
-        Ok((fragment, metadata.map(FileInfo::from_metadata)))
+        Ok((fragment, metadata.as_ref().map(FileInfo::from_metadata)))
     }
 
     async fn copy_to_scratch_file(
@@ -253,7 +245,7 @@ impl InstanceOperation for OsOperation {
         result: &RelativePath,
         mode: MergeTextMode<'_>,
     ) -> Result<bool, FsError> {
-        Ok(merge3_text_by_path(&self.repo_path, base, mine, theirs, result, mode).await?)
+        Ok(merge3_text_by_path(&self.filesystem_root, base, mine, theirs, result, mode).await?)
     }
 
     async fn infer_is_diffable(&self, path: FilesystemPath<'_>) -> Result<bool, FsError> {

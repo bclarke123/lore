@@ -18,26 +18,6 @@ use tracing::warn;
 use super::jwk::JWKServiceError;
 use crate::auth::jwk::JWKService;
 
-#[serde_as]
-#[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
-pub struct JWTUserInfo {
-    #[serde(rename = "sub")]
-    pub user_id: String,
-    #[serde(rename = "iss")]
-    pub issuer: String,
-    #[serde(rename = "iat")]
-    pub issued_at: u64,
-    #[serde_as(as = "OneOrMany<_, PreferMany>")]
-    #[serde(rename = "aud")]
-    pub audience: Vec<String>,
-    pub env: String,
-    pub name: String,
-    pub preferred_username: String,
-    pub is_service_account: Option<bool>,
-    #[serde(rename = "exp")]
-    pub expires: u64,
-}
-
 /// From Lore protos, but cannot derive deserialize on external type
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
 pub struct ResourcePermission {
@@ -55,6 +35,7 @@ impl ResourcePermission {
     }
 }
 
+/// The required set is `iss`, `sub`, `aud`, `exp`, `iat`.
 #[serde_as]
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq, Default)]
 pub struct AuthorizationToken {
@@ -69,19 +50,62 @@ pub struct AuthorizationToken {
     #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(rename = "aud")]
     pub audience: Vec<String>,
-    pub env: String,
-    pub name: String,
-    pub preferred_username: String,
+    pub env: Option<String>,
+    pub name: Option<String>,
+    pub preferred_username: Option<String>,
+    pub client_id: Option<String>,
     pub resources: Option<Vec<ResourcePermission>>,
     pub groups: Option<Vec<String>>,
     pub is_service_account: Option<bool>,
-    pub idp: String,
+    pub idp: Option<String>,
     /// Root-domain suffixes the issuer permits this token to be sent to.
     /// The upstream OIDC proposal (D5) reads the send-check list from this
     /// claim before falling back to domain-shaped `aud` entries; minted
     /// tokens carry it so clients keep working when `aud` becomes a URI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_domains: Option<Vec<String>>,
+    /// Every claim the named fields do not consume, kept so configurable
+    /// claim paths (`permission_claim = "realm_access.roles"`) can reach
+    /// claims this struct does not name.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl AuthorizationToken {
+    /// Resolve a dotted claim path (`realm_access.roles`) against the named
+    /// fields first and then [`extra`](Self::extra). The value is returned by
+    /// clone: named fields are not stored as JSON values, so a borrowed
+    /// return cannot cover them.
+    pub fn claim_at(&self, dotted_path: &str) -> Option<serde_json::Value> {
+        let mut segments = dotted_path.split('.');
+        let root = self.root_claim(segments.next()?)?;
+        segments.try_fold(root, |value, segment| value.get(segment).cloned())
+    }
+
+    /// The value of a single top-level claim. Named fields shadow `extra`,
+    /// which mirrors decoding: a claim a named field consumes never lands in
+    /// `extra`, so the named field is the only truth for it.
+    fn root_claim(&self, claim: &str) -> Option<serde_json::Value> {
+        use serde_json::json;
+
+        match claim {
+            "sub" => Some(json!(self.user_id)),
+            "iss" => Some(json!(self.issuer)),
+            "iat" => Some(json!(self.issued_at)),
+            "exp" => Some(json!(self.expires)),
+            "aud" => Some(json!(self.audience)),
+            "env" => self.env.as_ref().map(|v| json!(v)),
+            "name" => self.name.as_ref().map(|v| json!(v)),
+            "preferred_username" => self.preferred_username.as_ref().map(|v| json!(v)),
+            "client_id" => self.client_id.as_ref().map(|v| json!(v)),
+            "resources" => self.resources.as_ref().map(|v| json!(v)),
+            "groups" => self.groups.as_ref().map(|v| json!(v)),
+            "is_service_account" => self.is_service_account.map(|v| json!(v)),
+            "idp" => self.idp.as_ref().map(|v| json!(v)),
+            "root_domains" => self.root_domains.as_ref().map(|v| json!(v)),
+            other => self.extra.get(other).cloned(),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -99,7 +123,9 @@ pub enum JwtVerifierError {
 #[derive(Clone)]
 pub struct JwtVerifier {
     pub jwk_service: Arc<dyn JWKService>,
-    pub jwt_issuer: Option<String>,
+    /// Every `iss` value verification accepts. Two entries during an issuer's
+    /// cutover, one otherwise (see [`AuthSettings::jwt_issuer`](crate::settings::AuthSettings)).
+    pub jwt_issuer: Option<Vec<String>>,
     pub jwt_audience: Option<Vec<String>>,
 }
 
@@ -185,7 +211,7 @@ impl JwtVerifier {
     ) -> Result<AuthorizationToken, JwtVerifierError> {
         let mut validation = Validation::new(*alg);
         if let Some(iss) = self.jwt_issuer.as_ref() {
-            validation.set_issuer(&[iss]);
+            validation.set_issuer(iss);
         }
         if let Some(aud) = self.jwt_audience.as_ref() {
             validation.set_audience(aud);
@@ -195,39 +221,21 @@ impl JwtVerifier {
 
         debug!("Decoding JWT token");
 
-        if let Ok(token_data) = decode::<AuthorizationToken>(token, key, &validation) {
-            debug!("Decoded user info: {:?}", token_data.claims);
-            Ok(token_data.claims)
-        } else {
-            let token_data = decode::<JWTUserInfo>(token, key, &validation).map_err(|error| {
+        let token_data =
+            decode::<AuthorizationToken>(token, key, &validation).map_err(|error| {
                 if matches!(
                     error.kind(),
                     jsonwebtoken::errors::ErrorKind::ExpiredSignature
                 ) {
-                    debug!(error = ?error, "Allowable error decoding JWT AuthN token");
+                    debug!(error = ?error, "Allowable error decoding JWT token");
                 } else {
-                    warn!(error = ?error, "Unexpected error decoding JWT AuthN token");
+                    warn!(error = ?error, "Unexpected error decoding JWT token");
                 }
                 JwtVerifierError::ValidationFailed(error)
             })?;
 
-            let token = token_data.claims;
-            Ok(AuthorizationToken {
-                user_id: token.user_id,
-                issuer: token.issuer,
-                issued_at: token.issued_at,
-                expires: token.expires,
-                audience: token.audience,
-                env: token.env,
-                name: token.name,
-                preferred_username: token.preferred_username,
-                resources: None,
-                groups: None,
-                is_service_account: token.is_service_account,
-                idp: String::default(),
-                root_domains: None,
-            })
-        }
+        debug!("Decoded user info: {:?}", token_data.claims);
+        Ok(token_data.claims)
     }
 }
 
@@ -299,18 +307,20 @@ mod tests {
         };
         let authorization_token = AuthorizationToken {
             audience: vec!["test".to_string()],
-            env: "test".to_string(),
+            env: Some("test".to_string()),
             expires: 1234,
             user_id: "test".to_string(),
-            idp: "test".to_string(),
+            idp: Some("test".to_string()),
             root_domains: None,
             issuer: "test".to_string(),
-            name: "test".to_string(),
-            preferred_username: "test".to_string(),
+            name: Some("test".to_string()),
+            preferred_username: Some("test".to_string()),
+            client_id: None,
             groups: None,
             is_service_account: Some(false),
             issued_at: 123,
             resources: Some(vec![resource_permission]),
+            extra: Default::default(),
         };
         let allowed_context: RepositoryId = Context::from_str("0194b726b34e72b0b45550b88a967076")
             .unwrap()
@@ -332,18 +342,20 @@ mod tests {
         };
         let wildcard_authorization_token = AuthorizationToken {
             audience: vec!["test".to_string()],
-            env: "test".to_string(),
+            env: Some("test".to_string()),
             expires: 1234,
             user_id: "test".to_string(),
-            idp: "test".to_string(),
+            idp: Some("test".to_string()),
             root_domains: None,
             issuer: "test".to_string(),
-            name: "test".to_string(),
-            preferred_username: "test".to_string(),
+            name: Some("test".to_string()),
+            preferred_username: Some("test".to_string()),
+            client_id: None,
             groups: None,
             is_service_account: Some(false),
             issued_at: 123,
             resources: Some(vec![resource_permission]),
+            extra: Default::default(),
         };
         let test_contexts: Vec<RepositoryId> = vec![
             Context::from_str("0194b726b34e72b0b45550b88a967076")
@@ -360,6 +372,87 @@ mod tests {
         for context in test_contexts {
             verify_authorization(&wildcard_authorization_token, context)
                 .expect("verify auth failed");
+        }
+    }
+
+    mod claim_at {
+        use serde_json::json;
+
+        use super::*;
+
+        fn token_with_extra(extra: serde_json::Value) -> AuthorizationToken {
+            let serde_json::Value::Object(extra) = extra else {
+                panic!("extra claims must be a JSON object");
+            };
+            AuthorizationToken {
+                user_id: "the u".to_string(),
+                name: Some("the name".to_string()),
+                groups: Some(vec!["readers".to_string()]),
+                extra,
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn resolves_a_nested_path() {
+            let token = token_with_extra(json!({
+                "realm_access": { "roles": ["obliterate", "admin"] }
+            }));
+            assert_eq!(
+                token.claim_at("realm_access.roles"),
+                Some(json!(["obliterate", "admin"]))
+            );
+        }
+
+        #[test]
+        fn resolves_a_flat_named_field() {
+            let token = token_with_extra(json!({}));
+            assert_eq!(token.claim_at("groups"), Some(json!(["readers"])));
+        }
+
+        #[test]
+        fn a_missing_path_is_none() {
+            let token = token_with_extra(json!({}));
+            assert_eq!(token.claim_at("realm_access.roles"), None);
+            assert_eq!(token.claim_at("no_such_claim"), None);
+        }
+
+        #[test]
+        fn a_path_through_a_non_object_is_none() {
+            let token = token_with_extra(json!({ "realm_access": "a string" }));
+            assert_eq!(token.claim_at("realm_access.roles"), None);
+            assert_eq!(token.claim_at("name.first"), None);
+        }
+
+        #[test]
+        fn a_named_field_shadows_extra() {
+            // Decoding never puts a consumed claim into `extra`, but a
+            // constructed token can. The named field must win.
+            let token = token_with_extra(json!({ "name": "the impostor" }));
+            assert_eq!(token.claim_at("name"), Some(json!("the name")));
+        }
+
+        /// Decode then re-serialize preserves unknown claims.
+        #[test]
+        fn unknown_claims_survive_a_round_trip() {
+            let claims = json!({
+                "iss": "the issuer",
+                "sub": "the u",
+                "aud": ["Lore"],
+                "iat": 1,
+                "exp": 2,
+                "realm_access": { "roles": ["obliterate"] },
+                "custom_scalar": 42,
+            });
+
+            let token: AuthorizationToken = serde_json::from_value(claims).unwrap();
+            let reserialized = serde_json::to_value(&token).unwrap();
+
+            assert_eq!(
+                reserialized.get("realm_access"),
+                Some(&json!({ "roles": ["obliterate"] }))
+            );
+            assert_eq!(reserialized.get("custom_scalar"), Some(&json!(42)));
         }
     }
 
@@ -799,9 +892,10 @@ mod tests {
                 issuer: "the issuer".to_string(),
                 issued_at: 1,
                 audience,
-                env: "the env".to_string(),
-                name: "the name".to_string(),
-                preferred_username: "pu".to_string(),
+                env: Some("the env".to_string()),
+                name: Some("the name".to_string()),
+                preferred_username: Some("pu".to_string()),
+                client_id: None,
                 resources: None,
                 groups: None,
                 is_service_account: Some(false),
@@ -810,37 +904,14 @@ mod tests {
                     .unwrap()
                     .add(Duration::from_secs(5))
                     .as_secs(),
-                idp: "the idp".to_string(),
+                idp: Some("the idp".to_string()),
                 root_domains: None,
-            }
-        }
-
-        fn mock_authn_token(audience: Vec<String>) -> JWTUserInfo {
-            JWTUserInfo {
-                user_id: "the u".to_string(),
-                issuer: "the issuer".to_string(),
-                issued_at: 1,
-                audience,
-                env: "the env".to_string(),
-                name: "the name".to_string(),
-                preferred_username: "pu".to_string(),
-                is_service_account: Some(false),
-                expires: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .add(Duration::from_secs(5))
-                    .as_secs(),
+                extra: Default::default(),
             }
         }
 
         fn make_authz_token_with_audience(audience: Vec<String>) -> (AuthorizationToken, String) {
             let jwt_claims = mock_authz_token(audience);
-            let encoded = encode_jwt(&jwt_claims);
-            (jwt_claims, encoded)
-        }
-
-        fn make_authn_token_with_audience(audience: Vec<String>) -> (JWTUserInfo, String) {
-            let jwt_claims = mock_authn_token(audience);
             let encoded = encode_jwt(&jwt_claims);
             (jwt_claims, encoded)
         }
@@ -939,16 +1010,116 @@ mod tests {
             };
             let (original_authz_token, encoded_authz_token) =
                 make_authz_token_with_audience(vec!["Lore".to_string()]);
-            let (original_authn_token, encoded_authn_token) =
-                make_authn_token_with_audience(vec!["Lore".to_string()]);
 
             let verified_authz_token = verifier.verify_token(&encoded_authz_token).await?;
-            let verified_authn_token = verifier.verify_token(&encoded_authn_token).await?;
             assert_eq!(original_authz_token, verified_authz_token);
-            assert_eq!(
-                original_authn_token.audience,
-                verified_authn_token.audience.clone()
-            );
+
+            Ok(())
+        }
+
+        fn verifier_with_issuers(issuers: Vec<String>) -> JwtVerifier {
+            let mut service = MockTestJWKService::new();
+            service.expect_get_key().returning(|_| {
+                Ok((
+                    DecodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref()),
+                    AGREED_UPON_ALGORITHM,
+                ))
+            });
+
+            JwtVerifier {
+                jwk_service: Arc::new(service),
+                jwt_issuer: Some(issuers),
+                jwt_audience: Some(vec!["Lore".to_string()]),
+            }
+        }
+
+        fn token_with_issuer(issuer: &str) -> String {
+            let mut claims = mock_authz_token(vec!["Lore".to_string()]);
+            claims.issuer = issuer.to_string();
+            encode_jwt(&claims)
+        }
+
+        /// The test that makes an issuer's `iss` cutover a rollout rather than
+        /// an outage: with the old keyword and the new URL both configured,
+        /// tokens carrying either verify.
+        #[tokio::test]
+        async fn either_of_two_configured_issuers_verifies() -> Result<(), Box<dyn Error>> {
+            let verifier = verifier_with_issuers(vec![
+                "LEGACY_AUTH_KEYWORD".to_string(),
+                "https://auth.example.com/realms/lore".to_string(),
+            ]);
+
+            verifier
+                .verify_token(&token_with_issuer("LEGACY_AUTH_KEYWORD"))
+                .await?;
+            verifier
+                .verify_token(&token_with_issuer("https://auth.example.com/realms/lore"))
+                .await?;
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn an_issuer_in_neither_entry_is_refused() {
+            let verifier = verifier_with_issuers(vec![
+                "LEGACY_AUTH_KEYWORD".to_string(),
+                "https://auth.example.com/realms/lore".to_string(),
+            ]);
+
+            let error = verifier
+                .verify_token(&token_with_issuer("https://attacker.example.com"))
+                .await
+                .expect_err("an unlisted issuer is refused");
+            assert!(matches!(error, JwtVerifierError::ValidationFailed(_)));
+        }
+
+        #[tokio::test]
+        async fn a_single_configured_issuer_still_verifies() -> Result<(), Box<dyn Error>> {
+            let verifier = verifier_with_issuers(vec!["LEGACY_AUTH_KEYWORD".to_string()]);
+            verifier
+                .verify_token(&token_with_issuer("LEGACY_AUTH_KEYWORD"))
+                .await?;
+            Ok(())
+        }
+
+        /// A Keycloak-shaped token: only the required claims — `iss`, `sub`, `aud`, `exp`,
+        /// `iat` — no `name`, no `env`, no `idp`. Everything else must default, not
+        /// fail the decode.
+        #[tokio::test]
+        async fn verify_token_with_only_required_claims() -> Result<(), Box<dyn Error>> {
+            let mut service = MockTestJWKService::new();
+            service.expect_get_key().returning(|_| {
+                Ok((
+                    DecodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref()),
+                    AGREED_UPON_ALGORITHM,
+                ))
+            });
+
+            let verifier = JwtVerifier {
+                jwk_service: Arc::new(service),
+                jwt_issuer: None,
+                jwt_audience: Some(vec!["Lore".to_string()]),
+            };
+
+            let minimal_claims = json!({
+                "iss": "https://keycloak.example.com/realms/lore",
+                "sub": "f7d3a1c2-0000-0000-0000-000000000000",
+                "aud": "Lore",
+                "iat": 1,
+                "exp": SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .add(Duration::from_secs(5))
+                    .as_secs(),
+            });
+            let encoded = encode_jwt(&minimal_claims);
+
+            let verified = verifier.verify_token(&encoded).await?;
+            assert_eq!(verified.user_id, "f7d3a1c2-0000-0000-0000-000000000000");
+            assert_eq!(verified.name, None);
+            assert_eq!(verified.env, None);
+            assert_eq!(verified.idp, None);
+            assert_eq!(verified.client_id, None);
 
             Ok(())
         }

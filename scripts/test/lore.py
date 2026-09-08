@@ -46,6 +46,8 @@ from lore_parsers import (
     parse_file_info,
     parse_shared_store_info,
     SharedStoreInfo,
+    parse_shared_store_list,
+    SharedStoreList,
 )
 
 logger = logging.getLogger(__name__)
@@ -176,10 +178,24 @@ class Lore:
         # registers this repo against the wrong instance.
         if remote_url:
             self.environment_vars.setdefault("LORE_REMOTE_URL", remote_url)
+        # Resolved before creating, because the create now passes the full URL rather
+        # than a bare name for the CLI to expand out of LORE_REMOTE_URL.
+        self.remote = remote_url if remote_url else os.getenv("LORE_REMOTE_URL", "")
+        if remote_path:
+            self.remote_path = remote_path
+        elif self.remote:
+            # Supply the separator rather than assuming the caller's remote ends in one:
+            # the session fixture appends it, but a `remote_url=` passed straight in need
+            # not, and concatenating would yield `lore://host:1234name` -- a different
+            # host rather than the intended repository.
+            self.remote_path = f"{self.remote.rstrip('/')}/{self.name}"
+        else:
+            # No remote at all, so the bare name is the whole identifier. Joining a
+            # separator onto nothing would make `/name`, whose empty first segment is not
+            # a valid repository name.
+            self.remote_path = self.name
         if create_repo:
             self.repository_create(remote_path=remote_path, repo_id=repo_id)
-        self.remote = remote_url if remote_url else os.getenv("LORE_REMOTE_URL", "")
-        self.remote_path = remote_path if remote_path else self.remote + self.name
         self.test_commit_id = 1
 
     def dot_dir(self) -> str:
@@ -371,14 +387,16 @@ class Lore:
         remote_path: str | None = None,
         description: str | None = None,
         repo_id: str | None = None,
+        vfs: str | None = None,
         use_shared_store: bool = False,
         shared_store_path: str | None = None,
         **kwargs: Unpack[GlobalOptions],
     ):
         output = self.run(
-            ["repository", "create", remote_path if remote_path else self.name]
+            ["repository", "create", remote_path if remote_path else self.remote_path]
             + (["--description", description] if description else [])
             + (["--id", repo_id] if repo_id else [])
+            + (["--vfs", vfs] if vfs else [])
             + (["--use-shared-store"] if use_shared_store else [])
             + (["--shared-store-path", shared_store_path] if shared_store_path else []),
             **kwargs,
@@ -422,7 +440,7 @@ class Lore:
         self, remote_path: str | None = None, **kwargs: Unpack[GlobalOptions]
     ):
         return self.run(
-            ["repository", "delete", remote_path if remote_path else self.name],
+            ["repository", "delete", remote_path if remote_path else self.remote_path],
             **kwargs,
         )
 
@@ -1858,6 +1876,7 @@ class Lore:
         virtually: bool = False,
         direct_file_write: bool = False,
         flush_file: bool = False,
+        vfs: str | None = None,
         layer: str | None = None,
         layer_metadata: str | None = None,
         prefetch: str | None = None,
@@ -1893,6 +1912,7 @@ class Lore:
             + (["--virtually"] if virtually else [])
             + (["--direct-file-write"] if direct_file_write else [])
             + (["--flush-file"] if flush_file else [])
+            + (["--vfs", vfs] if vfs else [])
             + (["--layer", layer] if layer else [])
             + (["--layer-metadata", layer_metadata] if layer_metadata else [])
             + (["--prefetch", prefetch] if prefetch else [])
@@ -1977,13 +1997,25 @@ class Lore:
 
     def dirty_move(self, from_path: str, to_path: str, **kwargs: Unpack[GlobalOptions]):
         return self.run(
-            ["file", "dirty", "move", self._fix_path(from_path), self._fix_path(to_path)],
+            [
+                "file",
+                "dirty",
+                "move",
+                self._fix_path(from_path),
+                self._fix_path(to_path),
+            ],
             **kwargs,
         )
 
     def dirty_copy(self, from_path: str, to_path: str, **kwargs: Unpack[GlobalOptions]):
         return self.run(
-            ["file", "dirty", "copy", self._fix_path(from_path), self._fix_path(to_path)],
+            [
+                "file",
+                "dirty",
+                "copy",
+                self._fix_path(from_path),
+                self._fix_path(to_path),
+            ],
             **kwargs,
         )
 
@@ -2327,6 +2359,32 @@ class Lore:
         output = self.run(["shared-store", "info"])
         if can_parse_output(kwargs):
             return parse_shared_store_info(output)
+        return output
+
+    @overload
+    def shared_store_list(
+        self, include_instances: bool = False, **kwargs: Unpack[GlobalOptionsParseable]
+    ) -> SharedStoreList: ...
+
+    @overload
+    def shared_store_list(
+        self, include_instances: bool = False, **kwargs: Unpack[GlobalOptions]
+    ) -> SharedStoreList | str | None: ...
+
+    def shared_store_list(
+        self, include_instances: bool = False, **kwargs: Unpack[GlobalOptions]
+    ) -> SharedStoreList | str | None:
+        output = self.run(
+            [
+                "shared-store",
+                "list",
+                "--include-instances",
+                "true" if include_instances else "false",
+            ],
+            **kwargs,
+        )
+        if can_parse_output(kwargs):
+            return parse_shared_store_list(output)
         return output
 
     def shared_store_set_use_automatically(self, enabled: bool):

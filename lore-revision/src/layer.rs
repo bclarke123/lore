@@ -16,7 +16,11 @@ use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
 use crate::find;
+use crate::fs::filesystem_provider::FilesystemDiffIntent;
+use crate::fs::filesystem_provider::FilesystemDiffTree;
 use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lore::BranchId;
@@ -208,10 +212,10 @@ async fn save_config(
         .forward::<LayerError>("Failed to save configuration")
 }
 
-pub fn layer_config_path(repository_path: impl AsRef<Path>) -> PathBuf {
-    let path = repository_path.as_ref();
-    let dotpath = path.join(repository::RepositoryFormat::detect(path).dot_dir());
-    dotpath.join(repository::LAYER)
+pub fn layer_config_path(repository: &Arc<RepositoryContext>) -> Result<PathBuf, InvalidArguments> {
+    repository
+        .dot_dir_path()
+        .map(|path| path.join(repository::LAYER))
 }
 
 pub struct LayerState {
@@ -389,7 +393,8 @@ pub async fn add(
         ));
     }
 
-    let mut config = load_config(layer_config_path(repository.require_path()?)).await?;
+    let config_path = layer_config_path(&repository)?;
+    let mut config = load_config(&config_path).await?;
 
     for layer in config.layers.iter() {
         if layer.repository == layer_repository.id
@@ -452,20 +457,22 @@ pub async fn add(
         stats: Arc::default(),
         modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
     };
-    clone::clone_node(clone_ctx, layer_storage, target_path, layer_node_link.node)
-        .await
-        .forward::<LayerError>("Failed cloning target layer")?;
+    let target_states = layer_repository.filter.mount_states(target_path.relative());
+    clone::clone_node(
+        clone_ctx,
+        layer_storage,
+        target_path,
+        layer_node_link.node,
+        target_states,
+    )
+    .await
+    .forward::<LayerError>("Failed cloning target layer")?;
     layer_operation
         .finalize(true)
         .await
         .forward::<LayerError>("Failed to finalize operation")?;
 
-    save_config(
-        token,
-        layer_config_path(repository.require_path()?),
-        &config,
-    )
-    .await?;
+    save_config(token, &config_path, &config).await?;
 
     Ok(())
 }
@@ -511,7 +518,7 @@ pub async fn remove(
     source_repository: RepositoryId,
     purge: bool,
 ) -> Result<(), LayerError> {
-    let config_path = layer_config_path(repository.require_path()?);
+    let config_path = layer_config_path(&repository)?;
     let mut config = load_config(&config_path).await?;
 
     let layer_index = resolve_layer_index(&config.layers, target_path.as_str(), source_repository)?;
@@ -733,8 +740,20 @@ fn walk_layer_subtree<'a>(
 }
 
 pub async fn list(repository: Arc<RepositoryContext>) -> Result<Vec<Layer>, LayerError> {
-    let config = load_config(layer_config_path(repository.require_path()?)).await?;
+    let config = load_config(layer_config_path(&repository)?).await?;
     Ok(config.layers)
+}
+
+/// The mount paths of `layers`, for routing a path to the layer that owns it and
+/// for masking those subtrees out of a parent-repository walk.
+///
+/// Takes an iterator so callers holding `Layer` alongside its state or context
+/// can project without rebuilding a `Vec<Layer>` first.
+pub fn target_paths<'a>(layers: impl IntoIterator<Item = &'a Layer>) -> Vec<String> {
+    layers
+        .into_iter()
+        .map(|layer| layer.target_path.clone())
+        .collect()
 }
 
 /// For operations that cascade into every configured layer.
@@ -826,6 +845,33 @@ pub async fn sync(
     source_path: RelativePath,
     options: SyncOptions,
 ) -> Result<(), LayerError> {
+    let filesystem = repository.file_system();
+    with_operation(filesystem, true, async |operation| {
+        sync_in_operation(
+            operation,
+            repository,
+            state_current,
+            state_target,
+            target_path,
+            source_path,
+            options,
+        )
+        .await
+    })
+    .await
+}
+
+/// Realizes the layer's target state over its mount, within `operation`.
+#[allow(clippy::too_many_arguments)]
+async fn sync_in_operation(
+    operation: Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    state_current: Arc<State>,
+    state_target: Arc<State>,
+    target_path: RelativePath,
+    source_path: RelativePath,
+    options: SyncOptions,
+) -> Result<(), LayerError> {
     let stats: Arc<SyncRealizeStats> = Arc::default();
     let changes = if !options.reset {
         lore_info!(
@@ -867,18 +913,26 @@ pub async fn sync(
             "Calculating deltas from filesystem -> {}",
             state_target.revision_number()
         );
-        let (mut changes, _diff_stats) = state::diff_filesystem(
-            repository.clone(),
-            state_target.clone(),
-            repository.clone(),
-            state_current.clone(),
+        let mut changes = Vec::new();
+        state::diff_filesystem(
+            &operation,
+            FilesystemDiffTree {
+                repository: repository.clone(),
+                state: state_target.clone(),
+            },
+            FilesystemDiffTree {
+                repository: repository.clone(),
+                state: state_current.clone(),
+            },
             if !source_path.is_empty() {
                 Some(source_path)
             } else {
                 None
             },
             options.filter_mode,
+            FilesystemDiffIntent::Report,
             Arc::new(Vec::new()),
+            &mut changes,
         )
         .await
         .forward::<LayerError>("Failed to calculate file system diff when synchronizing")?;
@@ -890,11 +944,6 @@ pub async fn sync(
     let options = Arc::new(options);
     let changes = Arc::new(changes);
     let force = execution_context().globals().force();
-    let operation = repository
-        .file_system()
-        .begin_operation()
-        .await
-        .forward::<LayerError>("Failed to start filesystem operation")?;
     let changes = if !changes.is_empty() && !force {
         lore_info!(
             "Verifying {} layer changes with local file system",
@@ -927,11 +976,6 @@ pub async fn sync(
     )
     .await
     .forward::<LayerError>("Failed to sync layer files")?;
-
-    operation
-        .finalize(true)
-        .await
-        .forward::<LayerError>("Failed to finalize operation")?;
 
     Ok(())
 }
@@ -1122,7 +1166,8 @@ pub async fn store_layer_current(
     current: Hash,
     staged: Option<Hash>,
 ) -> Result<(), LayerError> {
-    let mut config = load_config(layer_config_path(repository.require_path()?)).await?;
+    let config_path = layer_config_path(&repository)?;
+    let mut config = load_config(&config_path).await?;
 
     for layer in config.layers.iter_mut() {
         if layer.repository == layer_repository && layer.target_path.as_str() == target_path {
@@ -1130,12 +1175,7 @@ pub async fn store_layer_current(
             if let Some(staged) = staged {
                 layer.staged = staged;
             }
-            save_config(
-                token,
-                layer_config_path(repository.require_path()?),
-                &config,
-            )
-            .await?;
+            save_config(token, &config_path, &config).await?;
             lore_debug!("Saved layer config: {config:?}");
             return Ok(());
         }
@@ -1153,7 +1193,8 @@ pub async fn store_layer_current_batch(
         return Ok(());
     }
 
-    let mut config = load_config(layer_config_path(repository.require_path()?)).await?;
+    let config_path = layer_config_path(&repository)?;
+    let mut config = load_config(&config_path).await?;
 
     for (layer_repository, target_path, current) in updates {
         for layer in config.layers.iter_mut() {
@@ -1164,12 +1205,7 @@ pub async fn store_layer_current_batch(
         }
     }
 
-    save_config(
-        token,
-        layer_config_path(repository.require_path()?),
-        &config,
-    )
-    .await?;
+    save_config(token, &config_path, &config).await?;
     lore_debug!(
         "Saved layer config (batch update, {} layers): {config:?}",
         updates.len()
@@ -1185,17 +1221,13 @@ pub async fn store_layer_staged(
     layer_repository: RepositoryId,
     staged: Hash,
 ) -> Result<(), LayerError> {
-    let mut config = load_config(layer_config_path(repository.require_path()?)).await?;
+    let config_path = layer_config_path(&repository)?;
+    let mut config = load_config(&config_path).await?;
 
     for layer in config.layers.iter_mut() {
         if layer.repository == layer_repository && layer.target_path.as_str() == target_path {
             layer.staged = staged;
-            save_config(
-                token,
-                layer_config_path(repository.require_path()?),
-                &config,
-            )
-            .await?;
+            save_config(token, &config_path, &config).await?;
             lore_debug!("Saved layer config: {config:?}");
             return Ok(());
         }

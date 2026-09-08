@@ -6,14 +6,14 @@ use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
 
-use super::DOT_LORE;
-use super::DOT_URC;
 use super::FileConfig;
 use super::RepositoryConfig;
 use super::RepositoryMetadata;
 use super::RepositoryWriteToken;
 use super::SharedStoreToUseConfig;
 use super::StoreConfig;
+use super::VfsConfig;
+use super::get_dot_lore_path;
 use crate::branch;
 use crate::errors::*;
 use crate::event;
@@ -115,6 +115,8 @@ pub struct CreateOptions {
     pub description: Option<String>,
     // Whether to use the shared store and options configuring it if desired
     pub shared_store_options: Option<SharedStoreToUseConfig>,
+    // Whether to use VFS for the repository
+    pub vfs_options: VfsConfig,
 }
 
 #[derive(Clone)]
@@ -123,6 +125,22 @@ pub struct CreateMetadata {
     pub creator: String,
     // Created
     pub created: u64,
+}
+
+/// Names a repository created without a URL after the directory it lives in.
+///
+/// The path reaching here may still be relative (`.` is the common case), so resolve it
+/// against the call's working directory before taking the final component — otherwise
+/// every repository created in the current directory would be named `.`.
+fn directory_name(path: &Path) -> Option<String> {
+    let absolute = path
+        .to_str()
+        .and_then(|path| util::path::make_absolute(path).ok())
+        .unwrap_or_else(|| path.to_path_buf());
+    absolute
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
 }
 
 pub async fn create(
@@ -142,31 +160,72 @@ pub async fn create_with_metadata(
     let context = execution_context();
     let call = context.globals();
 
-    let (remote_url, name) = repository::parse_url(repository_url, call.offline_or_local())
-        .forward::<CreateError>("parsing repository URL")?;
-
-    if !repository::is_valid_name(name.as_str()) {
-        return Err(CreateError::internal("Invalid repository URL"));
-    }
-
     let path = path.as_ref();
 
-    // Check both formats for pre-existence
-    for dot_dir in [DOT_URC, DOT_LORE] {
-        let existing = path.join(dot_dir);
-        if existing.exists() {
-            if call.force() {
-                lore_io::IoDriver::global()
-                    .remove_dir_all(existing.as_path())
-                    .await
-                    .internal_with(|| {
-                        format!("removing previous repository in path {}", path.display())
-                    })?;
-            } else {
-                return Err(CreateError::from(RepositoryAlreadyExists {
-                    path: path.display().to_string(),
-                }));
+    // A local repository is the only kind that has no remote, and `--offline` / `--local`
+    // is how the caller asks for one. Under that flag the argument names the repository
+    // rather than locating it, and may be omitted entirely for the directory's own name.
+    // Without it a URL that names a host is required, so a bare name is never silently
+    // reinterpreted as a repository name.
+    let local_only = call.offline_or_local();
+    let (remote_url, name) = if repository_url.is_empty() {
+        if !local_only {
+            return Err(InvalidArguments {
+                reason: "a repository URL is required, pass --offline to create a local \
+                         repository named after the current directory"
+                    .to_string(),
             }
+            .into());
+        }
+        let name = directory_name(path)
+            .ok_or_else(|| CreateError::internal("Unable to derive repository name from path"))?;
+        (String::default(), name)
+    } else {
+        // A bare name is only a name when the caller asked for a local repository. The
+        // check is here rather than left to `parse_url` so the message names the choice
+        // the caller has, instead of reporting their repository name as a broken URL.
+        if !local_only && !repository_url.contains("://") && !repository_url.contains('/') {
+            return Err(InvalidArguments {
+                reason: format!(
+                    "repository URL '{repository_url}' must include a host name, pass \
+                     --offline to create a local repository named '{repository_url}'"
+                ),
+            }
+            .into());
+        }
+        repository::parse_url(repository_url, local_only)
+            .forward::<CreateError>("parsing repository URL")?
+    };
+
+    if !repository::is_valid_name(name.as_str()) {
+        // Blame whatever the name actually came from. Without an argument it came from the
+        // directory; under `--offline` the argument is the name itself, so calling it a
+        // broken URL would point the reader at a scheme they deliberately did not pass.
+        return Err(CreateError::internal(if repository_url.is_empty() {
+            format!("Directory name '{name}' is not a valid repository name, pass a name or URL")
+        } else if local_only {
+            format!(
+                "'{name}' is not a valid repository name, names may hold letters, digits, \
+                 '/', '-', '_' and '.'; include a scheme such as lore:// to name a remote"
+            )
+        } else {
+            "Invalid repository URL".to_string()
+        }));
+    }
+
+    let existing_dot_dir = get_dot_lore_path(path)?;
+    if existing_dot_dir.exists() {
+        if call.force() {
+            lore_io::IoDriver::global()
+                .remove_dir_all(existing_dot_dir.as_path())
+                .await
+                .internal_with(|| {
+                    format!("removing previous repository in path {}", path.display())
+                })?;
+        } else {
+            return Err(CreateError::from(RepositoryAlreadyExists {
+                path: path.display().to_string(),
+            }));
         }
     }
 
@@ -182,7 +241,9 @@ pub async fn create_with_metadata(
         Context::from(uuid::Uuid::now_v7())
     };
 
-    let connection = if !call.offline_or_local() {
+    // With no remote URL there is no server to create the repository on, so skip
+    // straight to the local setup rather than failing the way an unreachable remote does.
+    let connection = if !call.offline_or_local() && !remote_url.is_empty() {
         // Try to create the repository on server
         let connection = protocol::connect(
             remote_url.as_str(),
@@ -253,6 +314,7 @@ pub async fn create_with_metadata(
         remote_url: Some(remote_url),
         identity: resolved_identity,
         shared_store_to_use: options.shared_store_options,
+        vfs: Some(options.vfs_options),
         store: Some(StoreConfig::client_default()),
         file: Some(FileConfig::default()),
     };

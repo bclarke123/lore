@@ -69,8 +69,11 @@ pub struct Principals(Vec<String>);
 impl Principals {
     pub fn from_claims(claims: &AuthorizationToken) -> Self {
         let mut principals = vec![claims.user_id.clone()];
-        if !claims.preferred_username.is_empty() && claims.preferred_username != claims.user_id {
-            principals.push(claims.preferred_username.clone());
+        if let Some(preferred_username) = claims.preferred_username.as_deref()
+            && !preferred_username.is_empty()
+            && preferred_username != claims.user_id
+        {
+            principals.push(preferred_username.to_string());
         }
         Self(principals)
     }
@@ -692,7 +695,7 @@ mod tests {
     fn claims(user_id: &str, email: &str) -> AuthorizationToken {
         AuthorizationToken {
             user_id: user_id.to_string(),
-            preferred_username: email.to_string(),
+            preferred_username: Some(email.to_string()),
             ..AuthorizationToken::default()
         }
     }

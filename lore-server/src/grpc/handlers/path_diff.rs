@@ -196,7 +196,6 @@ mod tests {
     use lore_revision::node::NodeFlags;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryContextCreationArgs;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::state;
     use lore_revision::util::path::RelativePath;
     use lore_transport::ProtocolError;
@@ -221,14 +220,13 @@ mod tests {
             .expect("Failed to create store"),
         );
         Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
-            path: None,
+            paths: None,
             immutable_store: immutable,
             mutable_store: mutable,
             id: Context::default().into(),
             instance_id: lore_revision::instance::InstanceId::generate(),
             remote: Err(ProtocolError::from(lore_base::error::NoRemote)),
             filter: Arc::default(),
-            format: RepositoryFormat::Lore,
             filesystem_provider: None,
         }))
     }
@@ -249,6 +247,7 @@ mod tests {
             action: lore_revision::change::FileAction::Add,
             path: RelativePath::from_str("Samples/Content/file.uasset").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,
@@ -299,6 +298,7 @@ mod tests {
             action: lore_revision::change::FileAction::Delete,
             path: RelativePath::from_str("Samples/Content/file.uasset").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,
@@ -353,6 +353,7 @@ mod tests {
             action: lore_revision::change::FileAction::Keep,
             path: RelativePath::from_str("Samples/Content/file.uasset").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,
@@ -408,6 +409,7 @@ mod tests {
             action: lore_revision::change::FileAction::Add,
             path: RelativePath::from_str("Samples/Content/file.uasset").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,
@@ -458,6 +460,7 @@ mod tests {
             action: lore_revision::change::FileAction::Add,
             path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,
@@ -508,6 +511,7 @@ mod tests {
             action: lore_revision::change::FileAction::Delete,
             path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,
@@ -563,6 +567,7 @@ mod tests {
             action: lore_revision::change::FileAction::Keep,
             path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,
@@ -623,6 +628,7 @@ mod tests {
             action: lore_revision::change::FileAction::Keep,
             path: RelativePath::from_str("Samples/Content/merged.txt").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::ConflictAutomerged,
             from: NodeChangeState {
                 node: 1,
@@ -680,6 +686,7 @@ mod tests {
             action: lore_revision::change::FileAction::Add,
             path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,
@@ -726,6 +733,7 @@ mod tests {
             action: lore_revision::change::FileAction::Add,
             path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,
@@ -771,6 +779,7 @@ mod tests {
             action: lore_revision::change::FileAction::Keep,
             path: RelativePath::from_str("libs/shared/a.txt").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 3,
@@ -828,6 +837,7 @@ mod tests {
             action: lore_revision::change::FileAction::Delete,
             path: RelativePath::from_str("libs/shared/gone.txt").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 3,
@@ -868,6 +878,7 @@ mod tests {
             action: lore_revision::change::FileAction::Keep,
             path: RelativePath::from_str("README.txt").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,

@@ -59,7 +59,12 @@ documentation_style = "c99"
 ############################# Codegen Options ##################################
 
 [export]
-exclude = []
+# `FilterState` and `FilterStates` are public so a tree walk can thread the
+# filter verdict down as it descends, and so the filter tests can build one.
+# `FileInfo` is public so the walk and the stage path can pass what a path
+# measured. All three are Rust-side only -- no C entry point takes or returns
+# them -- so cbindgen would otherwise emit opaque typedefs no caller can use.
+exclude = ["FileInfo", "FilterState", "FilterStates"]
 # `LoreStore` and `LoreRevisionTree` are reachable via `lore_*_args_t::handle`
 # but cbindgen misses transitive types behind a typedef field; emit them
 # explicitly. The `lore_revision_tree_*_args_t` types live here too so the
@@ -344,6 +349,7 @@ include = [
 "LoreDependencyResolveBeginEventData" = "lore_dependency_resolve_begin_event_data_t"
 "LoreDependencyResolveItemEventData" = "lore_dependency_resolve_item_event_data_t"
 "LoreDependencyResolveEndEventData" = "lore_dependency_resolve_end_event_data_t"
+"LoreVfsType" = "lore_vfs_type_t"
 "LoreRepositoryCloneArgs" = "lore_repository_clone_args_t"
 "LoreRepositoryCloneBeginEventData" = "lore_repository_clone_begin_event_data_t"
 "LoreRepositoryCloneCountData" = "lore_repository_clone_count_data_t"
@@ -427,6 +433,10 @@ include = [
 "LoreSharedStoreInfoArgs" = "lore_shared_store_info_args_t"
 "LoreSharedStoreMode" = "lore_shared_store_mode_t"
 "LoreSharedStoreInfoEventData" = "lore_shared_store_info_event_data_t"
+"LoreSharedStoreListArgs" = "lore_shared_store_list_args_t"
+"LoreSharedStoreListEventData" = "lore_shared_store_list_event_data_t"
+"LoreSharedStoreListItem" = "lore_shared_store_list_item_t"
+"LoreArray_lore_shared_store_list_item" = "lore_shared_store_list_item_array_t"
 "LoreSharedStoreSetUseAutomaticallyArgs" = "lore_shared_store_set_use_automatically_args_t"
 "LoreServiceStartArgs" = "lore_service_start_args_t"
 "LoreServiceStopArgs" = "lore_service_stop_args_t"

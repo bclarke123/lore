@@ -8,6 +8,7 @@ use lore_base::types::Hash;
 use lore_proto::lore::revision::v1::BranchPushRequest;
 use lore_proto::lore::revision::v1::BranchPushResponse;
 use lore_revision::branch;
+use lore_revision::branch::BranchError;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::notification::NotificationSender;
@@ -24,6 +25,7 @@ use tracing::debug;
 use tracing::info;
 use tracing::span;
 
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
@@ -34,6 +36,7 @@ use crate::grpc::handlers::branch_push::dispatch_response_message;
 use crate::grpc::handlers::branch_push::extract_client_ip;
 use crate::grpc::handlers::branch_push::push;
 use crate::grpc::hook_error_to_status;
+use crate::grpc::none_or_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
@@ -49,6 +52,11 @@ use crate::util::setup_execution;
 /// deleted branch reinstates the name → id mapping if the name is
 /// still free, or returns `AlreadyExists` if claimed by a different
 /// live branch.
+///
+/// A fragment of the pushed revision the server does not hold is the
+/// other `FailedPrecondition`, and the only one carrying an address in
+/// the status details. `NotFound` names an absent branch alone, so a
+/// caller reads it as one without inspecting the status further.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "BranchPush::v1::handle", skip_all)]
 pub async fn handler(
@@ -224,9 +232,11 @@ async fn ensure_branch_pushable(
 ) -> Result<(), Status> {
     let metadata_hash = branch::metadata_hash(repository.clone(), branch_id)
         .await
+        .filter_slow_down()?
         .map_err(|_err| Status::not_found(format!("Branch {branch_id} not found")))?;
     let metadata = branch::load_metadata(repository.clone(), metadata_hash)
         .await
+        .filter_slow_down()?
         .warn_map_err(|err| Status::internal(err.to_string()))?;
 
     let Ok(name) = branch::name(&metadata) else {
@@ -236,11 +246,17 @@ async fn ensure_branch_pushable(
         return Ok(());
     }
 
-    match branch::load_name_to_id_local(repository.clone(), name).await {
-        Ok(mapped) if BranchId::from(mapped) == branch_id => Ok(()),
-        Ok(other) => {
+    // The `None` arm reinstates the mapping, so an unreadable name key must
+    // not reach it: that would rebind the name away from whichever branch
+    // currently owns it.
+    match none_or_status(
+        branch::load_name_to_id_local(repository.clone(), name).await,
+        BranchError::is_branch_not_found,
+    )? {
+        Some(mapped) if BranchId::from(mapped) == branch_id => Ok(()),
+        Some(other) => {
             let other_id = BranchId::from(other);
-            if other_branch_still_claims_name(&repository, other_id, name).await {
+            if other_branch_still_claims_name(&repository, other_id, name).await? {
                 info!(
                     {BRANCH_ID} = %branch_id,
                     %name,
@@ -259,18 +275,20 @@ async fn ensure_branch_pushable(
                 );
                 branch::store_name_to_id(repository, branch_id, name)
                     .await
+                    .filter_slow_down()?
                     .warn_map_err(|err| {
                         Status::internal(format!("Failed to reinstate name → id mapping: {err}"))
                     })
             }
         }
-        Err(_) => {
+        None => {
             // No mapping (deleted — the underlying store treats zero
             // values as missing — or never written). Reinstate the
             // mapping so the subsequent push sees a live branch.
             debug!({BRANCH_ID} = %branch_id, %name, "Reinstating name → id mapping for push");
             branch::store_name_to_id(repository, branch_id, name)
                 .await
+                .filter_slow_down()?
                 .warn_map_err(|err| {
                     Status::internal(format!("Failed to reinstate name → id mapping: {err}"))
                 })
@@ -281,19 +299,27 @@ async fn ensure_branch_pushable(
 /// True iff `other_id` exists and its metadata still names it `name`. A
 /// mismatch (dead branch, missing metadata, or a rename that left an
 /// orphan name pointer) is treated as a stale mapping the caller can
-/// safely overwrite.
+/// safely overwrite. A store that cannot answer is reported rather than
+/// read as a mismatch, so an unreadable branch never has its name
+/// reassigned.
 async fn other_branch_still_claims_name(
     repository: &Arc<RepositoryContext>,
     other_id: BranchId,
     name: &str,
-) -> bool {
-    let Ok(metadata_hash) = branch::metadata_hash(repository.clone(), other_id).await else {
-        return false;
+) -> Result<bool, Status> {
+    let Ok(metadata_hash) = branch::metadata_hash(repository.clone(), other_id)
+        .await
+        .filter_slow_down()?
+    else {
+        return Ok(false);
     };
-    let Ok(metadata) = branch::load_metadata(repository.clone(), metadata_hash).await else {
-        return false;
+    let Ok(metadata) = branch::load_metadata(repository.clone(), metadata_hash)
+        .await
+        .filter_slow_down()?
+    else {
+        return Ok(false);
     };
-    branch::name(&metadata).unwrap_or("") == name
+    Ok(branch::name(&metadata).unwrap_or("") == name)
 }
 
 #[cfg(test)]

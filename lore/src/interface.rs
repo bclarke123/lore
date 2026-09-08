@@ -4,6 +4,9 @@ use std::ffi::CString;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
+use lore_base::error::ShutDown;
+use lore_error_set::FfiError;
+
 pub type LoreEvent = lore_revision::interface::LoreEvent;
 
 /// Return the tag identifying the type of an event.
@@ -7304,8 +7307,11 @@ pub extern "C" fn lore_log_configure(config: &LoreLogConfig) -> i32 {
 /// Returns 0 on success and a non-zero value on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_shutdown() -> i32 {
-    crate::shutdown();
-    0
+    if crate::shutdown() {
+        0
+    } else {
+        ShutDown.ffi_code()
+    }
 }
 
 /// Limits the total number of threads Lore sizes its pools for.
@@ -7513,7 +7519,11 @@ pub extern "C" fn lore_repository_instance_list_async(
 
 pub type LoreRepositoryInstancePruneArgs = crate::repository::LoreRepositoryInstancePruneArgs;
 
-/// Remove stale instances of the repository that are no longer present.
+/// Remove stale instances of the repository: those whose path no longer
+/// exists, those whose path holds no checkout, and those whose path now holds
+/// a repository naming a different current instance. Each removed instance is
+/// reported through a `RepositoryInstance` event whose `stale` field gives the
+/// reason.
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_repository_instance_prune(
     globals: &LoreGlobalArgs,

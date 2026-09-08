@@ -276,17 +276,19 @@ impl TokenMinter {
             issued_at: now,
             expires: now + self.user_token_ttl_seconds,
             audience: self.audience.clone(),
-            env: self.env.clone(),
-            name: name.clone(),
-            preferred_username,
+            env: Some(self.env.clone()),
+            name: Some(name.clone()),
+            preferred_username: Some(preferred_username),
+            client_id: None,
             resources: None,
             groups: None,
             is_service_account: Some(false),
-            idp: identity.idp.clone(),
+            idp: Some(identity.idp.clone()),
             // The audience entries are the server's domain(s); advertising
             // them under the dedicated claim as well keeps the client-side
             // send-check working if `aud` ever becomes a URI (upstream D5).
             root_domains: Some(self.audience.clone()),
+            extra: Default::default(),
         };
 
         Ok(MintedLogin {
@@ -311,7 +313,7 @@ impl TokenMinter {
             expires: now + self.authz_token_ttl_seconds,
             issuer: self.issuer.clone(),
             audience: self.audience.clone(),
-            env: self.env.clone(),
+            env: Some(self.env.clone()),
             resources: Some(resources),
             ..user_claims.clone()
         };
@@ -319,7 +321,10 @@ impl TokenMinter {
         Ok(MintedLogin {
             token: self.sign(&claims)?,
             user_id: claims.user_id.clone(),
-            user_name: claims.name.clone(),
+            user_name: claims
+                .name
+                .clone()
+                .unwrap_or_else(|| claims.user_id.clone()),
             expires_at_ms: (claims.expires as i64).saturating_mul(1000),
             refresh_token: None,
         })

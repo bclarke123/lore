@@ -42,6 +42,8 @@ pub async fn handler(
     request: Request<RevisionInfoRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<Response<RevisionInfoResponse>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
@@ -63,7 +65,9 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            let signature = resolve_signature(&repository, query.into()).await?;
+            let signature =
+                resolve_signature(&repository, query.into(), history_step_size, acceleration)
+                    .await?;
             // Only the default branch can exist with no revisions; its
             // latest then resolves to the zero hash. That is not an error:
             // answer successfully with no revision to describe, rather than
@@ -108,6 +112,7 @@ async fn load_revision(
     let metadata_fut = async {
         Metadata::deserialize(repository.clone(), metadata_hash)
             .await
+            .filter_slow_down()?
             .map_err(|err| {
                 warn!(
                     {REPOSITORY_ID} = %repository.id,
@@ -250,6 +255,7 @@ async fn load_optional_parent(
     let metadata_hash = state.metadata_hash();
     let metadata = Metadata::deserialize(repository.clone(), metadata_hash)
         .await
+        .filter_slow_down()?
         .map_err(|err| {
             warn!(
                 {REPOSITORY_ID} = %repository.id,
@@ -300,6 +306,7 @@ mod test {
     use super::*;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
+    use crate::grpc::server::RevisionListAcceleration;
     use crate::store::test_store_create;
 
     fn make_request(repository: RepositoryId, query: Query) -> Request<RevisionInfoRequest> {
@@ -386,9 +393,15 @@ mod test {
                 REPOSITORY_ID_KEY,
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
             );
-            let err = handler(request, immutable_store, mutable_store)
-                .await
-                .expect_err("unset query should fail");
+            let err = handler(
+                request,
+                immutable_store,
+                mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+            )
+            .await
+            .expect_err("unset query should fail");
             assert_eq!(err.code(), tonic::Code::InvalidArgument);
         }))
         .await;
@@ -418,6 +431,8 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("Request failed")
@@ -454,6 +469,8 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("Request failed")
@@ -487,6 +504,8 @@ mod test {
                 make_request(repository, Query::Signature(root.into())),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("Request failed")
@@ -551,6 +570,8 @@ mod test {
                 make_request(repository, Query::Signature(merge_signature.into())),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("Request failed")
@@ -642,6 +663,8 @@ mod test {
                 make_request(repository, Query::Signature(signature.into())),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("Request failed")
@@ -704,6 +727,8 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("empty branch should answer successfully")
@@ -724,6 +749,8 @@ mod test {
                 make_request(repository, Query::Signature(Hash::default().into())),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("zero signature should answer successfully")
@@ -745,6 +772,8 @@ mod test {
                 make_request(repository, Query::Signature(bogus.into())),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect_err("unknown signature should fail");
@@ -771,6 +800,8 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect_err("unknown branch should fail");
@@ -800,6 +831,8 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect_err("unknown branch should fail");
@@ -828,6 +861,8 @@ mod test {
                 make_request(repository, Query::Signature(target.into())),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("Request failed")

@@ -78,23 +78,26 @@ pub async fn metadata_set_executable(
         });
 }
 
-#[cfg(target_family = "windows")]
-pub fn metadata_to_mode(metadata: &Metadata, previous: u16) -> u16 {
-    // On Windows we just preserve the previous mode for files
-    if metadata.is_file() {
-        previous & NodeFileMode::Executable.bits()
-    } else {
-        0
+/// The mode to store on a node whose mode is `previous`: the observed executable bit
+/// where the platform gave one, `previous`'s where it did not, and none for a path that
+/// is not a file.
+pub fn mode_from_observed(is_file: bool, executable: Option<bool>, previous: u16) -> u16 {
+    if !is_file {
+        return 0;
+    }
+    match executable {
+        Some(true) => NodeFileMode::Executable.bits(),
+        Some(false) => 0,
+        None => previous & NodeFileMode::Executable.bits(),
     }
 }
 
-#[cfg(target_family = "unix")]
-pub fn metadata_to_mode(metadata: &Metadata, _previous: u16) -> u16 {
-    if metadata.is_file() && ((metadata.permissions().mode() & FILE_MODE_USER_EXEC) != 0) {
-        NodeFileMode::Executable.bits()
-    } else {
-        0
-    }
+pub fn metadata_to_mode(metadata: &Metadata, previous: u16) -> u16 {
+    mode_from_observed(
+        metadata.is_file(),
+        file_executable_observed(metadata),
+        previous,
+    )
 }
 
 pub fn mode_changed(from: u16, to: u16) -> bool {
@@ -132,6 +135,19 @@ pub fn file_is_executable(_metadata: &Metadata) -> bool {
 #[cfg(target_family = "unix")]
 pub fn file_is_executable(metadata: &Metadata) -> bool {
     (metadata.permissions().mode() & FILE_MODE_USER_EXEC) != 0
+}
+
+/// Whether the file carries the executable bit, `None` where the platform has no such
+/// bit to read. [`file_is_executable`] answers `false` for both and cannot tell them
+/// apart, which a caller updating a node's mode needs.
+#[cfg(target_family = "windows")]
+pub fn file_executable_observed(_metadata: &Metadata) -> Option<bool> {
+    None
+}
+
+#[cfg(target_family = "unix")]
+pub fn file_executable_observed(metadata: &Metadata) -> Option<bool> {
+    Some(file_is_executable(metadata))
 }
 
 /// Whether every one of `names` is present in `parent`, compared exactly rather than by the
@@ -449,19 +465,6 @@ pub async fn filesystem_path(
         .map(|(path, _)| path)
 }
 
-/// The metadata of `path`, stat'ed unless [`filesystem_path_and_metadata`]
-/// already read it while resolving the path. A path the file system does not
-/// hold has none, which is what the callers act on.
-pub async fn metadata_or_stat(
-    resolved: Option<Metadata>,
-    path: impl Into<PathBuf>,
-) -> Option<Metadata> {
-    match resolved {
-        Some(metadata) => Some(metadata),
-        None => lore_io::IoDriver::global().metadata(path).await.ok(),
-    }
-}
-
 /// [`filesystem_path`], and the metadata of the resolved path where establishing
 /// it read that metadata, so a caller needing both reads it once.
 ///
@@ -569,13 +572,22 @@ pub async fn filesystem_path_and_metadata(
         found_path.push(fs_names[0].as_str());
     }
 
-    lore_debug!(
-        "Found full path case variation {} for path {} in path {}",
-        found_path.as_str(),
-        find_path.as_str(),
-        base_path.display()
-    );
+    log_resolved_case(found_path.as_str(), find_path.as_str(), base_path);
     Ok((found_path.freeze(), None))
+}
+
+/// Record a resolved path: at debug where the file system holds the name in a
+/// different case than the caller asked for, at trace where it matches, which is
+/// every other path a walk resolves.
+fn log_resolved_case(found: &str, requested: &str, base: &Path) {
+    if found == requested {
+        lore_trace!("Resolved path {found} in {}", base.display());
+    } else {
+        lore_debug!(
+            "Found full path case variation {found} for path {requested} in path {}",
+            base.display()
+        );
+    }
 }
 
 pub fn filesystem_path_fork(
@@ -1508,5 +1520,25 @@ mod tests {
     async fn all_names_exist_is_false_for_an_unreadable_directory() {
         let dir = temp_dir();
         assert!(!filesystem_names_all_exist(&dir.path().join("absent"), &["any"]).await);
+    }
+
+    const EXEC: u16 = NodeFileMode::Executable.bits();
+
+    #[test]
+    fn an_observed_bit_replaces_the_stored_one() {
+        assert_eq!(EXEC, mode_from_observed(true, Some(true), 0));
+        assert_eq!(0, mode_from_observed(true, Some(false), EXEC));
+    }
+
+    #[test]
+    fn an_unobserved_bit_keeps_the_stored_one() {
+        assert_eq!(EXEC, mode_from_observed(true, None, EXEC));
+        assert_eq!(0, mode_from_observed(true, None, 0));
+    }
+
+    #[test]
+    fn only_a_file_carries_a_mode() {
+        assert_eq!(0, mode_from_observed(false, Some(true), EXEC));
+        assert_eq!(0, mode_from_observed(false, None, EXEC));
     }
 }

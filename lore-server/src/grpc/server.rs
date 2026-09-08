@@ -68,6 +68,7 @@ use crate::grpc::revision_service::LoreRevisionService;
 use crate::grpc::storage_service::LoreStorageService;
 use crate::grpc::thinclient::LoreThinClientV1Service;
 use crate::grpc::tower::grpc_response_trace::GrpcResponseTraceLayer;
+use crate::grpc::tower::malformed_request::MalformedRequestLayer;
 use crate::grpc::tower::tracing::LoreTracingLayer;
 use crate::hooks::HookDispatcher;
 use crate::legacy::rpc::environment_service_server::EnvironmentServiceServer;
@@ -83,20 +84,23 @@ type GrpcRouter = tonic::transport::server::Router<
     Stack<
         crate::auth::anonymous::AnonymousReadLayer,
         Stack<
-            GrpcResponseTraceLayer,
+            MalformedRequestLayer,
             Stack<
-                ServiceBuilder<Stack<GrpcMetricsLayer, tower::layer::util::Identity>>,
+                GrpcResponseTraceLayer,
                 Stack<
-                    LoreTracingLayer,
+                    ServiceBuilder<Stack<GrpcMetricsLayer, tower::layer::util::Identity>>,
                     Stack<
+                        LoreTracingLayer,
                         Stack<
-                            TraceLayer<
-                                SharedClassifier<GrpcErrorsAsFailures>,
-                                MakeCorrelationIdSpan,
+                            Stack<
+                                TraceLayer<
+                                    SharedClassifier<GrpcErrorsAsFailures>,
+                                    MakeCorrelationIdSpan,
+                                >,
+                                CorrelationIdLayer,
                             >,
-                            CorrelationIdLayer,
+                            Stack<CoreHopLayer, tower::layer::util::Identity>,
                         >,
-                        Stack<CoreHopLayer, tower::layer::util::Identity>,
                     >,
                 >,
             >,
@@ -629,8 +633,8 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             enabled
         };
 
-        let metrics_layer =
-            tower::ServiceBuilder::new().layer(GrpcMetricsLayer::new(self.0.user_agent_filter));
+        let metrics_layer = tower::ServiceBuilder::new()
+            .layer(GrpcMetricsLayer::new(self.0.user_agent_filter.clone()));
         let mut server = Server::builder()
             .http2_keepalive_interval(self.0.http2_keep_alive_interval)
             .http2_keepalive_timeout(self.0.http2_keep_alive_timeout);
@@ -654,6 +658,8 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             .layer(LoreTracingLayer {})
             .layer(metrics_layer)
             .layer(GrpcResponseTraceLayer {})
+            // Innermost: the layers above must observe the reclassified status.
+            .layer(MalformedRequestLayer::new(self.0.user_agent_filter))
             // Grants anonymous read access to public repositories by
             // injecting a synthesized authorization the JWT interceptors
             // honor; inert for requests carrying a bearer token or when
@@ -669,11 +675,19 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             ),
             history_walk_concurrency: self.0.feature.revision_diff_history_walk_concurrency,
         };
+        let history_step_size = self
+            .0
+            .feature
+            .history_step_size
+            .unwrap_or(DEFAULT_HISTORY_STEP_SIZE);
+        let acceleration = RevisionListAcceleration::from_feature(&self.0.feature);
         let thin_client_v1_svc = LoreThinClientV1Service::new(
             self.0.immutable_store.clone(),
             self.0.mutable_store.clone(),
             rpc_timeout,
             revision_diff_config,
+            history_step_size,
+            acceleration,
         );
 
         let mut admin_svc = self.0.admin_svc;
@@ -685,12 +699,6 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             self.0.local_store.clone(),
             self.0.mutable_store.clone(),
         );
-        let history_step_size = self
-            .0
-            .feature
-            .history_step_size
-            .unwrap_or(DEFAULT_HISTORY_STEP_SIZE);
-        let acceleration = RevisionListAcceleration::from_feature(&self.0.feature);
         let revision_svc = ServiceBuilder::new().service(LoreRevisionService::new(
             self.0.immutable_store.clone(),
             self.0.mutable_store.clone(),

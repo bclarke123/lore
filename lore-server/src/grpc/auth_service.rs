@@ -399,7 +399,7 @@ impl UrcAuthApi for LoreAuthService {
             .into_iter()
             .map(|user_id| {
                 let display_name = if user_id == caller.user_id {
-                    caller.name.clone()
+                    caller.name.clone().unwrap_or_else(|| user_id.clone())
                 } else {
                     user_id.clone()
                 };
@@ -880,7 +880,7 @@ mod tests {
             .await
             .expect("verify minted token");
         assert_eq!(verified.user_id, "test-oidc:google-subject-1");
-        assert_eq!(verified.idp, "test-oidc");
+        assert_eq!(verified.idp.as_deref(), Some("test-oidc"));
         assert_eq!(verified.resources, None);
     }
 

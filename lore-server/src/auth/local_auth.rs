@@ -145,7 +145,7 @@ impl LocalAuth {
             jwt_issuer: auth
                 .jwt_issuer
                 .clone()
-                .or_else(|| Some(token_settings.issuer.clone())),
+                .or_else(|| Some(vec![token_settings.issuer.clone()])),
             jwt_audience: auth
                 .jwt_audience
                 .clone()
@@ -449,7 +449,7 @@ pub(crate) mod tests {
 
         let mut both_verifiers = full.clone();
         both_verifiers.jwk = Some(crate::auth::jwk::JWKServiceSettings {
-            endpoint: "https://idp.example.com/jwks".to_string(),
+            endpoint: Some("https://idp.example.com/jwks".to_string()),
         });
         assert!(matches!(
             LocalAuth::from_settings(Some(&both_verifiers)),

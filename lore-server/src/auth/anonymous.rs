@@ -38,8 +38,8 @@ pub const ANONYMOUS_USER: &str = "anonymous";
 pub fn anonymous_token(repository: RepositoryId) -> AuthorizationToken {
     AuthorizationToken {
         user_id: ANONYMOUS_USER.to_string(),
-        name: ANONYMOUS_USER.to_string(),
-        preferred_username: ANONYMOUS_USER.to_string(),
+        name: Some(ANONYMOUS_USER.to_string()),
+        preferred_username: Some(ANONYMOUS_USER.to_string()),
         resources: Some(vec![ResourcePermission {
             resource_id: format!("urc-{repository}"),
             permission: vec!["read".to_string()],
@@ -135,8 +135,8 @@ pub fn lookup_grpc_method(path: &str) -> bool {
 pub fn anonymous_lookup_token() -> AuthorizationToken {
     AuthorizationToken {
         user_id: ANONYMOUS_USER.to_string(),
-        name: ANONYMOUS_USER.to_string(),
-        preferred_username: ANONYMOUS_USER.to_string(),
+        name: Some(ANONYMOUS_USER.to_string()),
+        preferred_username: Some(ANONYMOUS_USER.to_string()),
         resources: Some(vec![]),
         ..AuthorizationToken::default()
     }

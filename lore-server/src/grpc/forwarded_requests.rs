@@ -5,6 +5,7 @@ pub mod repository_service;
 pub mod revision_service;
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use http::Uri;
 use lore_base::lore_spawn_net;
@@ -13,7 +14,7 @@ use lore_error_set::prelude::*;
 use lore_revision::errors::UnhandledError;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
-use lore_transport::grpc::user_agent;
+use lore_transport::user_agent;
 use serde::Deserialize;
 use tonic::Request;
 use tonic::Response;
@@ -35,6 +36,31 @@ pub type ForwardedRequestResult<T> = Result<Result<Response<T>, Status>, Interna
 
 const ON_BEHALF_OF_USER_ID_FIELD: &str = "on-behalf-of-user-id";
 const ON_BEHALF_OF_AUTHORIZATION_FIELD: &str = "on-behalf-of-authorization";
+
+/// Classify what a forwarded call returned.
+///
+/// A `Status` decoded from a peer's response trailers carries no source error;
+/// one tonic synthesizes locally from a connect, HTTP/2 or codec failure carries
+/// the underlying error. Only the first is the peer's answer to the caller, so
+/// the second becomes an [`InternalClientError`] and the origin substitutes its
+/// own status instead of passing transport wording on to the client.
+///
+/// Two locally-produced statuses carry no source and are therefore treated as
+/// the peer's answer: a `Status` boxed as an error by a middleware in the
+/// channel stack, and tower's load-shed `Overloaded`. [`make_channel`] adds
+/// neither, so revisit this if the channel gains a layer.
+pub(crate) fn classify_forwarded_result<T>(
+    result: Result<Response<T>, Status>,
+) -> ForwardedRequestResult<T> {
+    match result {
+        Ok(response) => Ok(Ok(response)),
+        Err(status) if std::error::Error::source(&status).is_none() => Ok(Err(status)),
+        Err(status) => Err(InternalClientError::internal_with_context(
+            status,
+            "forwarded request did not reach the peer",
+        )),
+    }
+}
 
 /// Reconstructed information about the end user client who has performed a particular
 /// RPC. Used in place of directly reading from metadata to avoid it being brought into
@@ -144,6 +170,8 @@ pub struct RpcFlags {
 
     #[serde(default)]
     pub repository_create: bool,
+    #[serde(default)]
+    pub repository_get: bool,
 }
 
 pub trait ForwardedRequests: Send + Sync {
@@ -169,7 +197,17 @@ async fn make_channel(settings: &GrpcInternalClientSettings) -> Result<Channel, 
 
     let endpoint = endpoint
         .user_agent(user_agent())
-        .internal("error setting user agent")?;
+        .internal("error setting user agent")?
+        .connect_timeout(Duration::from_secs(settings.connect_timeout_seconds))
+        .timeout(Duration::from_secs(settings.request_timeout_seconds))
+        .tcp_keepalive(Some(Duration::from_secs(settings.tcp_keepalive_seconds)))
+        .http2_keep_alive_interval(Duration::from_secs(
+            settings.http2_keepalive_interval_seconds,
+        ))
+        .keep_alive_timeout(Duration::from_secs(
+            settings.http2_keepalive_timeout_seconds,
+        ))
+        .keep_alive_while_idle(true);
     // Connect from net so the hyper/h2 driver tasks this spawns bind there rather
     // than to the core runtime the caller runs on.
     let channel = lore_spawn_net!(async move { endpoint.connect().await })
@@ -339,6 +377,61 @@ mod test {
 
             let ctx = CallerContext::from_forwarded_request(&request).unwrap();
             assert_eq!(ctx.authorization, None);
+        }
+    }
+
+    mod classify_forwarded_result {
+        use super::*;
+
+        /// Stands in for a transport failure: tonic reports one as a `Status`
+        /// carrying the underlying error as its source.
+        fn locally_synthesized_status() -> Status {
+            Status::from_error(Box::new(std::io::Error::other("tcp connect error")))
+        }
+
+        #[test]
+        fn success_is_passed_through() {
+            let response = classify_forwarded_result(Ok(Response::new(42)))
+                .expect("a response is not a client error")
+                .expect("a response is not a peer error");
+            assert_eq!(response.into_inner(), 42);
+        }
+
+        #[test]
+        fn sourceless_status_is_the_peer_answer_for_the_client() {
+            let result: ForwardedRequestResult<()> =
+                classify_forwarded_result(Err(Status::not_found("no such repository")));
+
+            let status = result
+                .expect("a peer answer is not a client error")
+                .expect_err("the peer answered with an error");
+            assert_eq!(status.code(), tonic::Code::NotFound);
+            assert_eq!(status.message(), "no such repository");
+        }
+
+        #[test]
+        fn sourced_status_becomes_an_internal_client_error() {
+            let result: ForwardedRequestResult<()> =
+                classify_forwarded_result(Err(locally_synthesized_status()));
+
+            let err = result.expect_err("a transport failure is a client error");
+            assert!(
+                err.to_string().contains("did not reach the peer"),
+                "unexpected error: {err}"
+            );
+        }
+
+        #[test]
+        fn transport_detail_is_kept_for_the_log() {
+            let result: ForwardedRequestResult<()> =
+                classify_forwarded_result(Err(locally_synthesized_status()));
+
+            let err = result.expect_err("a transport failure is a client error");
+            let detail = format!("{err:?}");
+            assert!(
+                detail.contains("tcp connect error"),
+                "the failing status should stay in the error chain: {detail}"
+            );
         }
     }
 

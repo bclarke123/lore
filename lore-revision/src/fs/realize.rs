@@ -21,7 +21,9 @@ use crate::errors::LocalModifications;
 use crate::errors::WriteRequired;
 use crate::event;
 use crate::filter::FilterMode;
+use crate::fs::filesystem_provider::FilesystemDiffIntent;
 use crate::fs::filesystem_provider::FilesystemPath;
+use crate::fs::filesystem_provider::FilesystemTraversal;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::MeasuredNode;
@@ -138,21 +140,31 @@ pub async fn realize_state(
             "Calculating deltas from filesystem -> {}",
             state_target.revision_number()
         );
-        let (mut changes, _stats) = operation
-            .changes_from_filesystem_to_state(
-                repository.clone(),
-                state_target.clone(),
-                repository.clone(),
-                state_current.clone(),
-                RelativePath::new(),
-                ROOT_NODE,
-                ROOT_NODE,
-                options.filter_mode | FilterMode::Ignore,
-            )
-            .await
-            .forward::<SyncError>(
-                "Failed to calculate delta changes between file system and target state",
-            )?;
+        let mut changes = Vec::new();
+        state::diff_filesystem_subtree(
+            &operation,
+            FilesystemTraversal {
+                repository: repository.clone(),
+                state: state_target.clone(),
+                node_path: RelativePath::new(),
+                root_node: ROOT_NODE,
+            },
+            FilesystemTraversal {
+                repository: repository.clone(),
+                state: state_current.clone(),
+                node_path: RelativePath::new(),
+                root_node: ROOT_NODE,
+            },
+            RelativePath::new(),
+            options.filter_mode | FilterMode::Ignore,
+            FilesystemDiffIntent::Report,
+            Arc::new(Vec::new()),
+            &mut changes,
+        )
+        .await
+        .forward::<SyncError>(
+            "Failed to calculate delta changes between file system and target state",
+        )?;
         /*
         stats.change.file_retain.fetch_add(
             diff_stats.file_retain.load(Ordering::Relaxed) as usize,
@@ -715,21 +727,31 @@ pub async fn verify_filesystem(
                 })?;
             let subnode_current = current_node_link.node;
             let state_from = change.from.state.clone();
-            let (directory_changes, _) = operation
-                .changes_from_filesystem_to_state(
-                    change.from.repository.clone(),
-                    state_from.clone(),
-                    repository_current,
-                    state_current.clone(),
-                    change.path.clone(),
-                    change.from.node,
-                    subnode_current,
-                    filter_mode,
-                )
-                .await
-                .forward::<SyncError>(
-                    "Failed to calculate delta changes between file system and target state",
-                )?;
+            let mut directory_changes = Vec::new();
+            state::diff_filesystem_subtree(
+                &operation,
+                FilesystemTraversal {
+                    repository: change.from.repository.clone(),
+                    state: state_from.clone(),
+                    node_path: change.path.clone(),
+                    root_node: change.from.node,
+                },
+                FilesystemTraversal {
+                    repository: repository_current,
+                    state: state_current.clone(),
+                    node_path: change.path.clone(),
+                    root_node: subnode_current,
+                },
+                change.path.clone(),
+                filter_mode,
+                FilesystemDiffIntent::Report,
+                Arc::new(Vec::new()),
+                &mut directory_changes,
+            )
+            .await
+            .forward::<SyncError>(
+                "Failed to calculate delta changes between file system and target state",
+            )?;
             if !directory_changes.is_empty() {
                 let mut has_modified_file = false;
                 for subchange in directory_changes {
@@ -1607,7 +1629,7 @@ async fn realize_change_modify_add(
     // Only on-disk work honours the view. This gates directory creation, link
     // cloning and the file write. The move rename below is not gated, because
     // it repositions a path an earlier in-view realize may have written.
-    let write_to_disk = !view_filter.excludes(path, node.is_directory(), FilterMode::View);
+    let write_to_disk = !view_filter.excludes_tree(path, node.is_directory(), FilterMode::View);
 
     // A move is realized by renaming the file already on disk, which lets the
     // content write be skipped when the content did not change. That only holds
@@ -1615,7 +1637,7 @@ async fn realize_change_modify_add(
     // tree holds nothing at an excluded source, so the rename finds no file and
     // the destination has to be written from the immutable store like any add.
     let moved_from_in_view = change.from_path.as_ref().is_some_and(|from_path| {
-        !view_filter.excludes(from_path, node.is_directory(), FilterMode::View)
+        !view_filter.excludes_tree(from_path, node.is_directory(), FilterMode::View)
     });
 
     lore_trace!(
@@ -1691,23 +1713,24 @@ async fn realize_change_modify_add(
 
             let clone_path = RepositoryPath::from_relative(&link, change.path.clone())?;
 
-            let link_operation = operation
-                .associated_operation(link.clone())
-                .await
-                .forward::<SyncError>("Failed starting operation in linked repository")?;
-            // Don't use the existing operation because virtualization needs to be resolved for the
-            // linked repository separately.
             let clone_ctx = CloneContext {
                 repository: link.clone(),
                 state: link_state,
-                operation: link_operation,
+                operation: operation.clone(),
                 options: Arc::default(),
                 stats: Arc::default(),
                 modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
             };
-            clone::clone_node(clone_ctx, link_storage, clone_path, node.child)
-                .await
-                .forward::<SyncError>("Failed to sync link")?;
+            let clone_states = link.filter.mount_states(clone_path.relative());
+            clone::clone_node(
+                clone_ctx,
+                link_storage,
+                clone_path,
+                node.child,
+                clone_states,
+            )
+            .await
+            .forward::<SyncError>("Failed to sync link")?;
         }
     } else if node.is_file() && !dry_run && write_to_disk {
         // For move changes where content didn't change, the rename already positioned the file correctly and the current branch's content should be preserved.
@@ -2003,7 +2026,7 @@ async fn realize_file_merge(
     let mut conflict = true;
     let mut size = 0;
 
-    let in_view = !view_filter.excludes(&change_to.path, false, FilterMode::View);
+    let in_view = !view_filter.excludes_tree(&change_to.path, false, FilterMode::View);
 
     // A view-excluded path has no working-tree file, so there is nothing to
     // compare and no merge result to edit. Adopt the incoming side, recorded
@@ -2632,6 +2655,7 @@ mod tests {
             to: side(repository, source),
             path: path.clone(),
             from_path: None,
+            observed: None,
         };
 
         Box::pin(verify_filesystem(

@@ -28,6 +28,7 @@ pub enum UserInfoError {
     NoRemote,
     Maintenance,
     NotFound,
+    AddressNotFound,
     NotSupported,
     Oversized,
     SlowDown,
@@ -470,7 +471,7 @@ pub async fn user_display_name(
         )
         .await
     {
-        return Ok(user_info.name);
+        return Ok(display_name(&user_info));
     }
 
     // Obtain an authorization token from the authentication token

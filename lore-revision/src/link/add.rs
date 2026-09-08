@@ -9,7 +9,7 @@ use crate::branch;
 use crate::errors::InvalidPath;
 use crate::event;
 use crate::filter::FilterMode;
-use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreFileAction;
 use crate::link;
 use crate::link::LinkFlags;
@@ -47,10 +47,28 @@ pub async fn add(
     pin: Option<String>,
     disable_branching: bool,
 ) -> Result<(), LinkError> {
-    let (remote_url, name) = repository::parse_url(&link_identifier, false)
-        .forward_with::<LinkError, _>(|| {
+    // The identifier is a full URL or a bare name or ID, and only a scheme tells them apart:
+    // `is_valid_name` permits scoped names like `org/project`, so a slash says nothing about
+    // which form this is. A schemeless identifier names a repository on the same remote as
+    // this one, so resolve it against this repository's own configured remote rather than
+    // reading its first segment as a host. Taking the remote from the config also keeps the
+    // link and the repository pointing at the same server, which the environment variable
+    // this replaces could not guarantee.
+    let (remote_url, name) = if link_identifier.contains("://") {
+        repository::parse_url(&link_identifier, false).forward_with::<LinkError, _>(|| {
             format!("Invalid repository URL or ID: {link_identifier}")
-        })?;
+        })?
+    } else {
+        let remote_url = repository
+            .require_path()
+            .ok()
+            .and_then(|path| repository::repository_remote(path.to_string_lossy()).ok())
+            .unwrap_or_default();
+        if remote_url.is_empty() {
+            return Err(LinkError::from(crate::errors::NoRemote));
+        }
+        (remote_url, link_identifier.clone())
+    };
 
     let context = execution_context();
     let identity = context.globals().identity().unwrap_or_default();
@@ -265,6 +283,22 @@ pub async fn add(
     let inner_state = chain.innermost_state.clone();
     let remainder_path = chain.remainder_path.clone();
 
+    // The stored path rather than the argument, which resolved case-insensitively.
+    let resolved_source_path =
+        link::link_source_path(link.clone(), &link_state, link_node_link.node)
+            .await
+            .forward::<LinkError>("Failed resolving link source path")?;
+
+    link::check_source_path_overlap(
+        &inner_state,
+        inner_repository.clone(),
+        link.clone(),
+        resolved_source_path,
+        crate::node::INVALID_NODE,
+    )
+    .await
+    .forward::<LinkError>("Failed checking link source paths")?;
+
     if let Ok(node_link) = inner_state
         .find_relative_node_link(
             inner_repository.clone(),
@@ -328,25 +362,29 @@ pub async fn add(
                 .join(chain.innermost_mount_path.as_str());
 
             lore_debug!("Staging link parent path in innermost repository");
-            Box::pin(stage::stage_filesystem_path(
-                inner_repository.clone(),
-                inner_state.clone(),
-                inner_base_absolute,
-                RelativePathBuf::new(),
-                chain.innermost_base_node,
-                remainder_parent.freeze(),
-                Arc::default(),
-                StageOptions {
-                    no_children: true,
-                    ..Default::default()
-                },
-                None, // No link tracking when adding links
-                None, // No layer mask
-                None, // Prefixes resolved for the outer repository do not apply
-                None, // Node ids here index the inner repository's own state
-            ))
-            .await
-            .forward::<LinkError>("Failed staging the link node")?;
+            with_operation(repository.file_system(), true, async |operation| {
+                Box::pin(stage::stage_filesystem_path(
+                    operation,
+                    inner_repository.clone(),
+                    inner_state.clone(),
+                    inner_base_absolute,
+                    RelativePathBuf::new(),
+                    chain.innermost_base_node,
+                    remainder_parent.freeze(),
+                    Arc::default(),
+                    StageOptions {
+                        no_children: true,
+                        ..Default::default()
+                    },
+                    None, // No link tracking when adding links
+                    None, // No layer mask
+                    None, // Prefixes resolved for the outer repository do not apply
+                    None, // Node ids here index the inner repository's own state
+                ))
+                .await
+                .forward::<LinkError>("Failed staging the link node")
+            })
+            .await?;
         }
     }
 
@@ -423,27 +461,27 @@ pub async fn add(
     .send();
 
     let stats = Arc::new(CloneStats::default());
-    let operation = link
-        .file_system()
-        .begin_operation()
+    let clone_states = link.filter.mount_states(clone_path.relative());
+    with_operation(link.file_system(), true, async |operation| {
+        let clone_ctx = CloneContext {
+            repository: link.clone(),
+            state: link_state,
+            operation,
+            options: Arc::default(),
+            stats: stats.clone(),
+            modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
+        };
+        clone::clone_node(
+            clone_ctx,
+            storage,
+            clone_path,
+            link_node_link.node,
+            clone_states,
+        )
         .await
-        .forward::<LinkError>("Failed to start operation")?;
-    let clone_ctx = CloneContext {
-        repository: link.clone(),
-        state: link_state,
-        operation: operation.clone(),
-        options: Arc::default(),
-        stats: stats.clone(),
-        modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
-    };
-
-    clone::clone_node(clone_ctx, storage, clone_path, link_node_link.node)
-        .await
-        .forward::<LinkError>("Failed cloning target link")?;
-    operation
-        .finalize(true)
-        .await
-        .forward::<LinkError>("Failed cloning target layer")?;
+        .forward::<LinkError>("Failed cloning target link")
+    })
+    .await?;
 
     event::LoreEvent::RepositoryCloneEnd(LoreRepositoryCloneEndEventData {
         branch: branch_name.into(),

@@ -1102,7 +1102,12 @@ async fn commit_link_only(
     let mut link_context = repository
         .to_link_context(resolved_staged.link_context.id)
         .await;
-    link_context.path = Some(repository.require_path()?.join(&link_path));
+    link_context.paths = Some(
+        link_context
+            .paths
+            .ok_or(CommitError::internal("Repository context missing a path"))?
+            .with_link_path(link_path.as_ref()),
+    );
     let link_repository = Arc::new(link_context);
 
     // Determine the effective current revision for the link. The parent's
@@ -2458,7 +2463,7 @@ async fn commit_file(
     let (address, content_size, mode, modified_time) =
         if repository
             .filter
-            .excludes(&relative_path, false, FilterMode::View)
+            .excludes_tree(&relative_path, false, FilterMode::View)
         {
             (node.address, node.size, node.mode, None)
         } else {

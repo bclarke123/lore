@@ -90,7 +90,7 @@ mod tests {
     fn verifier(minter: &TokenMinter) -> JwtVerifier {
         JwtVerifier {
             jwk_service: Arc::new(LocalJwkService::new(minter)),
-            jwt_issuer: Some(minter.issuer().to_string()),
+            jwt_issuer: Some(vec![minter.issuer().to_string()]),
             jwt_audience: Some(minter.audience().to_vec()),
         }
     }
@@ -116,7 +116,7 @@ mod tests {
             .await
             .expect("verify");
         assert_eq!(claims.user_id, "static:alice");
-        assert_eq!(claims.idp, "static");
+        assert_eq!(claims.idp.as_deref(), Some("static"));
         assert_eq!(claims.resources, None);
     }
 
@@ -173,7 +173,7 @@ mod tests {
         for bad in [
             JwtVerifier {
                 jwk_service: Arc::new(LocalJwkService::new(&minter)),
-                jwt_issuer: Some("https://other.example.com".to_string()),
+                jwt_issuer: Some(vec!["https://other.example.com".to_string()]),
                 jwt_audience: None,
             },
             JwtVerifier {

@@ -216,14 +216,24 @@ fn trace_config_error_to_config(err: TraceConfigError) -> config::ConfigError {
 /// Server-related settings
 ///
 
+#[serde_with::serde_as]
 #[derive(Clone, Debug, Deserialize)]
 //#[serde(deny_unknown_fields)]
 pub struct AuthSettings {
-    /// External JWKS endpoint for verifying tokens issued by a remote auth
-    /// service. Mutually exclusive with `token` (server-local minting).
+    /// Optional JWK override. Verification is enabled by `[server.auth]`.
+    /// If this or its `endpoint` is absent, the JWKS endpoint is
+    /// resolved through OIDC discovery against `jwt_issuer`.
     pub jwk: Option<JWKServiceSettings>,
     pub jwt_audience: Option<Vec<String>>,
-    pub jwt_issuer: Option<String>,
+    /// The `iss` values verification accepts. A bare string still parses, so
+    /// existing configs need no edit. Two entries is for the length of an
+    /// issuer's cutover — accepting tokens minted under both the old and the
+    /// new `iss` while they are both in flight — and one entry otherwise. The
+    /// list is not for discovering several providers: discovery resolves
+    /// against the first entry, and two entries with different discovery
+    /// documents is a configuration error.
+    #[serde_as(as = "Option<serde_with::OneOrMany<_, serde_with::formats::PreferMany>>")]
+    pub jwt_issuer: Option<Vec<String>>,
     /// Server-local token minting; when set the server issues and verifies
     /// its own tokens.
     pub token: Option<crate::auth::minting::TokenMintingSettings>,
@@ -380,6 +390,45 @@ pub struct ServerSettings {
 pub struct GrpcInternalClientSettings {
     pub url: String,
     pub certs: Option<CertificateSettings>,
+    /// Ceiling on the TCP connect. Covers neither DNS nor the TLS handshake.
+    #[serde(default = "GrpcInternalClientSettings::default_connect_timeout_seconds")]
+    pub connect_timeout_seconds: u64,
+    /// Deadline for each request on the channel. Keep below the
+    /// `request_handler_timeout_seconds` of the endpoint whose handler issues it.
+    #[serde(default = "GrpcInternalClientSettings::default_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+    #[serde(default = "GrpcInternalClientSettings::default_tcp_keepalive_seconds")]
+    pub tcp_keepalive_seconds: u64,
+    /// HTTP/2 keep-alive PING interval, sent while the channel is idle. Keep below
+    /// the idle timeout of anything on the path that reaps idle connections.
+    #[serde(default = "GrpcInternalClientSettings::default_http2_keepalive_interval_seconds")]
+    pub http2_keepalive_interval_seconds: u64,
+    /// How long a keep-alive PING may go unanswered before the connection is
+    /// dropped.
+    #[serde(default = "GrpcInternalClientSettings::default_http2_keepalive_timeout_seconds")]
+    pub http2_keepalive_timeout_seconds: u64,
+}
+
+impl GrpcInternalClientSettings {
+    fn default_connect_timeout_seconds() -> u64 {
+        5
+    }
+
+    fn default_request_timeout_seconds() -> u64 {
+        40
+    }
+
+    fn default_tcp_keepalive_seconds() -> u64 {
+        30
+    }
+
+    fn default_http2_keepalive_interval_seconds() -> u64 {
+        20
+    }
+
+    fn default_http2_keepalive_timeout_seconds() -> u64 {
+        10
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -568,6 +617,45 @@ mod tests {
     fn http_settings(extra_keys: &str) -> HttpSettings {
         toml::from_str(&format!("{MINIMAL_HTTP_SETTINGS}\n{extra_keys}\n"))
             .expect("[server.http] should deserialize")
+    }
+
+    /// A bare-string `jwt_issuer` and a one-entry list are the same
+    /// configuration, so existing config files need no edit.
+    #[test]
+    fn jwt_issuer_accepts_a_bare_string_and_a_list() {
+        let bare: AuthSettings = toml::from_str(r#"jwt_issuer = "LEGACY_AUTH_KEYWORD""#)
+            .expect("[server.auth] with a bare string should deserialize");
+        let list: AuthSettings = toml::from_str(r#"jwt_issuer = ["LEGACY_AUTH_KEYWORD"]"#)
+            .expect("[server.auth] with a list should deserialize");
+
+        assert_eq!(bare.jwt_issuer, list.jwt_issuer);
+        assert_eq!(
+            bare.jwt_issuer,
+            Some(vec!["LEGACY_AUTH_KEYWORD".to_string()])
+        );
+    }
+
+    #[test]
+    fn jwt_issuer_accepts_two_entries_for_a_cutover() {
+        let auth: AuthSettings = toml::from_str(
+            r#"jwt_issuer = ["LEGACY_AUTH_KEYWORD", "https://auth.example.com/realms/lore"]"#,
+        )
+        .expect("[server.auth] with two issuers should deserialize");
+
+        assert_eq!(
+            auth.jwt_issuer,
+            Some(vec![
+                "LEGACY_AUTH_KEYWORD".to_string(),
+                "https://auth.example.com/realms/lore".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn jwt_issuer_absent_stays_none() {
+        let auth: AuthSettings =
+            toml::from_str("").expect("an empty [server.auth] should deserialize");
+        assert_eq!(auth.jwt_issuer, None);
     }
 
     /// Both keys absent means an empty policy, which resolves to the built-in set.

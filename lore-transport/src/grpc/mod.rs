@@ -25,11 +25,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use http::header::AUTHORIZATION;
+use lore_base::error::AddressNotFound;
 use lore_base::lore_debug;
 use lore_base::lore_info;
 use lore_base::lore_trace;
 use lore_base::types::*;
-use lore_base::version::LORE_LIBRARY_VERSION;
 use lore_error_set::prelude::*;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
@@ -632,23 +632,6 @@ async fn lock_connection(remote_url: &Url) -> Arc<RwLock<Weak<GRPCConnection>>> 
 const HTTP2_KEEP_ALIVE_INTERVAL: u64 = 30;
 const HTTP2_KEEP_ALIVE_TIMEOUT: u64 = 20;
 
-static USER_AGENT: OnceLock<String> = OnceLock::new();
-
-/// User agent string for gRPC connections. Reads from `LORE_USER_AGENT` env var,
-/// falls back to a default value.
-pub fn user_agent() -> &'static str {
-    USER_AGENT
-        .get_or_init(|| {
-            std::env::var("LORE_USER_AGENT")
-                .unwrap_or_else(|_| format!("lore-transport/{}", LORE_LIBRARY_VERSION.as_str()))
-        })
-        .as_str()
-}
-
-pub fn set_user_agent(name: String) -> bool {
-    USER_AGENT.set(name).is_ok()
-}
-
 async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
     let mut endpoint = tonic::transport::Channel::from_shared(remote.to_string())
         .internal_with(|| format!("connect: {remote}"))?;
@@ -675,7 +658,7 @@ async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
             )
             .internal_with(|| format!("configuring TLS for {remote}"))?;
     }
-    let user_agent = user_agent();
+    let user_agent = crate::user_agent();
     endpoint = endpoint
         .user_agent(user_agent)
         .internal_with(|| format!("setting user agent for {remote}"))?;
@@ -782,6 +765,30 @@ pub async fn connect(
     }
 
     Ok(connection)
+}
+
+/// Encode a missing address as `FAILED_PRECONDITION` carrying it in the status
+/// details.
+///
+/// The code states that the request cannot be served in the peer's current
+/// state, leaving `NOT_FOUND` to name an absent object alone. The details carry
+/// the address, which [`address_not_found_details`] reads back.
+pub fn address_not_found_status(error: &AddressNotFound, message: impl Into<String>) -> Status {
+    Status::with_details(
+        tonic::Code::FailedPrecondition,
+        message,
+        Bytes::copy_from_slice(&error.address),
+    )
+}
+
+/// Recover the address a peer attached with [`address_not_found_status`].
+///
+/// Details of any other length read as absent, so an address is reconstructed
+/// only from one this side can name in full.
+pub(crate) fn address_not_found_details(status: &Status) -> Option<AddressNotFound> {
+    Some(AddressNotFound {
+        address: status.details().try_into().ok()?,
+    })
 }
 
 async fn handle_error(retry: &mut crate::util::Retry, status: Status) -> Result<(), ProtocolError> {
@@ -1860,5 +1867,79 @@ mod tests {
             (1..=MAX_RECONNECTS_PER_OP as u32).collect::<Vec<_>>(),
             "each attempt must observe the epoch left by the previous rebuild",
         );
+    }
+
+    fn missing_address() -> AddressNotFound {
+        AddressNotFound {
+            address: std::array::from_fn(|index| index as u8),
+        }
+    }
+
+    /// The address survives the round trip, so a caller can name the fragment
+    /// the peer is missing.
+    #[test]
+    fn a_missing_address_round_trips_through_a_status() {
+        let status = Status::from(ProtocolError::from(missing_address()));
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+
+        let error = ProtocolError::from(status);
+        assert_eq!(
+            error.as_address_not_found().map(|error| error.address),
+            Some(missing_address().address),
+        );
+    }
+
+    /// The details are a trailer, so the round trip has to hold across the
+    /// headers a peer actually reads.
+    #[test]
+    fn a_missing_address_round_trips_through_the_headers() {
+        let mut headers = http::HeaderMap::new();
+        Status::from(ProtocolError::from(missing_address()))
+            .add_header(&mut headers)
+            .expect("encode the status");
+
+        let status = Status::from_header_map(&headers).expect("decode the status");
+        let error = ProtocolError::from(status);
+        assert_eq!(
+            error.as_address_not_found().map(|error| error.address),
+            Some(missing_address().address),
+        );
+    }
+
+    /// `NotFound` names an absent object, which a caller recovers from by
+    /// creating it, and never an address.
+    #[test]
+    fn a_not_found_is_never_read_as_an_address() {
+        let status = Status::with_details(
+            tonic::Code::NotFound,
+            "Branch not found",
+            Bytes::copy_from_slice(&missing_address().address),
+        );
+
+        let error = ProtocolError::from(status);
+        assert!(error.is_not_found(), "{error:?}");
+    }
+
+    /// A rejection naming no address is one of the other conditions the code
+    /// carries, so it stays an opaque failure.
+    #[test]
+    fn a_failed_precondition_without_details_is_not_an_address() {
+        let error = ProtocolError::from(Status::failed_precondition(
+            "Branch push is not a fast-forward",
+        ));
+        assert!(error.is_internal(), "{error:?}");
+    }
+
+    /// Details of any other length are not guessed at.
+    #[test]
+    fn details_of_another_length_are_not_read_as_an_address() {
+        let status = Status::with_details(
+            tonic::Code::FailedPrecondition,
+            "Missing fragment",
+            Bytes::from_static(&[1, 2, 3]),
+        );
+
+        let error = ProtocolError::from(status);
+        assert!(error.is_internal(), "{error:?}");
     }
 }

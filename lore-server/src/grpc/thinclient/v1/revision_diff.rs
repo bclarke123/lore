@@ -113,6 +113,8 @@ pub async fn handler(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     config: RevisionDiffConfig,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<Response<RevisionDiffStream>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
@@ -142,8 +144,20 @@ pub async fn handler(
         .scope(execution, async move {
             // Resolve both sides up-front so unary errors surface before
             // the stream opens.
-            let (from_sig, from_id) = resolve_to_identifier(&repository, query_from.into()).await?;
-            let (to_sig, to_id) = resolve_to_identifier(&repository, query_to.into()).await?;
+            let (from_sig, from_id) = resolve_to_identifier(
+                &repository,
+                query_from.into(),
+                history_step_size,
+                acceleration,
+            )
+            .await?;
+            let (to_sig, to_id) = resolve_to_identifier(
+                &repository,
+                query_to.into(),
+                history_step_size,
+                acceleration,
+            )
+            .await?;
 
             let (tx, rx) = mpsc::channel(256);
 
@@ -281,7 +295,10 @@ async fn branch_stack_contains(
     branch_id: BranchId,
     revision: Hash,
 ) -> Result<bool, Status> {
-    let metadata = match branch::metadata(repository.clone(), branch_id).await {
+    let metadata = match branch::metadata(repository.clone(), branch_id)
+        .await
+        .filter_slow_down()?
+    {
         Ok(metadata) => metadata,
         Err(err) if err.is_branch_not_found() => return Ok(false),
         Err(err) => {
@@ -370,7 +387,7 @@ async fn run_two_way(
         diff_revision_paths(repo_clone, from_state, to_state, None, producer_tx).await
     });
     while let Some(item) = producer_rx.recv().await {
-        let change = item.map_err(|err| {
+        let change = item.filter_slow_down()?.map_err(|err| {
             warn!(
                 {REPOSITORY_ID} = %repository.id,
                 from = %from_sig_clone,
@@ -396,9 +413,21 @@ async fn run_two_way(
     }
 
     // Surface any error from the producer task itself.
-    match producer.await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => {
+    let produced = match producer.await {
+        Ok(produced) => produced,
+        Err(join_err) => {
+            warn!(
+                {REPOSITORY_ID} = %repository.id,
+                ?join_err,
+                "2-way revision diff producer task panicked",
+            );
+            return Err(Status::internal("revision diff producer task failed"));
+        }
+    };
+
+    match produced.filter_slow_down()? {
+        Ok(()) => Ok(()),
+        Err(err) => {
             warn!(
                 {REPOSITORY_ID} = %repository.id,
                 from = %from_sig,
@@ -409,14 +438,6 @@ async fn run_two_way(
             Err(warn_error_to_status(&err, |e| {
                 Status::internal(e.to_string())
             }))
-        }
-        Err(join_err) => {
-            warn!(
-                {REPOSITORY_ID} = %repository.id,
-                ?join_err,
-                "2-way revision diff producer task panicked",
-            );
-            Err(Status::internal("revision diff producer task failed"))
         }
     }
 }
@@ -447,6 +468,7 @@ async fn run_three_way(
     let base =
         branch::resolve_diff3_base(repository.clone(), from_branch, from_sig, to_branch, to_sig)
             .await
+            .filter_slow_down()?
             .map_err(|err| {
                 warn!(
                     {REPOSITORY_ID} = %repository.id,
@@ -597,12 +619,10 @@ async fn run_three_way(
 /// typed variant lets us avoid string-matching the inner `StateError`
 /// across crate boundaries.
 fn map_branch_error_to_status(err: BranchError) -> Status {
-    if err.is_oversized() {
+    if err.is_slow_down() || err.is_oversized() || err.is_max_history_search_depth() {
         Status::resource_exhausted(err.to_string())
     } else if err.is_divergent() {
         Status::failed_precondition(err.to_string())
-    } else if err.is_max_history_search_depth() {
-        Status::resource_exhausted(err.to_string())
     } else {
         warn_error_to_status(&err, |e| Status::internal(e.to_string()))
     }
@@ -616,8 +636,12 @@ async fn load_state_pair(
     let from_fut = State::deserialize(repository.clone(), from_sig);
     let to_fut = State::deserialize(repository.clone(), to_sig);
     let (from_res, to_res) = tokio::join!(from_fut, to_fut);
-    let from_state = from_res.map_err(|err| state_status(repository, from_sig, err))?;
-    let to_state = to_res.map_err(|err| state_status(repository, to_sig, err))?;
+    let from_state = from_res
+        .filter_slow_down()?
+        .map_err(|err| state_status(repository, from_sig, err))?;
+    let to_state = to_res
+        .filter_slow_down()?
+        .map_err(|err| state_status(repository, to_sig, err))?;
     Ok((from_state, to_state))
 }
 
@@ -760,6 +784,7 @@ mod test {
     use super::*;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
+    use crate::grpc::server::RevisionListAcceleration;
     use crate::store::test_store_create;
 
     fn make_request(
@@ -897,6 +922,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             {
@@ -940,6 +967,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1002,6 +1031,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1095,6 +1126,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1189,6 +1222,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1247,6 +1282,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             {
@@ -1293,6 +1330,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1363,6 +1402,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1419,6 +1460,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             {
@@ -1478,6 +1521,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1574,6 +1619,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");

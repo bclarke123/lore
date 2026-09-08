@@ -65,7 +65,7 @@ pub struct ReqwestOidcBackend;
 impl OidcBackend for ReqwestOidcBackend {
     async fn fetch_discovery(&self, url: &str) -> Result<DiscoveryDocument, AuthProviderError> {
         let client = reqwest::Client::builder()
-            .user_agent(lore_transport::grpc::user_agent())
+            .user_agent(lore_transport::user_agent())
             .build()
             .map_err(|e| AuthProviderError::Internal(format!("http client: {e}")))?;
         let response = client
@@ -93,7 +93,7 @@ impl OidcBackend for ReqwestOidcBackend {
         form: &[(&str, &str)],
     ) -> Result<TokenResponse, AuthProviderError> {
         let client = reqwest::Client::builder()
-            .user_agent(lore_transport::grpc::user_agent())
+            .user_agent(lore_transport::user_agent())
             .build()
             .map_err(|e| AuthProviderError::Internal(format!("http client: {e}")))?;
         let response = client
@@ -120,7 +120,7 @@ impl OidcBackend for ReqwestOidcBackend {
     fn jwk_service(&self, jwks_uri: &str) -> Arc<dyn JWKService> {
         Arc::new(crate::auth::jwk::JwkServiceImpl::new(
             crate::auth::jwk::JWKServiceSettings {
-                endpoint: jwks_uri.to_string(),
+                endpoint: Some(jwks_uri.to_string()),
             },
         ))
     }

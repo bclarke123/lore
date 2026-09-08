@@ -14,6 +14,7 @@ from error_types import (
     NestedLinkError,
     NotALinkError,
     NothingStagedError,
+    OverlappingLinkError,
     PathExistChildrenLinkError,
     PathExistLinkError,
 )
@@ -2123,6 +2124,168 @@ def test_link_reset(new_lore_repo):
         assert "second link file original" in f.read(), (
             "Second link file should be restored after multi-link root reset"
         )
+
+
+@pytest.mark.smoke
+def test_link_reset_honours_a_directory_rule_naming_the_mount(new_lore_repo):
+    """A directory rule naming a link mount excludes the content mounted there.
+
+    The mount node is a link, not a directory, so the rule does not match the
+    node itself. It matches the mount path, which is what the content below it
+    sits in, and every walk folds the mount path that way. Reset has to reach
+    the same verdict or it restores files the filter excludes.
+    """
+    repo: Lore = new_lore_repo()
+
+    outside_file = "outside.txt"
+    with repo.open_file(outside_file, "w+") as output_file:
+        output_file.writelines(["outside original\n"])
+
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push()
+
+    link_repo = new_lore_repo()
+    link_file = "inside.txt"
+    with link_repo.open_file(link_file, "w+") as output_file:
+        output_file.writelines(["inside original\n"])
+
+    link_repo.stage(scan=True)
+    link_repo.commit()
+    link_repo.push()
+
+    link_path = "linked"
+    repo.link_add(link_path, link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+
+    mounted_file = f"{link_path}/{link_file}"
+    assert repo.compare_file(repo, mounted_file)
+
+    # A rooted directory rule naming the mount, the shape a sparse view uses.
+    with repo.open_file(repo.ignore_file(), "w+") as ignore_file:
+        ignore_file.write(f"/{link_path}/\n")
+
+    with repo.open_file(mounted_file, "w+") as output_file:
+        output_file.writelines(["inside modified\n"])
+    with repo.open_file(outside_file, "w+") as output_file:
+        output_file.writelines(["outside modified\n"])
+
+    repo.reset(".")
+
+    with repo.open_file(outside_file, "r") as f:
+        assert "outside original" in f.read(), (
+            "Reset should restore a file the filter does not exclude"
+        )
+    with repo.open_file(mounted_file, "r") as f:
+        assert "inside modified" in f.read(), (
+            "Reset should not descend into a link mount the filter excludes"
+        )
+
+
+def _staged_paths(repo: Lore) -> list[str]:
+    """Paths `status` reports as staged. It reports unstaged changes too, marked
+    with `flagStaged` false, so the flag is what separates the two."""
+    return [
+        entry["path"]
+        for entry in parse_status_json(repo.status(json=True))
+        if entry["flagStaged"]
+    ]
+
+
+@pytest.mark.smoke
+def test_link_unstage_honours_a_rule_naming_the_mount(new_lore_repo):
+    """The filter matches link content by its mount path, not its source path.
+
+    A link mounted at `linked` onto `/sub` reaches `sub/inside.txt` in the source
+    repository for a file the flattened tree spells `linked/inside.txt`. Rules are
+    written against the flattened tree, so unstage has to match the mount path or
+    it unstages content the filter excludes.
+
+    Both crossings are covered: unstaging the repository root reaches the link
+    node itself, and unstaging a path inside the link resolves through it to a
+    directory in the source repository.
+    """
+    repo: Lore = new_lore_repo()
+
+    outside_file = "outside.txt"
+    with repo.open_file(outside_file, "w+") as output_file:
+        output_file.writelines(["outside original\n"])
+
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push()
+
+    link_repo = new_lore_repo()
+    link_repo.make_dirs("sub/nested")
+    with link_repo.open_file("sub/inside.txt", "w+") as output_file:
+        output_file.writelines(["inside original\n"])
+    with link_repo.open_file("sub/nested/deep.txt", "w+") as output_file:
+        output_file.writelines(["deep original\n"])
+
+    link_repo.stage(scan=True)
+    link_repo.commit()
+    link_repo.push()
+
+    link_path = "linked"
+    repo.link_add(link_path, link_repo.get_id(), "/sub")
+    repo.commit()
+    repo.push()
+
+    mounted_file = f"{link_path}/inside.txt"
+    deep_file = f"{link_path}/nested/deep.txt"
+    assert repo.file_exists(mounted_file), f"{mounted_file} should be materialized"
+    assert repo.file_exists(deep_file), f"{deep_file} should be materialized"
+
+    def restage_everything():
+        with repo.open_file(mounted_file, "w+") as output_file:
+            output_file.writelines(["inside modified\n"])
+        with repo.open_file(deep_file, "w+") as output_file:
+            output_file.writelines(["deep modified\n"])
+        with repo.open_file(outside_file, "w+") as output_file:
+            output_file.writelines(["outside modified\n"])
+        repo.stage(scan=True)
+
+    restage_everything()
+
+    staged = _staged_paths(repo)
+    assert mounted_file in staged, f"{mounted_file} should be staged"
+    assert outside_file in staged, f"{outside_file} should be staged"
+
+    # Names the file below the mount rather than the mount, so the walk descends
+    # and the verdict is reached inside the link. It matches the flattened
+    # `linked/inside.txt` and cannot match the source path `sub/inside.txt`.
+    with repo.open_file(repo.ignore_file(), "w+") as ignore_file:
+        ignore_file.write(f"/{link_path}/inside.txt\n")
+
+    repo.unstage(".")
+
+    # Dropped so the status below reports the mounted file either way.
+    repo.remove_file(repo.ignore_file())
+
+    staged = _staged_paths(repo)
+    assert outside_file not in staged, (
+        "Unstage should unstage a file the filter does not exclude"
+    )
+    assert mounted_file in staged, (
+        "Unstage should skip link content the filter excludes"
+    )
+
+    # The same verdict, reached the other way: `linked/nested` resolves through
+    # the link to a directory in the source repository, which is the crossing
+    # the root walk above does not take.
+    restage_everything()
+    with repo.open_file(repo.ignore_file(), "w+") as ignore_file:
+        ignore_file.write(f"/{link_path}/nested/deep.txt\n")
+
+    repo.unstage(f"{link_path}/nested")
+
+    repo.remove_file(repo.ignore_file())
+
+    staged = _staged_paths(repo)
+    assert deep_file in staged, (
+        "Unstage should skip content the filter excludes below a resolved link"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -8855,6 +9018,189 @@ def test_link_branch_create_reports_each_mount_of_same_repo(new_lore_repo):
     )
 
 
+_OVERLAP_LINK_FILES = {
+    "sub/outer.txt": "outer content\n",
+    "sub/test/inner.txt": "inner content\n",
+    "sub/other/sibling.txt": "sibling content\n",
+}
+
+
+def _parent_and_link_for_overlap(new_lore_repo, name: str = ""):
+    parent: Lore = new_lore_repo()
+    parent.write_commit_push("Initial parent", {"parent.txt": "parent content\n"})
+
+    link_repo: Lore = new_lore_repo(name)
+    link_repo.write_commit_push("Initial link", _OVERLAP_LINK_FILES)
+
+    return parent, link_repo
+
+
+def _mounted_source_paths(repo: Lore) -> dict:
+    """Maps every mount path in `repo` to the source path it exposes."""
+    mounts = {}
+    link_path = None
+    for line in repo.link_list().splitlines():
+        line = line.strip()
+        if line.startswith("Link path:"):
+            link_path = line.split(":", 1)[1].split("(")[0].strip()
+        elif line.startswith("Source path:") and link_path is not None:
+            mounts[link_path] = line.split(":", 1)[1].split("(")[0].strip()
+            link_path = None
+    return mounts
+
+
+@pytest.mark.smoke
+def test_link_add_rejects_source_path_inside_existing_mount(new_lore_repo):
+    """`sub/test` lives inside `sub`, so both mounts would materialize
+    `sub/test/inner.txt` on disk, each under its own pin.
+
+    The argument is spelled in a different case from the stored path, which
+    resolves to the same node, so the comparison has to run on the stored path.
+    """
+    parent, link_repo = _parent_and_link_for_overlap(new_lore_repo)
+
+    parent.link_add("vendor/whole", link_repo.get_id(), "sub")
+    parent.commit("Add link at vendor/whole")
+    parent.push()
+
+    with pytest.raises(OverlappingLinkError):
+        parent.link_add("vendor/part", link_repo.get_id(), "SUB/test")
+
+    assert _mounted_source_paths(parent) == {"vendor/whole": "sub"}, (
+        "A refused link add must leave the registry holding only the first mount"
+    )
+
+
+@pytest.mark.smoke
+def test_link_add_rejects_source_path_containing_existing_mount(new_lore_repo):
+    """The check is symmetric: mounting `sub` when `sub/test` is already mounted
+    from the same repository is refused too.
+    """
+    parent, link_repo = _parent_and_link_for_overlap(new_lore_repo)
+
+    parent.link_add("vendor/part", link_repo.get_id(), "sub/test")
+    parent.commit("Add link at vendor/part")
+    parent.push()
+
+    with pytest.raises(OverlappingLinkError):
+        parent.link_add("vendor/whole", link_repo.get_id(), "sub")
+
+    assert _mounted_source_paths(parent) == {"vendor/part": "sub/test"}, (
+        "A refused link add must leave the registry holding only the first mount"
+    )
+
+
+@pytest.mark.smoke
+def test_link_add_rejects_nesting_under_a_root_mount(new_lore_repo):
+    """A root mount exposes every subtree, so any other source path nests under
+    it. The root is the empty stored path, which no prefix comparison matches.
+    """
+    parent, link_repo = _parent_and_link_for_overlap(new_lore_repo)
+
+    parent.link_add("vendor/all", link_repo.get_id(), "/")
+    parent.commit("Add root mount")
+    parent.push()
+
+    with pytest.raises(OverlappingLinkError):
+        parent.link_add("vendor/part", link_repo.get_id(), "sub/test")
+
+    assert _mounted_source_paths(parent) == {"vendor/all": "/"}, (
+        "A refused link add must leave the registry holding only the root mount"
+    )
+
+
+@pytest.mark.smoke
+def test_link_add_allows_non_nesting_source_paths(new_lore_repo):
+    """Only strictly nesting subtrees of one repository are refused.
+
+    Disjoint siblings cannot shadow each other, identical subtrees resolve to one
+    shared linked state and advance together, and a second repository shares no
+    pin with the first however its source paths line up.
+    """
+    parent, first_link = _parent_and_link_for_overlap(new_lore_repo)
+    second_link: Lore = new_lore_repo()
+    second_link.write_commit_push("Initial second link", _OVERLAP_LINK_FILES)
+
+    parent.link_add("vendor/test", first_link.get_id(), "sub/test")
+    parent.link_add("vendor/other", first_link.get_id(), "sub/other")
+    parent.link_add("vendor/test-again", first_link.get_id(), "sub/test")
+    parent.link_add("vendor/second", second_link.get_id(), "sub")
+    parent.commit("Add non-nesting mounts")
+    parent.push()
+
+    assert _mounted_source_paths(parent) == {
+        "vendor/test": "sub/test",
+        "vendor/other": "sub/other",
+        "vendor/test-again": "sub/test",
+        "vendor/second": "sub",
+    }
+
+    for mount in ("vendor/test", "vendor/test-again"):
+        with parent.open_file(f"{mount}/inner.txt") as f:
+            assert f.read() == _OVERLAP_LINK_FILES["sub/test/inner.txt"]
+    with parent.open_file("vendor/other/sibling.txt") as f:
+        assert f.read() == _OVERLAP_LINK_FILES["sub/other/sibling.txt"]
+    with parent.open_file("vendor/second/test/inner.txt") as f:
+        assert f.read() == _OVERLAP_LINK_FILES["sub/test/inner.txt"]
+
+
+@pytest.mark.smoke
+def test_link_reset_rejects_restoring_an_overlapping_mount(new_lore_repo):
+    """Staging a removal hides a mount from the registry, so a nesting mount can
+    be added while it is gone. Resetting the removal must not restore the overlap.
+    """
+    parent, link_repo = _parent_and_link_for_overlap(new_lore_repo)
+
+    parent.link_add("vendor/whole", link_repo.get_id(), "sub")
+    parent.commit("Add link at vendor/whole")
+    parent.push()
+
+    parent.link_remove("vendor/whole")
+    parent.link_add("vendor/part", link_repo.get_id(), "sub/test")
+
+    with pytest.raises(OverlappingLinkError):
+        parent.reset("vendor/whole")
+
+    assert _mounted_source_paths(parent) == {"vendor/part": "sub/test"}, (
+        "A refused reset must leave the staged registry as it was"
+    )
+
+
+@pytest.mark.smoke
+def test_link_merge_rejects_incoming_overlapping_mount(new_lore_repo):
+    """Both branches fork from a revision holding neither mount, so neither
+    `link add` can see the other. The merge that brings them together is refused.
+    """
+    parent, link_repo = _parent_and_link_for_overlap(new_lore_repo)
+
+    parent.branch_create("mount-whole")
+    parent.link_add("vendor/whole", link_repo.get_id(), "sub")
+    parent.commit("Add link at vendor/whole")
+    parent.push()
+
+    parent.branch_switch("main")
+    parent.branch_create("mount-part")
+    parent.link_add("vendor/part", link_repo.get_id(), "sub/test")
+    parent.commit("Add link at vendor/part")
+    parent.push()
+
+    parent.branch_switch("mount-whole")
+
+    with pytest.raises(OverlappingLinkError):
+        parent.branch_merge_start("mount-part", message="Merge nesting mount")
+
+    assert _mounted_source_paths(parent) == {"vendor/whole": "sub"}, (
+        "A refused merge must leave the target's registry as it was"
+    )
+    assert not parent.path_exists("vendor/part"), (
+        "A refused merge must be rejected before the incoming mount is cloned, "
+        "so no untracked content is left behind"
+    )
+    assert parent.branch_info().local_latest == parent.branch_info().remote_latest, (
+        "A refused merge must not have committed anything"
+    )
+
+
 @pytest.mark.smoke
 def test_link_branch_create_reuses_link_branch_id_under_other_name(new_lore_repo):
     """A linked branch that already owns the requested ID keeps its own name.
@@ -9859,4 +10205,35 @@ def test_link_branch_archive_repository_linked_twice(new_lore_repo):
     )
     assert sorted(link_repo.branch_list().remote_branches) == branches_before, (
         f"Expected link branches {branches_before}, got: {link_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_add_accepts_a_scoped_bare_name(new_lore_repo, lore_remote_url):
+    """A scoped name such as `org/project` is a name, not a host and a path.
+
+    `is_valid_name` permits slash-separated names, so a slash cannot be what tells a URL
+    from a bare identifier — only a scheme can. `link add org/project` therefore has to
+    resolve the whole argument against this repository's configured remote. Reading the
+    first segment as a host instead sent the lookup to `lores://org`, a server that was
+    never configured and, in this test, does not exist.
+    """
+    scoped_name = f"scoped/{Lore.generate_random_name('')}"
+    link_repo: Lore = new_lore_repo(
+        remote_path=f"{lore_remote_url.rstrip('/')}/{scoped_name}"
+    )
+
+    linked_file = "linked-content.txt"
+    with link_repo.open_file(linked_file, "w+") as output_file:
+        output_file.writelines(["content behind a scoped name\n"])
+    link_repo.stage(scan=True)
+    link_repo.commit("Seed the scoped repository")
+    link_repo.push()
+
+    repo: Lore = new_lore_repo()
+    # The bare, schemeless, slash-carrying identifier is the point of the test.
+    repo.link_add("vendor", scoped_name, "/")
+
+    assert link_repo.get_id() in repo.link_list(), (
+        f"link add should have resolved {scoped_name!r} against this repository's remote"
     )

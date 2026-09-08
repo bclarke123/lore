@@ -19,8 +19,6 @@ use lore_revision::lore::BranchId;
 use lore_revision::metadata::Metadata;
 use lore_revision::node::NodeFlags;
 use lore_revision::repository::RepositoryContext;
-use lore_revision::revision;
-use lore_revision::revision::ResolveSearchLocation;
 use lore_revision::state::State;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use lore_telemetry::tracing::fields::METADATA;
@@ -81,13 +79,15 @@ impl From<revision_diff_request::QueryTo> for RevisionSpec {
 ///
 /// Signature queries pass through; identifier queries with `number == 0`
 /// resolve to the branch's latest revision via `branch::load_latest`;
-/// non-zero numbers resolve via `revision::resolve("branch@N")`. The
-/// `is_not_found` / non-not-found split routes user-input misses to
-/// `Status::not_found` (quiet) and server-side faults to
-/// `Status::internal` (with structured warn).
+/// non-zero numbers resolve through the step acceleration structures,
+/// falling back to a full history walk. The `is_not_found` / non-not-found
+/// split routes user-input misses to `Status::not_found` (quiet) and
+/// server-side faults to `Status::internal` (with structured warn).
 pub(super) async fn resolve_signature(
     repository: &Arc<RepositoryContext>,
     spec: RevisionSpec,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<Hash, Status> {
     match spec {
         RevisionSpec::Signature(signature) => Ok(Hash::from(signature)),
@@ -97,6 +97,7 @@ pub(super) async fn resolve_signature(
                 debug!({BRANCH_ID} = %branch_id, "Resolving branch latest");
                 branch::load_latest(repository.clone(), branch_id)
                     .await
+                    .filter_slow_down()?
                     .map_err(|err| {
                         if err.is_branch_not_found() {
                             Status::not_found(format!("Branch {branch_id} not found"))
@@ -109,14 +110,15 @@ pub(super) async fn resolve_signature(
                         }
                     })
             } else {
-                let signature = format!("{branch_id}@{}", identifier.number);
-                revision::resolve(
-                    repository.clone(),
-                    signature,
-                    None,
-                    ResolveSearchLocation::Local,
+                crate::cache::revision::resolve_revision_number(
+                    repository,
+                    branch_id,
+                    identifier.number,
+                    history_step_size,
+                    acceleration,
                 )
                 .await
+                .filter_slow_down()?
                 .map_err(|err| {
                     if err.is_not_found() || err.is_revision_not_found() {
                         Status::not_found(format!(
@@ -147,8 +149,10 @@ pub(super) async fn resolve_signature(
 pub(super) async fn resolve_to_identifier(
     repository: &Arc<RepositoryContext>,
     spec: RevisionSpec,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<(Hash, model_v1::RevisionIdentifier), Status> {
-    let signature = resolve_signature(repository, spec).await?;
+    let signature = resolve_signature(repository, spec, history_step_size, acceleration).await?;
     debug!({REVISION} = %signature, "Loaded resolved signature");
     let identifier = identifier_for_signature(repository, signature).await?;
     Ok((signature, identifier))
@@ -186,6 +190,7 @@ pub(super) async fn identifier_for_signature(
     let metadata_hash = state.metadata_hash();
     let metadata = Metadata::deserialize(repository.clone(), metadata_hash)
         .await
+        .filter_slow_down()?
         .map_err(|err| {
             warn!(
                 {REPOSITORY_ID} = %repository.id,
@@ -340,7 +345,6 @@ mod tests {
     use lore_revision::node::NodeFlags;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryContextCreationArgs;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::state;
     use lore_revision::util::path::RelativePath;
     use lore_storage::Address;
@@ -367,14 +371,13 @@ mod tests {
             .expect("mutable store"),
         );
         Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
-            path: None,
+            paths: None,
             immutable_store: immutable,
             mutable_store: mutable,
             id: Context::from(uuid::Uuid::now_v7()).into(),
             instance_id: lore_revision::instance::InstanceId::generate(),
             remote: Err(ProtocolError::from(lore_base::error::NoRemote)),
             filter: Arc::default(),
-            format: RepositoryFormat::Lore,
             filesystem_provider: None,
         }))
     }
@@ -390,6 +393,7 @@ mod tests {
             action,
             path: RelativePath::from_str("dir/file.txt").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,

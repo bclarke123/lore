@@ -169,6 +169,19 @@ typedef enum lore_error_code_t {
   LORE_ERROR_CODE_SLOW_DOWN = 31,
 } lore_error_code_t;
 
+// Virtual File System type for repository operations.
+//
+// When not `None`, the `vfs` field causes the repository to create a Virtual File System
+// as the repository directory instead of materializing files directly on disk.
+typedef enum lore_vfs_type_t {
+  // Use no VFS, store all files using the regular file system
+  LORE_VFS_TYPE_NONE = 0,
+  // Use whichever VFS is suggested based on the user's environment
+  LORE_VFS_TYPE_DEFAULT = 1,
+  // Use SWFS as a VFS
+  LORE_VFS_TYPE_SWFS = 2,
+} lore_vfs_type_t;
+
 // Whether a repository being created or cloned should be backed by a shared store.
 //
 // `Inherit` is zero so a zero-initialized C struct keeps following the machine's
@@ -1833,6 +1846,8 @@ typedef struct lore_repository_data_event_data_t {
   struct lore_string_t remote_url;
   // Repository identifier.
   lore_repository_id_t id;
+  // Instance identifier.
+  struct lore_instance_id_t instance_id;
   // Repository name.
   struct lore_string_t name;
   // Repository description.
@@ -1890,7 +1905,11 @@ typedef struct lore_repository_instance_event_data_t {
   lore_branch_id_t branch;
   // Current revision hash for the instance
   struct lore_hash_t revision;
-  // Non-zero if the instance path no longer exists on disk
+  // Non-zero if the registration no longer describes a live checkout: 1 when
+  // the path no longer exists on disk, 2 when the path holds a repository
+  // whose `.lore/instance` names a different instance (superseded by a
+  // re-create or re-clone), 3 when the path holds no readable
+  // `.lore/instance` at all
   uint8_t stale;
 } lore_repository_instance_event_data_t;
 
@@ -2371,6 +2390,10 @@ typedef struct lore_revision_sync_target_event_data_t {
   uint8_t is_latest;
   // Flag indicating revision was from local revision history, not remote
   uint8_t local;
+  // Remote configured for the repository.
+  uint8_t remote_available;
+  // Remote branch query returned an authoritative answer, identity is authorized to access the repository.
+  uint8_t remote_authorized;
 } lore_revision_sync_target_event_data_t;
 
 // Details of a single file changed by a sync.
@@ -2493,6 +2516,33 @@ typedef struct lore_shared_store_info_event_data_t {
   // Per-store flag, nonzero when the store exists on disk.
   struct lore_uint8_array_t exists;
 } lore_shared_store_info_event_data_t;
+
+// Shared store array list item.
+typedef struct lore_shared_store_list_item_t {
+  // Remote URL the shared store is for.
+  struct lore_string_t remote_url;
+  // Path to the shared store on disk.
+  struct lore_string_t store_path;
+  // Paths to instances using the shared store
+  struct lore_string_array_t instance_paths;
+  // Ids of instances using the shared store
+  struct lore_instance_id_array_t instance_ids;
+} lore_shared_store_list_item_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_shared_store_list_item_array_t {
+  // Pointer to the first element.
+  const struct lore_shared_store_list_item_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_shared_store_list_item_array_t;
+
+// Data for an event describing all shared stores.
+typedef struct lore_shared_store_list_event_data_t {
+  // All stores from the registry.
+  struct lore_shared_store_list_item_array_t stores;
+} lore_shared_store_list_event_data_t;
 
 // Data for an event describing a link that has staged changes.
 typedef struct lore_link_staged_entry_event_data_t {
@@ -3561,6 +3611,8 @@ enum lore_event_id_t {
   LORE_EVENT_SHARED_STORE_CREATE,
   // Information about a shared store.
   LORE_EVENT_SHARED_STORE_INFO,
+  // List of all shared stores.
+  LORE_EVENT_SHARED_STORE_LIST,
   // One staged entry in a link listing.
   LORE_EVENT_LINK_STAGED_ENTRY,
   // A store was opened.
@@ -3839,6 +3891,7 @@ typedef struct lore_event_t {
     struct lore_notification_unsubscribed_event_data_t notification_unsubscribed;
     struct lore_shared_store_create_event_data_t shared_store_create;
     struct lore_shared_store_info_event_data_t shared_store_info;
+    struct lore_shared_store_list_event_data_t shared_store_list;
     struct lore_link_staged_entry_event_data_t link_staged_entry;
     struct lore_storage_opened_event_data_t storage_opened;
     struct lore_storage_put_item_complete_event_data_t storage_put_item_complete;
@@ -4577,10 +4630,10 @@ typedef struct lore_repository_clone_args_t {
   struct lore_string_t view;
   // Clone without any files
   uint8_t bare;
-  // Clone virtually using split-write filesystem
-  uint8_t virtually;
   // Use direct file write
   uint8_t direct_file_write;
+  // Which VFS to use, if any
+  enum lore_vfs_type_t vfs;
   // (Optional) Layer module
   struct lore_string_t layer;
   // (Optional) Layer metadata key to link revisions with
@@ -4620,14 +4673,18 @@ typedef struct lore_repository_dump_args_t {
   uintptr_t max_depth;
 } lore_repository_dump_args_t;
 
-// Arguments for creating a new repository at the specified URL.
+// Arguments for creating a new repository.
 typedef struct lore_repository_create_args_t {
-  // URL to the repository
+  // URL to the repository. Treated as the repository name instead when the call is
+  // offline or local, where an empty value names it after the directory it is
+  // created in. A URL naming no host is an error otherwise.
   struct lore_string_t repository_url;
   // Optional repository description
   struct lore_string_t description;
   // Optional repository ID, set to empty string to generate a new ID
   struct lore_string_t id;
+  // Which VFS to use, if any
+  enum lore_vfs_type_t vfs;
   // Whether to use the shared store instead of a local immutable store. Zero-initialized
   // (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
   enum lore_shared_store_mode_t use_shared_store;
@@ -11655,7 +11712,11 @@ void lore_repository_instance_list_async(const struct lore_global_args_t *global
                                          const struct lore_repository_instance_list_args_t *args,
                                          struct lore_event_callback_config_t callback);
 
-// Remove stale instances of the repository that are no longer present.
+// Remove stale instances of the repository: those whose path no longer
+// exists, those whose path holds no checkout, and those whose path now holds
+// a repository naming a different current instance. Each removed instance is
+// reported through a `RepositoryInstance` event whose `stale` field gives the
+// reason.
 int32_t lore_repository_instance_prune(const struct lore_global_args_t *globals,
                                        const struct lore_repository_instance_prune_args_t *args,
                                        struct lore_event_callback_config_t callback);

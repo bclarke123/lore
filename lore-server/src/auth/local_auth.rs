@@ -397,6 +397,12 @@ pub(crate) mod tests {
             }),
             server_admins: Vec::new(),
             clients: Vec::new(),
+            permission_claim: None,
+            resource_claim: None,
+            resource_id_template: AuthSettings::default_resource_id_template(),
+            resource_wildcard: AuthSettings::default_resource_wildcard(),
+            identity_claim: AuthSettings::default_identity_claim(),
+            baseline_access: crate::settings::BaselineAccess::default(),
         }
     }
 
@@ -420,6 +426,12 @@ pub(crate) mod tests {
             provider: None,
             server_admins: Vec::new(),
             clients: Vec::new(),
+            permission_claim: None,
+            resource_claim: None,
+            resource_id_template: AuthSettings::default_resource_id_template(),
+            resource_wildcard: AuthSettings::default_resource_wildcard(),
+            identity_claim: AuthSettings::default_identity_claim(),
+            baseline_access: crate::settings::BaselineAccess::default(),
         };
         assert!(
             LocalAuth::from_settings(Some(&bare))

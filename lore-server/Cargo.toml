@@ -80,11 +80,12 @@ tonic-prost-build = { workspace = true }
 vergen = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 ctor = { workspace = true }
 lore-credential = { workspace = true }
+lore-base = { workspace = true, features = ["test-util"] }
 axum-test = "18.1.0"
 rcgen = { workspace = true }
-tempfile = "3.21"
 http-body = "1.0.1"
 http-body-util = "0.1.3"
 indexmap = { workspace = true }

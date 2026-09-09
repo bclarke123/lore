@@ -826,6 +826,7 @@ async fn sync_local(
                 revision: args.revision.into(),
                 forward_changes: args.forward_changes != 0,
                 reset: args.reset != 0,
+                fill_missing: false,
                 force_hash_check: false,
                 filter_mode: lore_revision::filter::FilterMode::View,
                 root_files,

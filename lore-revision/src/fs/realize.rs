@@ -70,6 +70,9 @@ use crate::util::path::RelativePath;
 use crate::util::path::RepositoryPath;
 use crate::util::path::expand_path_ancestors;
 
+/// Attempts per file when a remote read fails transiently during sync.
+const SYNC_FILE_RETRIES: usize = 5;
+
 pub async fn realize_state(
     repository: Arc<RepositoryContext>,
     operation: Arc<InstanceOperationImpl>,
@@ -119,7 +122,7 @@ pub async fn realize_state(
     */
 
     let stats: Arc<SyncRealizeStats> = Arc::default();
-    let changes = if !options.reset {
+    let changes = if !options.reset && !options.fill_missing {
         lore_info!(
             "Calculating deltas {} -> {}",
             state_current.revision_number(),
@@ -176,6 +179,16 @@ pub async fn realize_state(
         );
         */
         change::reverse(changes.as_mut_slice());
+        if options.fill_missing && !options.reset {
+            // Keep only what the filesystem lacks entirely: an add whose path
+            // the diff found absent. Modified files carry an observation and
+            // stay as they are.
+            changes.retain(|change| {
+                change.action == change::FileAction::Add
+                    && change.observed.as_ref().is_none_or(|info| !info.exists)
+            });
+            lore_info!("{} files missing from the working copy", changes.len());
+        }
         changes
     };
 
@@ -1188,14 +1201,39 @@ async fn write_node_to_path(
     }
 
     if node.size > 0 {
-        operation
-            .set_file_to_immutable_store_contents(
-                repository.clone(),
-                node,
-                FilesystemPath::Repository(path),
-            )
-            .await
-            .forward_with::<SyncError, _>(|| format!("Failed to sync file {}", path.relative()))?;
+        // A remote read can fail transiently (server shedding load, a QUIC
+        // reconnect mid-transfer); retry the file before giving up on the sync.
+        let mut retry = lore_base::retry::retry(500, 5_000, SYNC_FILE_RETRIES);
+        loop {
+            match operation
+                .set_file_to_immutable_store_contents(
+                    repository.clone(),
+                    node,
+                    FilesystemPath::Repository(path),
+                )
+                .await
+                .forward_with::<SyncError, _>(|| format!("Failed to sync file {}", path.relative()))
+            {
+                Ok(_) => break,
+                Err(err)
+                    if matches!(
+                        err,
+                        SyncError::SlowDown(_)
+                            | SyncError::NotConnected(_)
+                            | SyncError::Disconnected(_)
+                    ) =>
+                {
+                    if !retry.wait().await {
+                        return Err(err);
+                    }
+                    lore_debug!(
+                        "Retrying {} after transient failure: {err}",
+                        path.relative()
+                    );
+                }
+                Err(err) => return Err(err),
+            }
+        }
     } else {
         operation
             .create_file(FilesystemPath::Repository(path))

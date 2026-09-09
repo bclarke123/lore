@@ -219,6 +219,9 @@ pub struct SyncOptions {
     pub forward_changes: bool,
     /// Reset local modified files to match incoming revision
     pub reset: bool,
+    /// Write files the target revision has but the working copy lacks, leaving
+    /// modified files alone. Diffs the filesystem like `reset`, applies only adds.
+    pub fill_missing: bool,
     /// Force hash checks of files
     pub force_hash_check: bool,
     /// Filter mode for diff operations during sync
@@ -240,6 +243,7 @@ impl Default for SyncOptions {
             revision: None,
             forward_changes: false,
             reset: false,
+            fill_missing: false,
             force_hash_check: false,
             filter_mode: FilterMode::View,
             root_files: Vec::new(),
@@ -280,6 +284,23 @@ pub async fn sync(
         current_revision,
         branch_id
     );
+
+    // A clone or sync that stopped short left the recorded state ahead of the
+    // filesystem; only a filesystem diff can find what is missing. Fill the
+    // holes without touching files the user has modified since.
+    let options = if !options.reset
+        && branch::load_sync_incomplete(repository.clone(), branch_id).await
+    {
+        lore_info!(
+            "Previous clone or sync of this branch was incomplete, fetching files missing from the working copy"
+        );
+        SyncOptions {
+            fill_missing: true,
+            ..options
+        }
+    } else {
+        options
+    };
 
     let force = execution_context().globals().force();
     let mut location = LoreBranchLocation::Local;
@@ -521,7 +542,7 @@ pub async fn sync(
     })
     .send();
 
-    if revision == current_revision && !force && !options.reset {
+    if revision == current_revision && !force && !options.reset && !options.fill_missing {
         return Ok(());
     }
 
@@ -659,6 +680,8 @@ pub async fn sync(
             .forward::<SyncError>("Failed to serialize current revision anchor")?;
 
         modified_times.store(repository.clone()).await;
+
+        branch::clear_sync_incomplete(repository.clone(), branch_id).await;
 
         state::rebase_staged_anchor(repository.clone(), revision)
             .await

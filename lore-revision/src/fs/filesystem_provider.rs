@@ -12,7 +12,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
+use lore_base::error::Disconnected;
 use lore_base::error::InvalidArguments;
+use lore_base::error::NotConnected;
+use lore_base::error::SlowDown;
 use lore_base::types::Fragment;
 use lore_error_set::ErrorSet;
 use lore_error_set::error_set;
@@ -41,6 +44,11 @@ use crate::util::path::RepositoryPath;
 #[error_set]
 pub enum FsError {
     InvalidArguments,
+    // Transport outcomes of a remote fragment read, kept distinct so a
+    // caller (clone, sync) can retry the file instead of failing the tree.
+    Disconnected,
+    NotConnected,
+    SlowDown,
 }
 
 impl From<std::io::Error> for FsError {

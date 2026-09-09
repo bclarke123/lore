@@ -1078,7 +1078,16 @@ pub fn handle_repository_clone(globals: LoreGlobalArgs, args: &RepositoryCloneAr
                     anstyle::Reset,
                     data.revision
                 );
-                println!("Clone complete in {:.2}s", start.elapsed().as_secs_f32());
+                if data.count.file_complete < data.count.file_count {
+                    println!(
+                        "Clone incomplete in {:.2}s: {} of {} files were not written, run `lore sync` to fetch them",
+                        start.elapsed().as_secs_f32(),
+                        data.count.file_count - data.count.file_complete,
+                        data.count.file_count
+                    );
+                } else {
+                    println!("Clone complete in {:.2}s", start.elapsed().as_secs_f32());
+                }
             }
             LoreEvent::RevisionResolve(data) => {
                 if data.revision_number != 0 {

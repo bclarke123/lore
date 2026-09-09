@@ -404,6 +404,9 @@ pub const LATEST: &str = "branch-head";
 pub const LATEST_STATUS: &str = "branch-head-status";
 pub const LATEST_HISTORY: &str = "branch-head-history";
 pub const LAST_SYNC: &str = "branch-last-sync";
+/// Set (to the target revision) when a clone or sync stopped before every file
+/// was written; cleared by the next sync that completes. Nonzero = incomplete.
+pub const SYNC_INCOMPLETE: &str = "branch-sync-incomplete";
 pub const METADATA: &str = "branch-metadata";
 pub const REVISION_NUMBER_STEP: &str = "branch-revision-number-step-v2";
 pub const REVISION_LIST_STEP: &str = "branch-revision-list-step";
@@ -905,6 +908,26 @@ pub async fn store_latest(
 
 pub async fn store_last_sync(repository: Arc<RepositoryContext>, branch: BranchId, revision: Hash) {
     let _ = mutable_store(repository, LAST_SYNC, branch, revision).await;
+}
+
+/// Record that the working copy of `branch` was left short of `revision`.
+pub async fn store_sync_incomplete(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    revision: Hash,
+) {
+    let _ = mutable_store(repository, SYNC_INCOMPLETE, branch, revision).await;
+}
+
+/// Whether the last clone or sync of `branch` stopped before every file was written.
+pub async fn load_sync_incomplete(repository: Arc<RepositoryContext>, branch: BranchId) -> bool {
+    mutable_load(repository, SYNC_INCOMPLETE, branch)
+        .await
+        .is_ok_and(|hash| !hash.is_zero())
+}
+
+pub async fn clear_sync_incomplete(repository: Arc<RepositoryContext>, branch: BranchId) {
+    let _ = mutable_delete(repository, SYNC_INCOMPLETE, branch).await;
 }
 
 pub async fn load_latest_history(

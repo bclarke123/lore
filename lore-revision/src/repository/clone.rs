@@ -259,6 +259,18 @@ pub struct LoreRepositoryCloneEndEventData {
 const CLONE_DIRECTORY_MAX: usize = 10_000;
 pub const CLONE_FILE_MAX: usize = 10_000;
 pub const CLONE_FILE_DISCOVERY: usize = 100;
+/// Attempts per file when the fetch fails transiently (server shedding load,
+/// a QUIC reconnect mid-transfer), backing off 500ms..5s between them.
+const CLONE_FILE_RETRIES: usize = 5;
+
+/// Failures worth retrying the file for: the server said slow down, or the
+/// transport reconnected underneath the request. Anything else is permanent.
+fn is_transient_clone_error(err: &CloneError) -> bool {
+    matches!(
+        err,
+        CloneError::SlowDown(_) | CloneError::NotConnected(_) | CloneError::Disconnected(_)
+    )
+}
 
 #[derive(Default)]
 pub struct CloneCompleteStats {
@@ -1252,6 +1264,13 @@ pub async fn clone(
         Err(e) => Err(CloneError::internal(format!("Store task failed: {e}"))),
     };
 
+    // The branch head is already recorded as the working copy's revision, so a
+    // shortfall would otherwise look "in sync" forever. Flag it: the next sync
+    // diffs the filesystem instead of trusting the recorded state.
+    if materialize_result.is_err() && !call.dry_run() && !revision.is_zero() {
+        branch::store_sync_incomplete(repository.clone(), branch_id, revision).await;
+    }
+
     let _ = repository.flush(call.sync_data()).await;
 
     if !call.dry_run() {
@@ -1576,6 +1595,7 @@ pub async fn clone_execute(
     ctx: CloneContext,
 ) -> Result<(), CloneError> {
     let mut failure = None;
+    let mut failed_files: u64 = 0;
     let mut tasks: JoinSet<Result<Option<(Hash, u64)>, CloneError>> = JoinSet::new();
     let repository = ctx.repository.clone();
     let stats = ctx.stats.clone();
@@ -1615,11 +1635,27 @@ pub async fn clone_execute(
             let stats = item_ctx.stats.clone();
             stats.complete.file_count.fetch_add(1, Ordering::Relaxed);
             stats.file_inflight_count.fetch_add(1, Ordering::Relaxed);
-            let result = clone_file(item_ctx, item.node, item.repository_path).await;
+            let mut retry = lore_base::retry::retry(500, 5_000, CLONE_FILE_RETRIES);
+            let result = loop {
+                match clone_file(item_ctx.clone(), item.node, item.repository_path.clone()).await {
+                    Err(err) if is_transient_clone_error(&err) => {
+                        if !retry.wait().await {
+                            break Err(err);
+                        }
+                        lore_debug!(
+                            "Retrying {} after transient failure: {err}",
+                            item.repository_path.absolute().display()
+                        );
+                    }
+                    result => break result,
+                }
+            };
             stats.file_inflight_count.fetch_sub(1, Ordering::Relaxed);
             result
         });
 
+        // A failed file must not stop the rest of the tree: every other file
+        // still lands, and the shortfall is reported once at the end.
         while let Some(result) = tasks.try_join_next() {
             match result
                 .map_err(|e| CloneError::internal_with_context(e, "Recursion task failed"))
@@ -1627,11 +1663,11 @@ pub async fn clone_execute(
             {
                 Ok(Some(entry)) => modified_times.push(entry),
                 Ok(None) => {}
-                Err(err) => failure = failure.or(Some(err)),
+                Err(err) => {
+                    failed_files += 1;
+                    failure = failure.or(Some(err));
+                }
             }
-        }
-        if failure.is_some() {
-            break;
         }
     }
 
@@ -1642,14 +1678,23 @@ pub async fn clone_execute(
         {
             Ok(Some(entry)) => modified_times.push(entry),
             Ok(None) => {}
-            Err(err) => failure = failure.or(Some(err)),
+            Err(err) => {
+                failed_files += 1;
+                failure = failure.or(Some(err));
+            }
         }
     }
 
     modified_times.store(repository.clone()).await;
 
     if let Some(err) = failure {
-        Err(err)
+        let total = stats.complete.file_count.load(Ordering::Relaxed);
+        lore_warn!(
+            "Clone incomplete: {failed_files} of {total} files were not written; run `lore sync` to fetch them"
+        );
+        Err(err).forward_with::<CloneError, _>(|| {
+            format!("Clone incomplete: {failed_files} of {total} files were not written")
+        })
     } else {
         Ok(())
     }

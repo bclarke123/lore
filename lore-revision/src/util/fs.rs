@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use lore_base::error::InvalidPath;
 use lore_base::lore_spawn;
 use rand::distr::Alphanumeric;
 use rand::distr::SampleString;
@@ -25,6 +26,9 @@ use super::path::RelativePath;
 use super::path::RelativePathBuf;
 use super::path::path_depth;
 use crate::MAX_CONCURRENT_TREE_TASKS;
+use crate::fs::filesystem_provider::FileInfo;
+use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::hash::hash_string;
 use crate::lore_debug;
 use crate::lore_trace;
@@ -32,6 +36,7 @@ use crate::lore_trace;
 use crate::lore_warn;
 use crate::node::NodeFileMode;
 use crate::repository::TEMP_FILE_EXTENSION;
+use crate::util::path::PathError;
 use crate::util::time::Retry;
 use crate::util::time::RetryPolicy;
 
@@ -207,21 +212,27 @@ pub async fn filesystem_names_all_exist(parent: &Path, names: &[&str]) -> bool {
 /// `Some(false)` does not mean the name is absent - it means not in this case.
 /// `None` is the platform declining to say, as macOS does for every name and
 /// Windows does past `MAX_PATH`; only reading the directory answers those, which
-/// is what [`filesystem_names`] is for.
+/// is what [`names_folding_to`] is for.
 pub async fn filesystem_name_matches(path: impl AsRef<Path>, name: &str) -> Option<bool> {
+    holds_name_exactly(path.as_ref().join(name)).await
+}
+
+/// Whether the directory holding `path` holds a child named exactly as `path` spells it,
+/// which is the OS arm of [`InstanceOperation::holds_name_exactly`].
+pub async fn holds_name_exactly(path: impl AsRef<Path>) -> Option<bool> {
     lore_io::IoDriver::global()
-        .holds_name_exactly(path.as_ref().join(name))
+        .holds_name_exactly(path.as_ref())
         .await
 }
 
-/// Every case variation of `name` the directory `path` holds, the exact one
-/// alone if it is there, and `NotFound` if no variation is.
+/// Every spelling of `name` the directory `path` holds that folds to the same name, the
+/// exact one alone if it is there, and empty if no spelling is.
 ///
 /// Reads the directory and compares every child, which is what answering for
 /// variations other than the one asked about takes. A caller that only needs to
 /// know whether the case it has is the one on disk should ask
 /// [`filesystem_name_matches`] instead.
-pub async fn filesystem_names(
+pub async fn names_folding_to(
     path: impl AsRef<Path>,
     name: &str,
 ) -> tokio::io::Result<Vec<String>> {
@@ -231,15 +242,14 @@ pub async fn filesystem_names(
     let match_name = name.to_lowercase();
     let mut listing = lore_io::IoDriver::global().read_dir(path).await?;
     while let Some(entry) = listing.next().await {
-        let entry_file_name = entry?.file_name;
-        let entry_name = entry_file_name.to_string_lossy();
+        let entry_name = entry_name(entry?.file_name).map_err(tokio::io::Error::other)?;
         if entry_name == name {
             // Exact match
-            return Ok(vec![entry_name.to_string()]);
+            return Ok(vec![entry_name]);
         }
         let entry_lowercase_name = entry_name.to_lowercase();
         if entry_lowercase_name == match_name {
-            matches.push(entry_name.to_string());
+            matches.push(entry_name);
         }
     }
 
@@ -267,10 +277,7 @@ pub async fn filesystem_names(
         "Found NO case variation for file {name} in path {}",
         path.display()
     );
-    Err(tokio::io::Error::new(
-        tokio::io::ErrorKind::NotFound,
-        "Matching file not found",
-    ))
+    Ok(vec![])
 }
 
 /// The case each directory prefix is held in on disk, resolved once for the
@@ -333,6 +340,7 @@ impl ResolvedPrefixes {
 /// and each is one or two syscalls: doing them one at a time is one round trip to
 /// the syscall pool per path.
 pub(crate) async fn resolve_prefixes(
+    operation: &Arc<InstanceOperationImpl>,
     base_path: impl AsRef<Path>,
     paths: &[DepthPath],
 ) -> ResolvedPrefixes {
@@ -340,32 +348,24 @@ pub(crate) async fn resolve_prefixes(
     struct ParentRun<'a> {
         parent: &'a str,
         variation: Arc<str>,
-        directory: Arc<Path>,
+        directory: Arc<RelativePath>,
     }
 
     fn parent_of(path: &str) -> &str {
         path.rfind('/').map_or("", |separator| &path[..separator])
     }
 
-    fn resolve_parent<'a>(
-        parent: &'a str,
-        base_path: &Path,
-        resolved: &ResolvedPrefixes,
-    ) -> ParentRun<'a> {
+    fn resolve_parent<'a>(parent: &'a str, resolved: &ResolvedPrefixes) -> ParentRun<'a> {
         // A parent left out of the map resolves to itself: either it is the root,
         // or it could not be resolved and this will not resolve either.
         let variation: Arc<str> = resolved
             .longest_prefix_of(parent)
             .map_or(parent, |(_, it)| it)
             .into();
-        let mut directory = base_path.to_path_buf();
-        if !variation.is_empty() {
-            directory.push(variation.as_ref());
-        }
         ParentRun {
             parent,
+            directory: Arc::new(RelativePath::new_from_clean_parts(variation.as_ref(), "")),
             variation,
-            directory: directory.into(),
         }
     }
 
@@ -379,6 +379,7 @@ pub(crate) async fn resolve_prefixes(
     }
 
     let base_path = base_path.as_ref();
+    let root: Arc<Path> = Arc::from(base_path.to_path_buf());
     let mut resolved = ResolvedPrefixes::default();
     let mut level_start = 0;
     while level_start < paths.len() {
@@ -390,23 +391,26 @@ pub(crate) async fn resolve_prefixes(
 
         // Every parent of a level sits above it, so nothing the level resolves
         // changes one and a run of siblings answers from the first of them.
-        let mut shared = resolve_parent(parent_of(paths[level_start].path()), base_path, &resolved);
+        let mut shared = resolve_parent(parent_of(paths[level_start].path()), &resolved);
 
         let mut tasks: JoinSet<Option<(String, String)>> = JoinSet::new();
         for path in &paths[level_start..level_end] {
             let parent = parent_of(path.path());
             if shared.parent != parent {
-                shared = resolve_parent(parent, base_path, &resolved);
+                shared = resolve_parent(parent, &resolved);
             }
 
             let variation = shared.variation.clone();
             let directory = shared.directory.clone();
             let path = path.path().to_string();
+            let operation = operation.clone();
+            let _root = root.clone();
             lore_spawn!(tasks, async move {
                 let name = path
                     .rfind('/')
                     .map_or(path.as_str(), |separator| &path[separator + 1..]);
-                if filesystem_name_matches(&directory, name).await == Some(true) {
+                let candidate = candidate_path(directory.as_str(), name);
+                if candidate_is_held(&operation, &candidate).await == Some(true) {
                     let resolved = join_relative(&variation, name);
                     return Some((path, resolved));
                 }
@@ -414,7 +418,7 @@ pub(crate) async fn resolve_prefixes(
                 // `filesystem_path` forks on, and are left for it to find as it
                 // always did. A platform that would not say arrives here too,
                 // and the read settles it.
-                if let Ok(names) = filesystem_names(&directory, name).await
+                if let Ok(names) = names_folding_to_in_operation(&operation, &directory, name).await
                     && let [single] = names.as_slice()
                 {
                     let resolved = join_relative(&variation, single);
@@ -448,7 +452,31 @@ fn join_relative(parent: &str, name: &str) -> String {
     }
 }
 
-/// `find_path` in the case the file system holds it, relative to `base_path`.
+/// The path a candidate name has, named as the operation names paths: from the root it was
+/// opened on, which is what `parent` is already a path under.
+fn candidate_path(parent: &str, name: &str) -> RelativePath {
+    RelativePath::new_from_clean_parts(parent, name)
+}
+
+/// [`InstanceOperation::holds_name_exactly`] for a candidate the resolver built.
+async fn candidate_is_held(
+    operation: &InstanceOperationImpl,
+    candidate: &RelativePath,
+) -> Option<bool> {
+    operation.holds_name_exactly(candidate).await
+}
+
+/// [`InstanceOperation::names_folding_to`] for a directory the resolver built.
+async fn names_folding_to_in_operation(
+    operation: &InstanceOperationImpl,
+    directory: &RelativePath,
+    name: &str,
+) -> Result<Vec<String>, crate::fs::filesystem_provider::FsError> {
+    operation.names_folding_to(directory, name).await
+}
+
+/// `find_path` in the case the file system holds it, relative to `base` -- itself a clean path
+/// from the root the operation was opened on, and empty where the two are the same.
 ///
 /// The components are read off the file system and joined here, so the result is
 /// clean by construction and a caller can walk it without validating or cleaning
@@ -456,46 +484,52 @@ fn join_relative(parent: &str, name: &str) -> String {
 ///
 /// A path the file system does not hold is an error rather than a case.
 pub async fn filesystem_path(
-    base_path: impl AsRef<Path>,
+    operation: &InstanceOperationImpl,
+    base: &str,
     find_path: &RelativePath,
     prefixes: Option<&ResolvedPrefixes>,
 ) -> tokio::io::Result<RelativePath> {
-    filesystem_path_and_metadata(base_path, find_path, prefixes)
+    filesystem_path_and_info(operation, base, find_path, prefixes)
         .await
         .map(|(path, _)| path)
 }
 
-/// [`filesystem_path`], and the metadata of the resolved path where establishing
-/// it read that metadata, so a caller needing both reads it once.
+/// [`filesystem_path`], and what the operation reported about the resolved path where
+/// establishing it read that, so a caller needing both asks once.
 ///
 /// `None` where the path was resolved a component at a time, which establishes
-/// each name without reading the metadata of the whole.
-pub async fn filesystem_path_and_metadata(
-    base_path: impl AsRef<Path>,
+/// each name without reading anything about the whole.
+///
+/// Names are established in the space the operation names paths in, so the buffer starts at
+/// `base` and the base is taken off the answer at the end -- a view moving rather than a path
+/// being built.
+pub async fn filesystem_path_and_info(
+    operation: &InstanceOperationImpl,
+    base: &str,
     find_path: &RelativePath,
     prefixes: Option<&ResolvedPrefixes>,
-) -> tokio::io::Result<(RelativePath, Option<std::fs::Metadata>)> {
-    let base_path = base_path.as_ref();
-
+) -> tokio::io::Result<(RelativePath, Option<FileInfo>)> {
     // TODO(mjansson): This should be a test for file system case sensitivity, in the sense that the file system
     //                 support multiple concurrent case variations of the same file name
     #[cfg(target_os = "linux")]
     {
-        let initial_path = base_path.join(find_path.as_str());
-        if let Ok(metadata) = lore_io::IoDriver::global().metadata(initial_path).await {
-            return Ok((find_path.clone(), Some(metadata)));
+        let initial_path = candidate_path(base, find_path.as_str());
+        if let Ok(info) = operation.file_info(&initial_path).await
+            && info.exists()
+        {
+            return Ok((find_path.clone(), Some(info)));
         }
     }
 
-    let mut full_path = base_path.to_path_buf();
     let mut remain_path = find_path.clone();
-    let mut found_path = RelativePathBuf::with_capacity(find_path.len());
+    let base_depth = if base.is_empty() { 0 } else { path_depth(base) };
+    let mut found_path = RelativePathBuf::with_capacity(base.len() + 1 + find_path.len());
+    found_path.push(base);
 
     // Whatever an earlier path already established is not established again.
     if let Some((components, resolved)) =
         prefixes.and_then(|prefixes| prefixes.longest_prefix_of(find_path.as_str()))
     {
-        full_path.push(resolved);
         found_path.push(resolved);
         remain_path.pop_root_repeat(components);
     }
@@ -506,12 +540,24 @@ pub async fn filesystem_path_and_metadata(
         // and that costs one lookup to establish. Only where it is not, or where
         // the platform will not say, does the directory get read, and a name
         // allocated for what it says.
-        if filesystem_name_matches(full_path.as_path(), name).await == Some(true) {
-            full_path.push(name);
+        if candidate_is_held(operation, &candidate_path(found_path.as_str(), name)).await
+            == Some(true)
+        {
             found_path.push(name);
             continue;
         }
-        let fs_names = filesystem_names(full_path.as_path(), name).await?;
+        let directory = candidate_path(found_path.as_str(), "");
+        let Ok(fs_names) = names_folding_to_in_operation(operation, &directory, name).await else {
+            return Err(tokio::io::Error::other(
+                "Failed to read the directory for case variations",
+            ));
+        };
+        if fs_names.is_empty() {
+            return Err(tokio::io::Error::new(
+                tokio::io::ErrorKind::NotFound,
+                "Matching file not found",
+            ));
+        }
         if fs_names.len() > 1 {
             if remain_path.is_empty() {
                 lore_debug!("Found ambiguous path case variations for {find_path}");
@@ -523,14 +569,14 @@ pub async fn filesystem_path_and_metadata(
             // Find the match in either or many of the potential variations
             let mut found_variation = false;
             for entry in fs_names.iter() {
-                let next_full_path = full_path.join(entry);
+                let next_full_path = directory.join(entry);
 
                 lore_debug!(
                     "Fork case variation check for {remain_path} in {}",
-                    next_full_path.display()
+                    next_full_path
                 );
                 if let Ok(sub_path) =
-                    filesystem_path_fork(next_full_path.as_path(), &remain_path).await
+                    filesystem_path_fork(operation, next_full_path.as_str(), &remain_path).await
                 {
                     if found_variation {
                         lore_debug!("Found ambiguous path case variations for {find_path}");
@@ -539,21 +585,18 @@ pub async fn filesystem_path_and_metadata(
                         ));
                     }
 
-                    full_path.push(entry);
-                    full_path.push(sub_path.as_str());
-
                     found_path.push(entry);
                     found_path.push(sub_path.as_str());
 
                     lore_debug!(
                         "Fork found case variation {sub_path} for {remain_path} in {}",
-                        next_full_path.display()
+                        next_full_path
                     );
                     found_variation = true;
                 } else {
                     lore_debug!(
                         "Fork found NO case variation for {remain_path} in {}",
-                        next_full_path.display()
+                        next_full_path
                     );
                 }
             }
@@ -568,37 +611,36 @@ pub async fn filesystem_path_and_metadata(
             break;
         }
 
-        full_path.push(fs_names[0].as_str());
         found_path.push(fs_names[0].as_str());
     }
 
-    log_resolved_case(found_path.as_str(), find_path.as_str(), base_path);
-    Ok((found_path.freeze(), None))
+    let mut found = found_path.freeze();
+    found.pop_root_repeat(base_depth);
+    log_resolved_case(found.as_str(), find_path.as_str(), base);
+    Ok((found, None))
 }
 
 /// Record a resolved path: at debug where the file system holds the name in a
 /// different case than the caller asked for, at trace where it matches, which is
 /// every other path a walk resolves.
-fn log_resolved_case(found: &str, requested: &str, base: &Path) {
+fn log_resolved_case(found: &str, requested: &str, base: &str) {
     if found == requested {
-        lore_trace!("Resolved path {found} in {}", base.display());
+        lore_trace!("Resolved path {found} in {base}");
     } else {
-        lore_debug!(
-            "Found full path case variation {found} for path {requested} in path {}",
-            base.display()
-        );
+        lore_debug!("Found full path case variation {found} for path {requested} in path {base}");
     }
 }
 
-pub fn filesystem_path_fork(
-    base_path: impl AsRef<Path>,
+pub fn filesystem_path_fork<'a>(
+    operation: &'a InstanceOperationImpl,
+    base: &str,
     find_path: &RelativePath,
-) -> Pin<Box<dyn Future<Output = tokio::io::Result<RelativePath>> + Send>> {
-    let base_path = base_path.as_ref().to_path_buf();
+) -> Pin<Box<dyn Future<Output = tokio::io::Result<RelativePath>> + Send + 'a>> {
+    let base = base.to_owned();
     let find_path = find_path.clone();
     // The fork resolves a path under one of several case variations of a
     // directory, which is not a prefix any map here was built against.
-    Box::pin(async move { filesystem_path(base_path, &find_path, None).await })
+    Box::pin(async move { filesystem_path(operation, &base, &find_path, None).await })
 }
 
 /// Represents a single filesystem item.
@@ -627,8 +669,9 @@ pub enum PathListingResult {
     /// For example, querying `/foo/bar/file.txt` yields `item.name = "file.txt"`.
     File { item: FileListItem },
 
-    /// The path did not exist, was not accessible, or was a special file type
-    /// (symlink, device, etc.) that we don't handle.
+    /// The path did not exist, was not accessible, or was a special file type (device, socket)
+    /// that we don't handle. A link is stat'd through to what it points at, so one naming a file
+    /// or a directory answers as that rather than as a kind we hold nothing for.
     NotFound,
 }
 
@@ -649,19 +692,50 @@ impl PathListingResult {
     }
 }
 
-/// Describes one listing entry, or `None` for one that says nothing about what is there: a name
-/// the walk could not read, or one whose metadata would not resolve — a broken link, or a name
-/// unlinked while the walk was running. A caller enumerating what is present skips those; one
-/// unreadable name says nothing about the rest of the directory.
-pub fn file_list_item(entry: std::io::Result<lore_io::DirEntry>) -> Option<FileListItem> {
-    let entry = entry.ok()?;
-    let metadata = entry.metadata?;
-    let name = entry.file_name.to_string_lossy().to_string();
+/// Describes one listing entry.
+///
+/// `Ok(None)` is an entry the walk carries nothing for: a name it could not read, or one whose
+/// metadata would not resolve — a broken link, or a name unlinked while the walk was running —
+/// and one the repository does not track, which is a link and anything the file system holds as
+/// neither a file nor a directory. A link is answered for by what it is rather than by what it
+/// points at, so one naming a file is skipped as the link it is. A caller enumerating what is
+/// present skips all of those; one unreadable name says nothing about the rest of the directory.
+///
+/// An error is a name that is not text. Nothing can be done with such a name that is not a
+/// guess: it hashes to a node the tree does not hold, and staging it would record a name no
+/// file answers to. Only the message it is reported in spells it lossily.
+pub fn file_list_item(
+    entry: std::io::Result<lore_io::DirEntry>,
+) -> Result<Option<FileListItem>, PathError> {
+    let Ok(entry) = entry else {
+        return Ok(None);
+    };
+    if entry.is_symlink {
+        return Ok(None);
+    }
+    let Some(metadata) = entry.metadata else {
+        return Ok(None);
+    };
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Ok(None);
+    }
+    let name = entry_name(entry.file_name)?;
     let name_hash = hash_string(name.as_str());
-    Some(FileListItem {
+    Ok(Some(FileListItem {
         name,
         metadata,
         name_hash,
+    }))
+}
+
+/// A directory entry's name as text, taking the bytes the listing already owns rather than a
+/// copy of them. A name that is not text is an error naming it lossily.
+pub fn entry_name(name: std::ffi::OsString) -> Result<String, PathError> {
+    name.into_string().map_err(|name| {
+        InvalidPath {
+            path: name.to_string_lossy().into_owned(),
+        }
+        .into()
     })
 }
 
@@ -681,48 +755,35 @@ pub fn file_list_item(entry: std::io::Result<lore_io::DirEntry>) -> Option<FileL
 ///
 /// Listing is attempted before the path is described, since a caller walking a tree reaches this
 /// with a directory almost every time — the walk recurses into those and compares files in place.
-pub async fn list_path(path: PathBuf) -> PathListingResult {
+pub async fn list_path(path: PathBuf) -> Result<PathListingResult, PathError> {
     let driver = lore_io::IoDriver::global();
 
     if let Ok(listing) = driver.read_dir(path.as_path()).await {
-        return PathListingResult::Directory { listing };
+        return Ok(PathListingResult::Directory { listing });
     }
 
     let Ok(metadata) = driver.metadata(path.as_path()).await else {
-        return PathListingResult::NotFound;
+        return Ok(PathListingResult::NotFound);
     };
 
     if metadata.is_file() {
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let file_name = match path.file_name() {
+            Some(name) => entry_name(name.to_os_string())?,
+            None => String::new(),
+        };
         let name_hash = hash_string(file_name.as_str());
 
-        PathListingResult::File {
+        Ok(PathListingResult::File {
             item: FileListItem {
                 name: file_name,
                 metadata,
                 name_hash,
             },
-        }
+        })
     } else {
         // Symlink or other special file type
-        PathListingResult::NotFound
+        Ok(PathListingResult::NotFound)
     }
-}
-
-/// Lists only directory children. Returns an error if path is not a directory.
-/// This is the preferred function when you know you're working with a directory.
-///
-/// # Arguments
-/// * `path` - The filesystem path to list (must be a directory)
-///
-/// # Returns
-/// * `Ok(listing)` - Yields an entry for each child; [`file_list_item`] describes one
-/// * `Err(_)` - If path doesn't exist, isn't accessible, or isn't a directory
-pub async fn list_directory(path: PathBuf) -> std::io::Result<lore_io::DirStream> {
-    lore_io::IoDriver::global().read_dir(path.as_path()).await
 }
 
 /// Helper function to rename files during name case unification handling. Will try to rename
@@ -1072,23 +1133,182 @@ mod tests {
         lore_base::test_util::TempDir::new("lore-fs-test-")
     }
 
+    /// A path of `depth` components, each named for its level.
+    fn nested_path(depth: usize) -> RelativePath {
+        let path = (1..=depth)
+            .map(|level| format!("level{level}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        std::str::FromStr::from_str(path.as_str()).expect("relative path")
+    }
+
+    /// Resolving a path the filesystem holds costs one lookup however deep it is: the path
+    /// is read whole and its components are not walked. A per-component walk reintroduced
+    /// here would show as a count that grows with the depth asked about.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_held_path_is_looked_up_once_however_deep() {
+        use crate::fs::filesystem_provider::FilesystemProvider;
+        use crate::fs::filesystem_provider::tests::TestFilesystemProvider;
+
+        for depth in [1usize, 9] {
+            let filesystem = Arc::new(TestFilesystemProvider::holding_every_path());
+            let operation = FilesystemProvider::begin_operation(filesystem.as_ref())
+                .await
+                .expect("beginning an operation");
+            let asked = nested_path(depth);
+
+            let (resolved, info) = filesystem_path_and_info(&operation, "", &asked, None)
+                .await
+                .expect("a held path must resolve");
+
+            assert_eq!(resolved.as_str(), asked.as_str());
+            assert!(
+                info.is_some(),
+                "the lookup that settled the path answers for it"
+            );
+            assert_eq!(
+                1,
+                filesystem.file_infos(),
+                "a path at depth {depth} must cost one lookup"
+            );
+            assert_eq!(
+                0,
+                filesystem.name_lookups(),
+                "no component was resolved on its own"
+            );
+            assert_eq!(0, filesystem.directory_reads(), "no directory was read");
+        }
+    }
+
+    /// A path the filesystem does not hold falls back to resolving a component at a time,
+    /// which is the only path that reads per component. It stops at the first component that
+    /// is not there, so that cost does not grow with the depth asked about either.
+    #[tokio::test]
+    async fn a_path_that_is_not_there_stops_at_its_first_component() {
+        use crate::fs::filesystem_provider::FilesystemProvider;
+        use crate::fs::filesystem_provider::tests::TestFilesystemProvider;
+
+        for depth in [1usize, 9] {
+            let filesystem = Arc::new(TestFilesystemProvider::new());
+            let operation = FilesystemProvider::begin_operation(filesystem.as_ref())
+                .await
+                .expect("beginning an operation");
+
+            assert!(
+                filesystem_path_and_info(&operation, "", &nested_path(depth), None)
+                    .await
+                    .is_err(),
+                "a path no component of which is there must not resolve"
+            );
+            assert_eq!(
+                1,
+                filesystem.name_lookups(),
+                "a path at depth {depth} must stop at its first component"
+            );
+            assert_eq!(1, filesystem.directory_reads(), "one directory settles it");
+        }
+    }
+
+    /// An operation over the OS filesystem, which is what the resolver reads through.
+    async fn os_operation(root: &Path) -> Arc<InstanceOperationImpl> {
+        crate::fs::filesystem_provider::FilesystemProvider::begin_operation(
+            &crate::fs::os::OsFilesystem::new(root),
+        )
+        .await
+        .expect("beginning an operation over the OS filesystem")
+    }
+
     #[tokio::test]
     async fn list_path_yields_a_directory_listing() {
         let dir = temp_dir();
         std::fs::write(dir.path().join("child"), b"data").expect("write child");
 
         let PathListingResult::Directory { mut listing } =
-            list_path(dir.path().to_path_buf()).await
+            list_path(dir.path().to_path_buf()).await.expect("listing")
         else {
             panic!("a directory must list");
         };
         let mut names = Vec::new();
         while let Some(entry) = listing.next().await {
-            if let Some(item) = file_list_item(entry) {
+            if let Some(item) = file_list_item(entry).expect("entry name") {
                 names.push(item.name);
             }
         }
         assert_eq!(names, vec!["child".to_string()]);
+    }
+
+    /// A link is not a kind the repository tracks, and the listing describes what a name holds
+    /// rather than what it points at, so one naming a file is skipped as the link it is.
+    #[cfg(target_family = "unix")]
+    #[tokio::test]
+    async fn a_listing_skips_a_link_to_a_file_it_would_otherwise_track() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("target"), b"data").expect("write target");
+        std::os::unix::fs::symlink(dir.path().join("target"), dir.path().join("link"))
+            .expect("link the target");
+
+        let PathListingResult::Directory { mut listing } =
+            list_path(dir.path().to_path_buf()).await.expect("listing")
+        else {
+            panic!("a directory must list");
+        };
+        let mut names = Vec::new();
+        while let Some(entry) = listing.next().await {
+            if let Some(item) = file_list_item(entry).expect("entry name") {
+                names.push(item.name);
+            }
+        }
+        assert_eq!(names, vec!["target".to_string()]);
+    }
+
+    /// A name a listing can yield that has no text spelling: bytes that are not UTF-8 on unix, an
+    /// unpaired surrogate on Windows.
+    #[cfg(target_family = "unix")]
+    fn name_that_is_not_text() -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        std::ffi::OsString::from_vec(vec![0xff])
+    }
+
+    #[cfg(target_family = "windows")]
+    fn name_that_is_not_text() -> std::ffi::OsString {
+        use std::os::windows::ffi::OsStringExt as _;
+
+        std::ffi::OsString::from_wide(&[0xd800])
+    }
+
+    /// A name that is not text is reported, and named lossily in the report, rather than passed
+    /// over: it hashes to a node the tree does not hold, so nothing can be done with it that is
+    /// not a guess.
+    ///
+    /// The entry is assembled rather than read off a disk so this runs wherever the crate builds.
+    /// A filesystem enforcing UTF-8 -- ZFS with `utf8only=on`, APFS -- refuses to create such a
+    /// name at all, which leaves
+    /// [`crate::fs::filesystem_provider::tests::a_name_that_is_not_text_is_reported`], the
+    /// end-to-end cover over a real listing, with nothing to list there.
+    #[test]
+    fn a_listed_name_that_is_not_text_is_reported() {
+        let dir = temp_dir();
+        let path = dir.path().join("named");
+        std::fs::write(&path, b"data").expect("write file");
+        // A real file's metadata: an entry carrying none, or naming neither a file nor a
+        // directory, is passed over before its name is read.
+        let metadata = std::fs::metadata(&path).expect("read metadata");
+
+        let listed = file_list_item(Ok(lore_io::DirEntry {
+            file_name: name_that_is_not_text(),
+            metadata: Some(metadata),
+            is_symlink: false,
+        }));
+
+        let Err(error) = listed else {
+            panic!("a name with no text spelling must be reported, not listed");
+        };
+        assert!(
+            error.to_string().contains('\u{fffd}'),
+            "the report names the entry lossily, not by a spelling it does not have: {error}"
+        );
     }
 
     #[tokio::test]
@@ -1097,7 +1317,7 @@ mod tests {
         let path = dir.path().join("lonely.txt");
         std::fs::write(&path, b"data").expect("write file");
 
-        let PathListingResult::File { item } = list_path(path).await else {
+        let PathListingResult::File { item } = list_path(path).await.expect("listing") else {
             panic!("a file must be described, not listed");
         };
         assert_eq!(item.name, "lonely.txt");
@@ -1108,7 +1328,10 @@ mod tests {
     async fn list_path_reports_a_missing_path() {
         let dir = temp_dir();
         assert!(
-            list_path(dir.path().join("absent")).await.is_not_found(),
+            list_path(dir.path().join("absent"))
+                .await
+                .expect("listing")
+                .is_not_found(),
             "a missing path is neither a file nor a directory"
         );
     }
@@ -1224,21 +1447,62 @@ mod tests {
     #[tokio::test]
     async fn path_resolves_a_path_already_in_the_case_on_disk() {
         let dir = temp_dir();
+        let operation = os_operation(dir.path()).await;
         let nested = dir.path().join("Assets").join("Meshes");
         std::fs::create_dir_all(&nested).expect("create dirs");
         std::fs::write(nested.join("Rock.mesh"), b"").expect("write file");
 
         let asked: RelativePath =
             std::str::FromStr::from_str("Assets/Meshes/Rock.mesh").expect("relative path");
-        let (resolved, metadata) = filesystem_path_and_metadata(dir.path(), &asked, None)
+        let (resolved, info) = filesystem_path_and_info(&operation, "", &asked, None)
             .await
             .expect("the path must resolve");
         assert_eq!(resolved.as_str(), "Assets/Meshes/Rock.mesh");
         assert_eq!(
-            metadata.is_some(),
+            info.is_some(),
             cfg!(target_os = "linux"),
             "the metadata comes back from the platforms that settle the path by reading it whole"
         );
+    }
+
+    /// A link or layer mount hands the resolver a base, and what comes back has to be relative
+    /// to that base rather than to the root the operation names paths from: a caller staging
+    /// inside a mount looks the answer up in the mount's own state, and a path with the mount
+    /// prefix still on it is one that state does not hold.
+    #[tokio::test]
+    async fn path_resolves_below_a_base_and_answers_relative_to_it() {
+        let dir = temp_dir();
+        let operation = os_operation(dir.path()).await;
+        let nested = dir.path().join("Mount").join("Assets");
+        std::fs::create_dir_all(&nested).expect("create dirs");
+        std::fs::write(nested.join("Rock.mesh"), b"").expect("write file");
+
+        let asked: RelativePath =
+            std::str::FromStr::from_str("assets/rock.MESH").expect("relative path");
+        let resolved = filesystem_path(&operation, "Mount", &asked, None)
+            .await
+            .expect("the path must resolve below the base");
+        assert_eq!(resolved.as_str(), "Assets/Rock.mesh");
+        assert_eq!(resolved.as_lowercase_str(), "assets/rock.mesh");
+    }
+
+    /// The lookup that settles a path already in the case on disk answers with the path as
+    /// asked, not with the base composed onto it. Only this shape reaches that lookup, since a
+    /// path in another case misses it and is settled a component at a time instead.
+    #[tokio::test]
+    async fn path_below_a_base_does_not_resolve_the_base_itself() {
+        let dir = temp_dir();
+        let operation = os_operation(dir.path()).await;
+        let nested = dir.path().join("Mount").join("Deeper");
+        std::fs::create_dir_all(&nested).expect("create dirs");
+        std::fs::write(nested.join("leaf.txt"), b"").expect("write file");
+
+        let asked: RelativePath =
+            std::str::FromStr::from_str("Deeper/leaf.txt").expect("relative path");
+        let resolved = filesystem_path(&operation, "Mount", &asked, None)
+            .await
+            .expect("the path must resolve below the base");
+        assert_eq!(resolved.as_str(), "Deeper/leaf.txt");
     }
 
     #[tokio::test]
@@ -1247,7 +1511,7 @@ mod tests {
         std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
 
         assert_eq!(
-            filesystem_names(dir.path(), "Test.file")
+            names_folding_to(dir.path(), "Test.file")
                 .await
                 .expect("a name the filesystem holds must resolve"),
             vec!["Test.file".to_string()]
@@ -1264,7 +1528,7 @@ mod tests {
         std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
 
         assert_eq!(
-            filesystem_names(dir.path(), "test.FILE")
+            names_folding_to(dir.path(), "test.FILE")
                 .await
                 .expect("a case variation must resolve"),
             vec!["Test.file".to_string()]
@@ -1277,7 +1541,10 @@ mod tests {
         std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
 
         assert!(
-            filesystem_names(dir.path(), "other.file").await.is_err(),
+            names_folding_to(dir.path(), "other.file")
+                .await
+                .expect("reading the directory must succeed")
+                .is_empty(),
             "a name no case variation of which is there must not resolve"
         );
     }
@@ -1291,7 +1558,10 @@ mod tests {
         std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
 
         assert!(
-            filesystem_names(dir.path(), "Test.file.").await.is_err(),
+            names_folding_to(dir.path(), "Test.file.")
+                .await
+                .expect("reading the directory must succeed")
+                .is_empty(),
             "a trailing dot names a file that is not there"
         );
     }
@@ -1308,7 +1578,7 @@ mod tests {
         std::fs::write(dir.path().join("Test.file"), b"").expect("write Test.file");
         std::fs::write(dir.path().join("test.file"), b"").expect("write test.file");
 
-        let mut found = filesystem_names(dir.path(), "TEST.FILE")
+        let mut found = names_folding_to(dir.path(), "TEST.FILE")
             .await
             .expect("the variations must resolve");
         found.sort();
@@ -1319,7 +1589,7 @@ mod tests {
         );
 
         assert_eq!(
-            filesystem_names(dir.path(), "test.file")
+            names_folding_to(dir.path(), "test.file")
                 .await
                 .expect("an exact name must resolve"),
             vec!["test.file".to_string()],
@@ -1332,6 +1602,7 @@ mod tests {
     #[tokio::test]
     async fn path_resolves_every_component_to_its_stored_case_variation() {
         let dir = temp_dir();
+        let operation = os_operation(dir.path()).await;
         if !case_insensitive(dir.path()) {
             return;
         }
@@ -1341,7 +1612,7 @@ mod tests {
 
         let asked = std::str::FromStr::from_str("assets/MESHES/rock.MESH")
             .expect("relative path is infallible");
-        let resolved = filesystem_path(dir.path(), &asked, None)
+        let resolved = filesystem_path(&operation, "", &asked, None)
             .await
             .expect("the path must resolve");
         assert_eq!(resolved.as_str(), "Assets/Meshes/Rock.mesh");
@@ -1363,13 +1634,14 @@ mod tests {
     #[tokio::test]
     async fn resolved_prefixes_answer_for_the_paths_under_them() {
         let dir = temp_dir();
+        let operation = os_operation(dir.path()).await;
         let nested = dir.path().join("Assets").join("Meshes");
         std::fs::create_dir_all(&nested).expect("create dirs");
         std::fs::write(nested.join("Rock.mesh"), b"").expect("write file");
 
         // Shallowest first, as the caller has them.
         let shared = depth_paths(&["assets", "assets/meshes"]);
-        let prefixes = resolve_prefixes(dir.path(), &shared).await;
+        let prefixes = resolve_prefixes(&operation, dir.path(), &shared).await;
 
         assert_eq!(prefixes.len(), 2);
         assert_eq!(prefixes.longest_prefix_of("assets"), Some((1, "Assets")));
@@ -1387,7 +1659,7 @@ mod tests {
         let asked: RelativePath =
             std::str::FromStr::from_str("assets/meshes/rock.MESH").expect("relative path");
         let (resolved, metadata) =
-            filesystem_path_and_metadata(dir.path(), &asked, Some(&prefixes))
+            filesystem_path_and_info(&operation, "", &asked, Some(&prefixes))
                 .await
                 .expect("the path must resolve");
         assert_eq!(resolved.as_str(), "Assets/Meshes/Rock.mesh");
@@ -1408,10 +1680,11 @@ mod tests {
     #[tokio::test]
     async fn resolved_prefixes_leave_out_what_they_cannot_settle() {
         let dir = temp_dir();
+        let operation = os_operation(dir.path()).await;
         std::fs::create_dir(dir.path().join("Assets")).expect("create dir");
 
         let shared = depth_paths(&["absent", "absent/deeper"]);
-        let prefixes = resolve_prefixes(dir.path(), &shared).await;
+        let prefixes = resolve_prefixes(&operation, dir.path(), &shared).await;
         assert!(prefixes.is_empty(), "nothing there resolves");
 
         // The path still resolves through the walk, which reports it as missing
@@ -1419,7 +1692,7 @@ mod tests {
         let asked: RelativePath =
             std::str::FromStr::from_str("absent/file").expect("relative path");
         assert!(
-            filesystem_path(dir.path(), &asked, Some(&prefixes))
+            filesystem_path(&operation, "", &asked, Some(&prefixes))
                 .await
                 .is_err()
         );
@@ -1430,7 +1703,9 @@ mod tests {
         std::fs::create_dir(dir.path().join("assets")).expect("create second variation");
         let shared = depth_paths(&["ASSETS"]);
         assert!(
-            resolve_prefixes(dir.path(), &shared).await.is_empty(),
+            resolve_prefixes(&operation, dir.path(), &shared)
+                .await
+                .is_empty(),
             "two case variations answer for it, so the caller has to fork and decide"
         );
     }
@@ -1443,23 +1718,24 @@ mod tests {
     #[tokio::test]
     async fn a_resolved_prefix_does_not_survive_the_directory_being_renamed() {
         let dir = temp_dir();
+        let operation = os_operation(dir.path()).await;
         std::fs::create_dir(dir.path().join("Assets")).expect("create dir");
         std::fs::write(dir.path().join("Assets").join("rock.mesh"), b"").expect("write file");
 
-        let prefixes = resolve_prefixes(dir.path(), &depth_paths(&["Assets"])).await;
+        let prefixes = resolve_prefixes(&operation, dir.path(), &depth_paths(&["Assets"])).await;
         assert_eq!(prefixes.longest_prefix_of("Assets"), Some((1, "Assets")));
 
         std::fs::rename(dir.path().join("Assets"), dir.path().join("ASSETS")).expect("rename");
 
         let asked: RelativePath =
             std::str::FromStr::from_str("Assets/rock.mesh").expect("relative path");
-        let afresh = filesystem_path(dir.path(), &asked, None).await.ok();
+        let afresh = filesystem_path(&operation, "", &asked, None).await.ok();
         assert_eq!(
             afresh.as_ref().map(RelativePath::as_str),
             Some("ASSETS/rock.mesh"),
             "resolving afresh finds the directory under the name it now has"
         );
-        let mapped = filesystem_path(dir.path(), &asked, Some(&prefixes))
+        let mapped = filesystem_path(&operation, "", &asked, Some(&prefixes))
             .await
             .ok();
         assert_ne!(
@@ -1477,6 +1753,7 @@ mod tests {
     #[tokio::test]
     async fn a_resolved_prefix_answers_exactly_as_the_walk_would() {
         let dir = temp_dir();
+        let operation = os_operation(dir.path()).await;
         let nested = dir.path().join("Assets").join("Meshes");
         std::fs::create_dir_all(&nested).expect("create dirs");
         std::fs::write(nested.join("Rock.mesh"), b"").expect("write file");
@@ -1489,7 +1766,7 @@ mod tests {
             "assets/meshes",
             "absent",
         ]);
-        let prefixes = resolve_prefixes(dir.path(), &shared).await;
+        let prefixes = resolve_prefixes(&operation, dir.path(), &shared).await;
 
         for asked in [
             // Given exactly as the filesystem holds it.
@@ -1507,10 +1784,10 @@ mod tests {
         ] {
             let asked: RelativePath = std::str::FromStr::from_str(asked).expect("relative path");
             assert_eq!(
-                filesystem_path(dir.path(), &asked, Some(&prefixes))
+                filesystem_path(&operation, "", &asked, Some(&prefixes))
                     .await
                     .ok(),
-                filesystem_path(dir.path(), &asked, None).await.ok(),
+                filesystem_path(&operation, "", &asked, None).await.ok(),
                 "{asked} must resolve the same with the map as without it"
             );
         }

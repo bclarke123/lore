@@ -19,6 +19,7 @@ use lore_telemetry::TraceConfigError;
 use serde::Deserialize;
 
 use crate::auth::jwk::JWKServiceSettings;
+use crate::authnz::repository_authorizer::select_repository_authorizer;
 use crate::grpc::server::FeatureSettings;
 use crate::grpc::server::GrpcPublicServicesSettings;
 use crate::hooks::HookSettings;
@@ -173,11 +174,21 @@ impl Settings {
     }
 }
 
-/// Missing `jwt_issuer` / `jwt_audience` under `[server.auth]` already fails
-/// deserialization. This catches the empty list, which would parse but reject
-/// every token, and is never what was configured on purpose.
+/// Missing `jwt_issuer` / `jwt_audience` under `[server.auth]` fails
+/// deserialization. Calls repository authorizer selection logic to verify
+/// that the configuration combination is valid for authorization.
 fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> {
-    let Some(auth) = settings.server.auth.as_ref() else {
+    let auth = settings.server.auth.as_ref();
+    let auth_url = settings
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.endpoint.as_ref())
+        .and_then(|endpoint| endpoint.auth_url.as_deref());
+    // Run the authorizer selection at load, so a refused pairing bails here,
+    // before any initialization, instead of at server startup.
+    select_repository_authorizer(auth, auth_url)
+        .map_err(|err| config::ConfigError::Message(err.to_string()))?;
+    let Some(auth) = auth else {
         return Ok(());
     };
     // Server-local minting pins issuer and audience from the token settings,
@@ -291,6 +302,11 @@ pub struct AuthSettings {
     /// Dotted path of the claim carrying per-repository resource grants.
     /// If this is set, enables the granular `ResourceGrantsAuthorizer`.
     pub resource_claim: Option<String>,
+    /// The field inside each resource entry naming the resource, for
+    /// providers whose entry shape cannot be changed (Keycloak's UMA
+    /// `permissions` entries carry `rsname`, for example).
+    #[serde(default = "AuthSettings::default_resource_id_claim")]
+    pub resource_id_claim: String,
     /// Template that renders a repository id into the corresponding resource
     /// name.
     #[serde(default = "AuthSettings::default_resource_id_template")]
@@ -310,11 +326,15 @@ pub struct AuthSettings {
 
 impl AuthSettings {
     pub(crate) fn default_resource_id_template() -> String {
-        "urc-{id}".to_string()
+        crate::auth::jwt::DEFAULT_RESOURCE_ID_TEMPLATE.to_string()
+    }
+
+    pub(crate) fn default_resource_id_claim() -> String {
+        "resource_id".to_string()
     }
 
     pub(crate) fn default_resource_wildcard() -> String {
-        "urc-*".to_string()
+        crate::auth::jwt::DEFAULT_RESOURCE_WILDCARD.to_string()
     }
 
     pub(crate) fn default_identity_claim() -> String {
@@ -758,6 +778,7 @@ mod tests {
             jwt_audience = ["lore"]
             permission_claim = "realm_access.roles"
             resource_claim = "resources"
+            resource_id_claim = "rsname"
             resource_id_template = "repo:{id}"
             resource_wildcard = "urc-*"
             identity_claim = "preferred_username"
@@ -768,6 +789,7 @@ mod tests {
 
         assert_eq!(auth.permission_claim.as_deref(), Some("realm_access.roles"));
         assert_eq!(auth.resource_claim.as_deref(), Some("resources"));
+        assert_eq!(auth.resource_id_claim, "rsname");
         assert_eq!(auth.resource_id_template, "repo:{id}");
         assert_eq!(auth.resource_wildcard, "urc-*");
         assert_eq!(auth.identity_claim, "preferred_username");
@@ -789,6 +811,7 @@ mod tests {
 
         assert_eq!(auth.resource_id_template, "urc-{id}");
         assert_eq!(auth.resource_wildcard, "urc-*");
+        assert_eq!(auth.resource_id_claim, "resource_id");
         assert_eq!(auth.baseline_access, BaselineAccess::Denied);
         assert_eq!(auth.permission_claim, None);
         assert_eq!(auth.resource_claim, None);
@@ -919,6 +942,57 @@ mod tests {
         )
         .expect("settings deserialize");
         validate_auth_config(&settings).expect("no [server.auth] must stay valid");
+    }
+
+    /// `auth_url` names an authorization service, but without `[server.auth]`
+    /// nothing verifies tokens and the server would run open. The loader
+    /// refuses it, naming both settings.
+    #[test]
+    fn auth_url_without_server_auth_fails_validation() {
+        let settings: Settings = toml::from_str(
+            r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+
+            [environment.endpoint]
+            auth_url = "https://legacy-auth.example.com"
+        "#,
+        )
+        .expect("settings deserialize");
+        let error = validate_auth_config(&settings)
+            .expect_err("auth_url without [server.auth] must fail validation");
+        assert!(error.to_string().contains("auth_url"), "{error}");
+        assert!(error.to_string().contains("[server.auth]"), "{error}");
+    }
+
+    /// The authorizer-selection conflict bails at config load: setting
+    /// `resource_claim` while `auth_url` is still configured is refused
+    /// before any initialization, naming both settings.
+    #[test]
+    fn auth_url_with_resource_claim_fails_validation() {
+        // The trailing table is appended after the `[server.auth]` keys the
+        // helper writes, which TOML reads as a sibling table.
+        let settings = settings_with_auth_keys(
+            r#"
+            jwt_issuer = "LEGACY_AUTH_KEYWORD"
+            jwt_audience = ["lore-service"]
+            resource_claim = "resources"
+
+            [environment.endpoint]
+            auth_url = "https://legacy-auth.example.com"
+        "#,
+        )
+        .expect("the conflicting pairing still parses");
+        let error = validate_auth_config(&settings)
+            .expect_err("auth_url with resource_claim must fail validation");
+        assert!(error.to_string().contains("auth_url"), "{error}");
+        assert!(error.to_string().contains("resource_claim"), "{error}");
     }
 
     /// Both keys absent means an empty policy, which resolves to the built-in set.

@@ -32,10 +32,12 @@ use crate::metadata::MetadataType;
 use crate::metadata::RESTORED_FROM;
 use crate::node::Node;
 use crate::node::NodeBlock;
+use crate::node::ROOT_NODE;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::revision::sync;
 use crate::state;
+use crate::util::path::RelativePath;
 use crate::util::serde::u8_as_bool;
 
 /// Event data reported at the start of the file phase of a restore.
@@ -311,30 +313,32 @@ pub async fn restore(
             if change.action == change::FileAction::Delete {
                 let block = change
                     .from
+                    .mapping
                     .state
                     .block(
-                        change.from.repository.clone(),
-                        NodeBlock::index(change.from.node),
+                        change.from.mapping.repository.clone(),
+                        NodeBlock::index(change.from.mapping.node),
                     )
                     .await
                     .forward::<RestoreError>("deserializing state node block")?;
-                block.node(Node::index(change.from.node))
+                block.node(Node::index(change.from.mapping.node))
             } else {
                 let block = change
                     .to
+                    .mapping
                     .state
                     .block(
-                        change.to.repository.clone(),
-                        NodeBlock::index(change.to.node),
+                        change.to.mapping.repository.clone(),
+                        NodeBlock::index(change.to.mapping.node),
                     )
                     .await
                     .forward::<RestoreError>("deserializing state node block")?;
-                block.node(Node::index(change.to.node))
+                block.node(Node::index(change.to.mapping.node))
             }
         };
 
         LoreEvent::RevisionRestoreFile(LoreRevisionRestoreFileEventData {
-            path: LoreString::from(&change.path),
+            path: LoreString::from(change.path()),
             action: change.action.into(),
             size: node.size,
             is_file: node.is_file() as u8,
@@ -449,9 +453,9 @@ pub async fn restore(
         repository.clone(),
         token.share(),
         state_staged.clone(),
-        repository.require_path()?,
+        RelativePath::new(),
+        ROOT_NODE,
         metadata.clone(),
-        None,
         std::sync::Arc::new(std::collections::HashMap::new()),
         current_branch,
         rehash_tracker.clone(),

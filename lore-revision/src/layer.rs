@@ -17,7 +17,6 @@ use crate::event;
 use crate::event::EventError;
 use crate::find;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
-use crate::fs::filesystem_provider::FilesystemDiffTree;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
@@ -31,7 +30,10 @@ use crate::lore_debug;
 use crate::lore_info;
 use crate::lore_warn;
 use crate::metadata;
+use crate::node::INVALID_NODE;
 use crate::node::NodeID;
+use crate::node::NodeLink;
+use crate::node::ROOT_NODE;
 use crate::repository;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
@@ -41,9 +43,9 @@ use crate::revision::sync;
 use crate::revision::sync::SyncOptions;
 use crate::revision::sync::SyncRealizeStats;
 use crate::state;
+use crate::state::NodeMapping;
 use crate::state::State;
 use crate::util::path::RelativePath;
-use crate::util::path::RepositoryPath;
 
 #[error_set]
 pub enum LayerError {
@@ -218,10 +220,49 @@ pub fn layer_config_path(repository: &Arc<RepositoryContext>) -> Result<PathBuf,
         .map(|path| path.join(repository::LAYER))
 }
 
+#[derive(Clone)]
 pub struct LayerState {
     pub repository: Arc<RepositoryContext>,
     pub state_current: Arc<State>,
     pub state_staged: Arc<State>,
+}
+
+/// One side of a diff of the subtree a layer draws, as `state` holds it.
+///
+/// A layer names that subtree by the path it draws from, which is the one thing the drawn-from
+/// repository's own spelling of a path is read for: a revision numbers its nodes as it pleases,
+/// so the same subtree is a different node in each. A revision holding no such subtree names no
+/// node, which is one side of an add or a delete.
+///
+/// `source_path` reaches no further. What a diff of two of these reports is spelled from
+/// `mount_path`, so no change carries the drawn-from spelling.
+pub(crate) async fn drawn_subtree_state(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    source_path: &RelativePath,
+    mount_path: &RelativePath,
+) -> change::NodeChangeState {
+    if source_path.is_empty() {
+        return state::node_change_state(repository, state, ROOT_NODE, mount_path.clone()).await;
+    }
+
+    let node_link = state
+        .find_node_link(repository.clone(), source_path.as_str())
+        .await
+        .ok()
+        .filter(NodeLink::is_valid);
+    let Some(node_link) = node_link else {
+        return state::node_change_state(repository, state, INVALID_NODE, mount_path.clone()).await;
+    };
+
+    match node_link.resolve(repository.clone(), state.clone()).await {
+        Ok((repository, state)) => {
+            state::node_change_state(&repository, &state, node_link.node, mount_path.clone()).await
+        }
+        Err(_) => {
+            state::node_change_state(repository, state, INVALID_NODE, mount_path.clone()).await
+        }
+    }
 }
 
 impl Layer {
@@ -413,8 +454,6 @@ pub async fn add(
         staged: Hash::default(),
     });
 
-    let target_path = RepositoryPath::from_relative(&repository, target_path)?;
-
     // Materialize layer
     lore_debug!("Connecting remote storage");
     let correlation_id = crate::lore::execution_context()
@@ -427,7 +466,7 @@ pub async fn add(
         .forward::<LayerError>("Not connected")?;
 
     event::LoreEvent::LayerAdd(LoreLayerAddEventData {
-        target_path: LoreString::from(target_path.relative().clone()),
+        target_path: LoreString::from(&target_path.clone()),
         source_repository: layer_repository.id,
         source_path: LoreString::from(&source_path),
         metadata: metadata.into(),
@@ -435,42 +474,37 @@ pub async fn add(
     })
     .send();
 
-    // Ensure the target path exist to clone into
-    lore_io::IoDriver::global()
-        .create_dir_all(target_path.absolute())
-        .await
-        .internal("Failed to create the target directory for layer")?;
+    let target_states = layer_repository.filter.mount_states(&target_path);
+    // The target directory and the files cloned under it are in the same filesystem, so one
+    // operation covers both.
+    with_operation(layer_repository.file_system(), true, async |operation| {
+        operation
+            .create_dir_all(&target_path)
+            .await
+            .forward::<LayerError>("Failed to create the target directory for layer")?;
 
-    let layer_operation = layer_repository
-        .file_system()
-        .begin_operation()
+        let clone_ctx = CloneContext {
+            repository: layer_repository.clone(),
+            state: layer_state,
+            operation,
+            options: Arc::new(clone::CloneOptions {
+                ignore_existing: false,
+                ..Default::default()
+            }),
+            stats: Arc::default(),
+            modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
+        };
+        clone::clone_node(
+            clone_ctx,
+            layer_storage,
+            target_path,
+            layer_node_link.node,
+            target_states,
+        )
         .await
-        .forward::<LayerError>("Failed to start operation")?;
-    let clone_ctx = CloneContext {
-        repository: layer_repository.clone(),
-        state: layer_state,
-        operation: layer_operation.clone(),
-        options: Arc::new(clone::CloneOptions {
-            ignore_existing: false,
-            ..Default::default()
-        }),
-        stats: Arc::default(),
-        modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
-    };
-    let target_states = layer_repository.filter.mount_states(target_path.relative());
-    clone::clone_node(
-        clone_ctx,
-        layer_storage,
-        target_path,
-        layer_node_link.node,
-        target_states,
-    )
-    .await
-    .forward::<LayerError>("Failed cloning target layer")?;
-    layer_operation
-        .finalize(true)
-        .await
-        .forward::<LayerError>("Failed to finalize operation")?;
+        .forward::<LayerError>("Failed cloning target layer")
+    })
+    .await?;
 
     save_config(token, &config_path, &config).await?;
 
@@ -508,6 +542,46 @@ fn resolve_layer_index(
                 layer.repository == source_repository && layer.target_path.as_str() == target_path
             })
             .ok_or_else(|| LayerNotFound.into())
+    }
+}
+
+/// Removes the files and directories a layer materialized at `target_path`.
+///
+/// Directories are removed in reverse path order, which places a directory before its ancestors
+/// so each is empty when it is removed. One still holding untracked content remains: only what
+/// the layer put there is removed. `purge` removes the whole subtree instead. Failures are
+/// logged and do not stop the removal.
+async fn remove_layer_mount(
+    operation: &InstanceOperationImpl,
+    target_path: &RelativePath,
+    tracked_files: &[RelativePath],
+    tracked_directories: &mut [RelativePath],
+    purge: bool,
+) {
+    if purge {
+        if let Err(err) = operation.remove_recursive(target_path).await {
+            lore_warn!("Failed to purge layer root {target_path}: {err}");
+        }
+        return;
+    }
+
+    for file in tracked_files {
+        if let Err(err) = operation.remove(file).await {
+            lore_warn!("Failed to remove layer file {file}: {err}");
+        }
+    }
+
+    tracked_directories.sort_unstable_by(|a, b| b.as_str().cmp(a.as_str()));
+    for directory in tracked_directories.iter() {
+        if let Err(err) = operation.remove(directory).await {
+            lore_debug!("Skip non-empty or unremovable layer directory {directory}: {err}");
+        }
+    }
+
+    if !target_path.is_empty()
+        && let Err(err) = operation.remove(target_path).await
+    {
+        lore_debug!("Skip non-empty or unremovable layer root {target_path}: {err}");
     }
 }
 
@@ -555,86 +629,55 @@ pub async fn remove(
     let mut tracked_directories: Vec<RelativePath> = Vec::new();
     let mut modified: Vec<String> = Vec::new();
 
-    walk_layer_subtree(
-        layer_repository.clone(),
-        layer_state.clone(),
-        source_node_link.node,
-        target_path.clone(),
-        &mut tracked_files,
-        &mut tracked_directories,
-        &mut modified,
-    )
-    .await?;
-
-    // Both reasons are reported before returning so a layer that is both staged
-    // and modified does not hide one behind the other across two --force runs.
     let force = execution_context().globals().force();
-    if !force && (staged_file_count > 0 || !modified.is_empty()) {
-        if staged_file_count > 0 {
-            lore_warn!(
-                "Layer at '{}' has {staged_file_count} staged file(s) (use --force to discard)",
-                target_path.as_str()
-            );
+    // The walk reads the same files the removal then deletes, so one operation covers both.
+    with_operation(repository.file_system(), true, async |operation| {
+        walk_layer_subtree(
+            &operation,
+            layer_repository.clone(),
+            layer_state.clone(),
+            source_node_link.node,
+            target_path.clone(),
+            &mut tracked_files,
+            &mut tracked_directories,
+            &mut modified,
+        )
+        .await?;
+
+        // Both reasons are reported before returning so a layer that is both staged
+        // and modified does not hide one behind the other across two --force runs.
+        if !force && (staged_file_count > 0 || !modified.is_empty()) {
+            if staged_file_count > 0 {
+                lore_warn!(
+                    "Layer at '{}' has {staged_file_count} staged file(s) (use --force to discard)",
+                    target_path.as_str()
+                );
+            }
+            if !modified.is_empty() {
+                lore_warn!(
+                    "Layer at '{}' has locally modified files (use --force to discard): {}",
+                    target_path.as_str(),
+                    modified.join(", ")
+                );
+            }
+            return Err(LocalModifications.into());
         }
-        if !modified.is_empty() {
-            lore_warn!(
-                "Layer at '{}' has locally modified files (use --force to discard): {}",
-                target_path.as_str(),
-                modified.join(", ")
-            );
-        }
-        return Err(LocalModifications.into());
-    }
+
+        remove_layer_mount(
+            &operation,
+            &target_path,
+            &tracked_files,
+            &mut tracked_directories,
+            purge,
+        )
+        .await;
+        Ok::<(), LayerError>(())
+    })
+    .await?;
 
     let modified_count = modified.len() as u64;
     let file_count = tracked_files.len() as u64;
     let directory_count = tracked_directories.len() as u64;
-    let absolute_root = target_path.to_absolute_path(repository.require_path()?);
-
-    if purge {
-        // Full nuke: delete the entire target subtree including untracked
-        // content. Force is independent — if there were modifications without
-        // --force we already returned above.
-        if let Err(err) = crate::util::fs::unlink_recursive(&absolute_root).await {
-            lore_warn!(
-                "Failed to purge layer root {}: {err}",
-                absolute_root.display()
-            );
-        }
-    } else {
-        for file in &tracked_files {
-            let absolute = file.to_absolute_path(repository.require_path()?);
-            if let Err(err) = crate::util::fs::unlink(&absolute).await {
-                lore_warn!("Failed to remove layer file {}: {err}", absolute.display());
-            }
-        }
-
-        // Bottom-up: deepest directories first so empty dirs collapse when
-        // their children are gone. Untracked files keep their parent dirs
-        // alive — remove_dir fails on non-empty dirs and is skipped silently.
-        tracked_directories.sort_by_key(|p| std::cmp::Reverse(p.as_str().split('/').count()));
-        for dir in &tracked_directories {
-            let absolute = dir.to_absolute_path(repository.require_path()?);
-            if let Err(err) = lore_io::IoDriver::global().remove_dir(&absolute).await
-                && err.kind() != tokio::io::ErrorKind::NotFound
-            {
-                lore_debug!(
-                    "Skip non-empty or unremovable layer directory {}: {err}",
-                    absolute.display()
-                );
-            }
-        }
-
-        if !target_path.is_empty()
-            && let Err(err) = lore_io::IoDriver::global().remove_dir(&absolute_root).await
-            && err.kind() != tokio::io::ErrorKind::NotFound
-        {
-            lore_debug!(
-                "Skip non-empty or unremovable layer root {}: {err}",
-                absolute_root.display()
-            );
-        }
-    }
 
     config.layers.remove(layer_index);
     save_config(token, &config_path, &config).await?;
@@ -655,7 +698,9 @@ pub async fn remove(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_layer_subtree<'a>(
+    operation: &'a InstanceOperationImpl,
     layer_repository: Arc<RepositoryContext>,
     layer_state: Arc<State>,
     node: NodeID,
@@ -688,6 +733,7 @@ fn walk_layer_subtree<'a>(
             if child_node.is_directory() {
                 tracked_directories.push(child_path.clone());
                 walk_layer_subtree(
+                    operation,
                     layer_repository.clone(),
                     layer_state.clone(),
                     child_id,
@@ -698,20 +744,18 @@ fn walk_layer_subtree<'a>(
                 )
                 .await?;
             } else if !child_node.is_staged_delete() {
-                let absolute = child_path.to_absolute_path(layer_repository.require_path()?);
-                match lore_io::IoDriver::global().metadata(&absolute).await {
-                    Ok(metadata) if metadata.is_file() => {
-                        let (file_mtime, file_size) =
-                            crate::util::fs::file_mtime_and_size(&metadata);
+                match operation.file_info(&child_path).await {
+                    Ok(info) if info.is_file() => {
                         if !child_node.is_staged() {
                             let is_modified = state::file_modification(
                                 layer_repository.clone(),
                                 &child_node,
-                                file_mtime,
-                                file_size,
+                                info.mtime(),
+                                info.size(),
                                 &child_path,
                                 true,
-                                None,
+                                operation,
+                                &lore_storage::ContentHashes::default(),
                             )
                             .await
                             .map_or(true, |modification| modification.is_modified());
@@ -721,15 +765,15 @@ fn walk_layer_subtree<'a>(
                         }
                         tracked_files.push(child_path);
                     }
-                    Ok(_) => {
+                    Ok(info) if info.exists() => {
                         modified.push(format!("{} (type changed)", child_path.as_str()));
                         tracked_files.push(child_path);
                     }
-                    Err(err) if err.kind() == tokio::io::ErrorKind::NotFound => {
+                    Ok(_) => {
                         modified.push(format!("{} (missing)", child_path.as_str()));
                     }
                     Err(err) => {
-                        lore_warn!("Failed to stat layer file {}: {err}", absolute.display());
+                        lore_warn!("Failed to stat layer file {}: {err}", child_path.as_str());
                         modified.push(format!("{} (stat failed)", child_path.as_str()));
                     }
                 }
@@ -764,14 +808,14 @@ pub async fn list_with_context(
     repository: Arc<RepositoryContext>,
 ) -> Result<Vec<(Layer, Arc<RepositoryContext>)>, LayerError> {
     let layers = list(repository.clone()).await?;
-    Ok(futures::future::join_all(layers.into_iter().map(|layer| {
+    futures::future::try_join_all(layers.into_iter().map(|layer| {
         let repository = repository.clone();
         async move {
             let context = Arc::new(repository.to_layer_context(layer.repository).await);
-            (layer, context)
+            Ok((layer, context))
         }
     }))
-    .await)
+    .await
 }
 
 /// Information about a layer with staged changes, including the count of files
@@ -873,67 +917,54 @@ async fn sync_in_operation(
     options: SyncOptions,
 ) -> Result<(), LayerError> {
     let stats: Arc<SyncRealizeStats> = Arc::default();
+    let current =
+        drawn_subtree_state(&repository, &state_current, &source_path, &target_path).await;
+    let target = drawn_subtree_state(&repository, &state_target, &source_path, &target_path).await;
+    let current_tree = NodeMapping {
+        repository: current.mapping.repository.clone(),
+        state: current.mapping.state.clone(),
+        path: target_path.clone(),
+        node: current.mapping.node,
+    };
+
     let changes = if !options.reset {
         lore_info!(
             "Calculating deltas {} -> {}",
             state_current.revision_number(),
             state_target.revision_number()
         );
-        let changes = state::diff_collect(
-            repository.clone(),
-            state_current.clone(),
-            repository.clone(),
-            state_target.clone(),
-            if !source_path.is_empty() {
-                Some(source_path.clone())
-            } else {
-                None
-            },
-            options.filter_mode,
-        )
-        .await
-        .forward::<LayerError>("Failed to calculate state diff when synchronizing")?;
-
-        if target_path != source_path {
-            // TODO(mjansson): Rewrite changes paths
-            return Err(LayerError::internal("Not implemented"));
-        }
-
-        changes
+        state::diff_collect_subtree(current, target, target_path, options.filter_mode)
+            .await
+            .forward::<LayerError>("Failed to calculate state diff when synchronizing")?
     } else {
-        if target_path != source_path {
-            // TODO(mjansson): File system diff not implemented when repository subpath
-            //                 and filesystem subpath are not equal
-            return Err(LayerError::internal("Not implemented"));
-        }
-
         // Reverse the changes since diff filesystem returns changes from state to filesystem,
         // while we want to do filesystem to state
         lore_info!(
             "Calculating deltas from filesystem -> {}",
             state_target.revision_number()
         );
-        let mut changes = Vec::new();
-        state::diff_filesystem(
+        let mut changes = state::diff_filesystem_subtree(
             &operation,
-            FilesystemDiffTree {
-                repository: repository.clone(),
-                state: state_target.clone(),
+            NodeMapping {
+                repository: target.mapping.repository,
+                state: target.mapping.state,
+                path: target_path.clone(),
+                node: target.mapping.node,
             },
-            FilesystemDiffTree {
-                repository: repository.clone(),
-                state: state_current.clone(),
+            NodeMapping {
+                repository: current.mapping.repository,
+                state: current.mapping.state,
+                path: target_path.clone(),
+                node: current.mapping.node,
             },
-            if !source_path.is_empty() {
-                Some(source_path)
-            } else {
-                None
-            },
+            target_path,
             options.filter_mode,
             FilesystemDiffIntent::Report,
             Arc::new(Vec::new()),
-            &mut changes,
         )
+        .await
+        .forward::<LayerError>("Failed to calculate file system diff when synchronizing")?
+        .collect()
         .await
         .forward::<LayerError>("Failed to calculate file system diff when synchronizing")?;
 
@@ -955,7 +986,7 @@ async fn sync_in_operation(
                 changes: changes.clone(),
                 repository_current: repository.clone(),
                 operation: operation.clone(),
-                state_current: state_current.clone(),
+                current: current_tree,
                 options: options.clone(),
             }),
         )
@@ -1234,4 +1265,48 @@ pub async fn store_layer_staged(
     }
 
     Err(LayerNotFound.into())
+}
+
+/// Pin `state`'s staged revision on the layer, writing a zero pin when nothing is left staged.
+///
+/// A pin that differs from `current` without staged content makes the next commit produce an
+/// empty revision in the layer.
+pub async fn store_staged_or_clear(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    layer: &Layer,
+    state: &LayerState,
+) -> Result<Hash, LayerError> {
+    let has_staged = state
+        .state_staged
+        .node_has_staged_children(state.repository.clone(), crate::node::ROOT_NODE)
+        .await
+        .forward::<LayerError>("Failed to check staged nodes")?;
+    let has_dirty = state
+        .state_staged
+        .node_has_dirty_children(state.repository.clone(), crate::node::ROOT_NODE)
+        .await
+        .forward::<LayerError>("Failed to check dirty nodes")?;
+
+    let signature = if has_staged || has_dirty {
+        state.state_staged.mark_dirty();
+        state
+            .state_staged
+            .serialize(state.repository.clone(), token)
+            .await
+            .forward::<LayerError>("Failed to serialize layer staged revision state")?
+    } else {
+        Hash::default()
+    };
+
+    store_layer_staged(
+        repository,
+        token,
+        layer.target_path.as_str(),
+        layer.repository,
+        signature,
+    )
+    .await?;
+
+    Ok(signature)
 }

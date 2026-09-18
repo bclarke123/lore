@@ -11,14 +11,12 @@
 //! - Otherwise: `write_content` with `remote_session = None` and `WriteOptions` derived from the
 //!   item's `fixed_size_chunk`; the computed address is reported back in `PUT_ITEM_COMPLETE`.
 //!
-//! Items run concurrently on a `JoinSet`; all per-item tasks are awaited before the closure
-//! returns, so no per-item work outlives the call.
+//! All per-item work is awaited before the closure returns, so none of it outlives the call.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
 use lore_base::error::InvalidArguments;
-use lore_base::lore_spawn;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
@@ -37,7 +35,6 @@ use lore_storage::options::WriteOptions;
 use lore_storage::write::write_content;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -131,28 +128,24 @@ async fn put_local(
         args,
         put,
         async move |store, args| {
-            let items = args.items.as_slice().to_vec();
+            let items = args.items.as_slice();
 
             if items.is_empty() {
                 return Ok::<(), PutError>(());
             }
 
             let effective = store.effective_flags(per_call)?;
-
-            let total = items.len();
             let mut reuse = crate::storage::store::SessionReuse::default();
-            let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            for item in items {
+
+            crate::storage::fan_out_items!(items, "put", |item| {
                 let session = reuse.session_for(
                     &store,
                     item.partition,
                     item.remote_write != 0 && !effective.no_remote,
                 );
                 let store = store.clone();
-                lore_spawn!(tasks, async move { put_item(store, item, session).await });
-            }
-            let codes = crate::storage::drain_codes(tasks).await;
-            crate::storage::build_call_error(&codes, total, "put")
+                async move { put_item(store, &item, session).await }
+            })
         },
     )
     .await
@@ -163,7 +156,7 @@ async fn put_local(
 /// failure code; `LoreErrorCode::None` means success.
 async fn put_item(
     store: Arc<StoreInternal>,
-    item: LoreStoragePutItem,
+    item: &LoreStoragePutItem,
     session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
     let outcome = resolve_put_item(store, item, session).await;
@@ -180,7 +173,7 @@ async fn put_item(
 
 async fn resolve_put_item(
     store: Arc<StoreInternal>,
-    item: LoreStoragePutItem,
+    item: &LoreStoragePutItem,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
 ) -> PutItemOutcome {
     if item.partition == Partition::default() {
@@ -209,8 +202,8 @@ async fn resolve_put_item(
     // - `item.data.ptr` is non-null (checked above) and the FFI contract requires
     //   `item.data.len` valid bytes behind it.
     // - The `'static` lifetime is fudged: the buffer's real lifetime is bounded by the
-    //   call's `Complete` event. `storage_call` only emits `Complete` after this future and
-    //   every spawned task has resolved, so the slice outlives every read of the `Bytes`.
+    //   call's `Complete` event. `storage_call` only emits `Complete` after the op's future, and
+    //   every task it spawned, has resolved, so the slice outlives every read of the `Bytes`.
     //   `Bytes::from_static` stores ptr+len verbatim without trying to free the memory.
     let slice: &'static [u8] =
         unsafe { std::slice::from_raw_parts(item.data.ptr.cast::<u8>(), item.data.len) };

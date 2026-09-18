@@ -19,6 +19,7 @@ use crate::lore::Hash;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::repository::RepositoryContext;
+use crate::state::NodeMapping;
 use crate::state::State;
 use crate::util::path::RelativePath;
 
@@ -37,16 +38,15 @@ pub async fn info(
     // Resolve through any parent links so the branch resolves against the
     // innermost crossed link's branch rather than the top-level one.
     let chain = link::resolve_link_chain(
-        repository.clone(),
-        state_staged.clone(),
+        NodeMapping::root(repository.clone(), state_staged.clone()),
         state_current.clone(),
         link_path.clone(),
         parent_branch,
     )
     .await?;
 
-    let owner_repository = chain.innermost_repository.clone();
-    let owner_state = chain.innermost_state.clone();
+    let owner_repository = chain.innermost.repository.clone();
+    let owner_state = chain.innermost.state.clone();
     let owner_branch = chain
         .levels
         .last()
@@ -55,7 +55,7 @@ pub async fn info(
     let node_link = owner_state
         .find_relative_node_link(
             owner_repository.clone(),
-            chain.innermost_base_node,
+            chain.innermost.node,
             chain.remainder_path.as_str(),
         )
         .await
@@ -80,11 +80,9 @@ pub async fn info(
         .into());
     }
 
-    let link_context = Arc::new(
-        owner_repository
-            .to_link_context(link_node.address.context.into())
-            .await,
-    );
+    let link_context = owner_repository
+        .to_link_context(link_node.address.context.into())
+        .await;
 
     // Staging a removal drops the registry entry but leaves the node in the
     // tree, so fall back to the committed registry to describe a link on its

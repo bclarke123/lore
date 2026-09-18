@@ -12,6 +12,7 @@ use lore_proto::lore::revision::v1::RevisionListResponse;
 use lore_proto::lore::revision::v1::revision_list_request::Start;
 use lore_revision::branch;
 use lore_revision::lore::BranchId;
+use lore_revision::metadata::BRANCH;
 use lore_revision::metadata::Metadata;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
@@ -24,6 +25,7 @@ use lore_telemetry::LabelArray;
 use lore_telemetry::observe::Observe;
 use lore_telemetry::observe::ObserveResult;
 use lore_telemetry::observe::observe_result;
+use lore_telemetry::tracing::fields::BRANCH_ID;
 use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use lore_telemetry::tracing::fields::REVISION;
 use lore_transport::grpc::REVISION_LIST_STRATEGY_HEADER;
@@ -208,7 +210,7 @@ pub async fn handler(
                     )
                 }
                 ResolveStart::Walk { start, strategy } => {
-                    debug!({REVISION} = %start, %strategy, "Listing revisions");
+                    debug!({REVISION} = %start, %strategy, "Walking revisions");
                     let walked = walk_revisions(
                         start,
                         &strategy,
@@ -226,6 +228,8 @@ pub async fn handler(
                     (walked, strategy)
                 }
             };
+
+            debug!(walked_items = walked.items.len(), %strategy, "Finished walk");
 
             let signature_forward =
                 forward_cursor(&repository, &walked, history_step_size, acceleration).await?;
@@ -264,7 +268,8 @@ async fn resolve_start(
 ) -> Result<ResolveStart, Status> {
     match start {
         Start::Signature(signature) => {
-            let hash = Hash::from(signature);
+            let hash = crate::grpc::revision_signature(signature)?;
+            debug!({REVISION} = %hash, "resolve_start - Signature");
             if acceleration.list_cache
                 && let Some(cached) =
                     try_serve_signature_from_cache(repository, hash, history_step_size).await?
@@ -278,6 +283,7 @@ async fn resolve_start(
         }
         Start::Identifier(identifier) => {
             let branch = BranchId::from(&identifier.branch_id);
+            debug!({BRANCH_ID} = %branch, revision_number = identifier.number, "resolve_start - Identifier");
             if identifier.number == 0 {
                 let hash = branch::load_latest(repository.clone(), branch)
                     .await
@@ -363,15 +369,11 @@ async fn resolve_start(
                 })
             } else {
                 let signature = format!("{branch}@{}", identifier.number);
-                let hash = revision::resolve(
-                    repository.clone(),
-                    signature,
-                    None,
-                    ResolveSearchLocation::Local,
-                )
-                .await
-                .filter_slow_down()?
-                .map_err(|err| Status::not_found(format!("Revision not found: {err}")))?;
+                let hash =
+                    revision::resolve(repository.clone(), signature, ResolveSearchLocation::Local)
+                        .await
+                        .filter_slow_down()?
+                        .map_err(|err| Status::not_found(format!("Revision not found: {err}")))?;
                 Ok(ResolveStart::Walk {
                     start: hash,
                     strategy: RevisionListStrategy::FullIteration,
@@ -862,7 +864,7 @@ async fn forward_target(
 /// along `parent_self`, so this always terminates at `first_number` or the
 /// root, bounded only by the branch's real history depth — the same
 /// guarantee `resolve_start`'s `FullIteration` fallback already relies on
-/// via `revision::resolve(..., None, ...)` when no acceleration is
+/// via `revision::resolve` when no acceleration is
 /// available. An item-count cap here would fail requests anchored deep in
 /// a long, legitimately un-accelerated history — worse, retrying such a
 /// request would fail identically every time, since this always restarts
@@ -968,6 +970,7 @@ async fn forward_cursor(
     // write"). `latest` is the only anchor available; descend from it
     // directly, same as `resolve_start` falling through to `FullIteration`.
     if !acceleration.step_keys {
+        debug!({BRANCH} = %branch, first_number, "forward_cursor - descend_unverified_gap");
         return descend_unverified_gap(
             repository,
             branch,
@@ -980,6 +983,7 @@ async fn forward_cursor(
         .map(Some);
     }
 
+    debug!({BRANCH} = %branch, first_number, "forward_cursor - find forward anchor");
     let anchor = forward_anchor(
         repository,
         branch,
@@ -992,6 +996,7 @@ async fn forward_cursor(
 
     let target = match anchor {
         ForwardAnchor::Sealed { anchor, boundary } => {
+            debug!({BRANCH} = %branch, boundary, "forward_cursor - calculating from sealed");
             forward_target(
                 repository,
                 branch,
@@ -1004,6 +1009,7 @@ async fn forward_cursor(
             .await?
         }
         ForwardAnchor::LatestBand { anchor } => {
+            debug!({BRANCH} = %branch, "forward_cursor - calculating from latest band");
             forward_target(
                 repository,
                 branch,
@@ -1016,6 +1022,7 @@ async fn forward_cursor(
             .await?
         }
         ForwardAnchor::UnverifiedGap { anchor } => {
+            debug!({BRANCH} = %branch, "forward_cursor - calculating from unverified gap");
             descend_unverified_gap(
                 repository,
                 branch,

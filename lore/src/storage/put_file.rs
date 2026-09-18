@@ -19,7 +19,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use lore_base::error::InvalidArguments;
-use lore_base::lore_spawn;
 use lore_base::types::Context;
 use lore_base::types::Partition;
 use lore_error_set::prelude::*;
@@ -36,7 +35,6 @@ use lore_storage::options::WriteOptions;
 use lore_storage::write::write_from_file;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -131,28 +129,22 @@ async fn put_file_local(
         args,
         put_file,
         async move |store, args| {
-            let items = args.items.as_slice().to_vec();
+            let items = args.items.as_slice();
             if items.is_empty() {
                 return Ok::<(), PutFileError>(());
             }
             let effective = store.effective_flags(per_call)?;
-            let total = items.len();
             let mut reuse = crate::storage::store::SessionReuse::default();
-            let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            for item in items {
+
+            crate::storage::fan_out_items!(items, "put_file", |item| {
                 let session = reuse.session_for(
                     &store,
                     item.partition,
                     item.remote_write != 0 && !effective.no_remote,
                 );
                 let store = store.clone();
-                lore_spawn!(
-                    tasks,
-                    async move { put_file_item(store, item, session).await }
-                );
-            }
-            let codes = crate::storage::drain_codes(tasks).await;
-            crate::storage::build_call_error(&codes, total, "put_file")
+                async move { put_file_item(store, &item, session).await }
+            })
         },
     )
     .await
@@ -160,10 +152,10 @@ async fn put_file_local(
 
 async fn put_file_item(
     store: Arc<StoreInternal>,
-    item: LoreStoragePutFileItem,
+    item: &LoreStoragePutFileItem,
     session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
-    let outcome = resolve_put_file_item(store, &item, session).await;
+    let outcome = resolve_put_file_item(store, item, session).await;
     LoreEvent::StoragePutItemComplete(LoreStoragePutItemCompleteEventData {
         id: item.id,
         address: outcome.address,
@@ -200,7 +192,7 @@ async fn resolve_put_file_item(
         write_from_file(
             store.immutable.clone(),
             item.partition,
-            Path::new(path_str),
+            &lore_storage::ContentSource::file(Path::new(path_str)),
             item.context,
             write_options,
             remote_session,

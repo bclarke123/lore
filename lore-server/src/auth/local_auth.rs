@@ -139,6 +139,7 @@ impl LocalAuth {
         let provider = Self::build_provider(provider_settings)?;
         let minter = TokenMinter::from_settings(token_settings)?;
         let verifier = JwtVerifier {
+            identity_claim: crate::auth::jwt::DEFAULT_IDENTITY_CLAIM.to_string(),
             jwk_service: Arc::new(LocalJwkService::new(&minter)),
             // Explicit issuer/audience settings override the minting values,
             // matching the external-JWKS configuration surface.
@@ -400,6 +401,7 @@ pub(crate) mod tests {
             permission_claim: None,
             resource_claim: None,
             resource_id_template: AuthSettings::default_resource_id_template(),
+            resource_id_claim: AuthSettings::default_resource_id_claim(),
             resource_wildcard: AuthSettings::default_resource_wildcard(),
             identity_claim: AuthSettings::default_identity_claim(),
             baseline_access: crate::settings::BaselineAccess::default(),
@@ -429,6 +431,7 @@ pub(crate) mod tests {
             permission_claim: None,
             resource_claim: None,
             resource_id_template: AuthSettings::default_resource_id_template(),
+            resource_id_claim: AuthSettings::default_resource_id_claim(),
             resource_wildcard: AuthSettings::default_resource_wildcard(),
             identity_claim: AuthSettings::default_identity_claim(),
             baseline_access: crate::settings::BaselineAccess::default(),

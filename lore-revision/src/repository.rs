@@ -191,6 +191,31 @@ pub struct RepositoryConfig {
     pub vfs: Option<VfsConfig>,
 }
 
+impl RepositoryConfig {
+    pub fn validate(&self) -> Result<(), RepositoryError> {
+        if self.is_swfs()
+            && !matches!(
+                self.shared_store_to_use.as_ref(),
+                Some(SharedStoreToUseConfig {
+                    use_shared_store: Some(true),
+                    ..
+                })
+            )
+        {
+            return Err(RepositoryError::internal(
+                "Using SWFS without using a shared store",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn is_swfs(&self) -> bool {
+        self.vfs
+            .as_ref()
+            .is_some_and(|vfs_config| vfs_config.vfs_type.is_swfs())
+    }
+}
+
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct StoreConfig {
     pub max_capacity: Option<usize>,
@@ -583,13 +608,25 @@ pub struct RepositoryPaths {
     dot_path: PathBuf,
 }
 
+/// Refuses a working-copy root that is not valid text.
+///
+/// Every path Lore reports, resolves from a user argument or keys a cache on is built from
+/// this root, and each of those needs one spelling that survives a round trip. A root
+/// without one could only be spelled approximately, so a path parsed back from a report
+/// could name a different file than the one on disk. Refusing once, where a working copy is
+/// opened or created, is what lets every path built from it be spelled losslessly.
+pub fn require_text_root(path: &Path) -> Result<(), RepositoryError> {
+    if path.to_str().is_some() {
+        return Ok(());
+    }
+    Err(RepositoryError::from(InvalidPath {
+        path: path.to_string_lossy().into_owned(),
+    }))
+}
+
 impl RepositoryPaths {
     pub fn new(path: PathBuf, dot_path: PathBuf) -> Self {
         Self { path, dot_path }
-    }
-
-    pub fn with_link_path(self, link_path: &Path) -> Self {
-        Self::new(self.path.join(link_path), self.dot_path)
     }
 }
 
@@ -604,6 +641,8 @@ pub struct RepositoryContext {
     mutable_store: Arc<dyn MutableStore>,
     file_system: Arc<dyn FilesystemProvider>,
     pub id: RepositoryId,
+    /// The root top level repository ID.
+    root_id: RepositoryId,
     pub instance_id: crate::instance::InstanceId,
     remote: Arc<tokio::sync::RwLock<RemoteState>>,
     pub filter: Arc<Filter>,
@@ -702,6 +741,7 @@ impl RepositoryContext {
             immutable_store,
             mutable_store,
             id,
+            root_id: id,
             instance_id,
             remote: remote_arc(remote),
             filter,
@@ -759,6 +799,11 @@ impl RepositoryContext {
         self.path()
             .unwrap_or_else(|| Path::new("<unset>"))
             .display()
+    }
+
+    /// The root top level repository ID.
+    pub fn root_id(&self) -> RepositoryId {
+        self.root_id
     }
 
     pub fn salt(&self) -> &'static [u8] {
@@ -932,6 +977,7 @@ impl RepositoryContext {
             immutable_store,
             mutable_store,
             id,
+            root_id: id,
             instance_id: crate::instance::InstanceId::default(),
             remote: remote_arc(RemoteState::Offline),
             filter: Arc::default(),
@@ -952,6 +998,7 @@ impl RepositoryContext {
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
             id,
+            root_id: id,
             instance_id: self.instance_id,
             remote: remote_arc(RemoteState::Offline),
             filter: self.filter.clone(),
@@ -977,6 +1024,7 @@ impl RepositoryContext {
             immutable_store,
             mutable_store,
             id: RepositoryId::default(),
+            root_id: RepositoryId::default(),
             instance_id: crate::instance::InstanceId::default(),
             remote: remote_arc(RemoteState::Offline),
             filter: Arc::default(),
@@ -997,6 +1045,7 @@ impl RepositoryContext {
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
             id: RepositoryId::default(),
+            root_id: RepositoryId::default(),
             instance_id: self.instance_id,
             remote: remote_arc(RemoteState::Offline),
             filter: self.filter.clone(),
@@ -1031,6 +1080,7 @@ impl RepositoryContext {
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
             id: self.id,
+            root_id: self.root_id,
             instance_id: self.instance_id,
             remote: remote_arc(RemoteState::from_result(remote)),
             filter,
@@ -1045,7 +1095,16 @@ impl RepositoryContext {
         }
     }
 
-    pub async fn to_link_context(&self, id: RepositoryId) -> Self {
+    /// This context aimed at the repository a link mounts, keeping the working tree it is
+    /// materialized into.
+    ///
+    /// The mounted repository holds its own tree of nodes, and a node in it is named by the
+    /// state and node id a caller already holds. Every path in a working tree is spelled
+    /// relative to the root this keeps, so the paths a walk carries across a mount stay the
+    /// paths the filesystem, the filter and the modified-time keys answer for. A path within
+    /// the mounted tree is derived from its node where one is called for, by
+    /// [`State::node_path`](crate::state::State::node_path).
+    pub async fn to_link_context(&self, id: RepositoryId) -> Arc<Self> {
         let remote = self.remote().await;
         let remote = if let Ok(remote) = remote {
             remote.connect_module(id).await
@@ -1053,12 +1112,13 @@ impl RepositoryContext {
             remote
         };
         let settings = self.settings.clone();
-        RepositoryContext {
+        Arc::new(RepositoryContext {
             link_read: self.link_read.clone(),
             paths: self.paths.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
             id,
+            root_id: self.root_id,
             instance_id: self.instance_id,
             remote: remote_arc(RemoteState::from_result(remote)),
             filter: self.filter.clone(),
@@ -1070,9 +1130,11 @@ impl RepositoryContext {
             session_pool: Default::default(),
             lazy_session: Default::default(),
             file_system: self.file_system.clone(),
-        }
+        })
     }
 
+    /// This context aimed at the repository a layer draws from, keeping the working tree it is
+    /// materialized into, as [`Self::to_link_context`] does for a link.
     pub async fn to_layer_context(&self, id: RepositoryId) -> Self {
         let remote = self.remote().await;
         let remote = if let Ok(remote) = remote {
@@ -1087,6 +1149,7 @@ impl RepositoryContext {
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
             id,
+            root_id: self.root_id,
             instance_id: self.instance_id,
             remote: remote_arc(RemoteState::from_result(remote)),
             filter: self.filter.clone(),
@@ -1108,6 +1171,7 @@ impl RepositoryContext {
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
             id: self.id,
+            root_id: self.root_id,
             instance_id: self.instance_id,
             remote: self.remote.clone(),
             filter,
@@ -1391,6 +1455,13 @@ pub const TEMP_FILE_EXTENSION: &str = ".~loretemp";
 pub const BASE_SUFFIX: &str = "~base";
 pub const THEIRS_SUFFIX: &str = "~theirs";
 pub const MINE_SUFFIX: &str = "~mine";
+
+/// The suffixes a conflicted merge names its copies of a file with, beside the file itself in
+/// the working tree.
+///
+/// A conflict writes only the sides it has, so fewer than three may be present, and a clean
+/// automerge removes the ones it wrote.
+pub const MERGE_ARTIFACT_SUFFIXES: [&str; 3] = [MINE_SUFFIX, THEIRS_SUFFIX, BASE_SUFFIX];
 
 pub fn get_dot_lore_path(path: &std::path::Path) -> Result<PathBuf, InvalidPath> {
     if let Some(mount_manager) = MountManagerState::mount_manager() {
@@ -1967,7 +2038,7 @@ fn connect(
     .shared())
 }
 
-fn read_id_from_file(path: PathBuf) -> io::Result<RepositoryId> {
+pub fn read_id_from_file(path: PathBuf) -> io::Result<RepositoryId> {
     let mut id = RepositoryId::default();
     // Synchronous read: tiny file, avoids thread hop and queuing behind
     // any store flush tasks still in flight from the previous command.
@@ -2018,6 +2089,7 @@ pub async fn load_and_connect_with_token(
     access: RepositoryAccess,
     write_token: Option<RepositoryWriteToken>,
 ) -> Result<Arc<RepositoryContext>, RepositoryError> {
+    require_text_root(path)?;
     debug_assert!(
         matches!(
             (&access, &write_token),
@@ -2159,7 +2231,7 @@ pub async fn load_and_connect_with_token(
         (immutable_store, mutable_store as Arc<dyn MutableStore>)
     };
 
-    let filter = load_filter(path).unwrap_or_default();
+    let filter = load_filter(path)?;
 
     // Resolve the remote eagerly only when we need it for the mutable store upgrade.
     // Otherwise keep it pending so local-only commands never block on the connect.
@@ -2256,6 +2328,20 @@ pub async fn load_and_connect_with_token(
         instance_id
     };
 
+    // Load the mounted filesystem if this is a SWFS-backed instance
+    let filesystem: Option<Arc<dyn FilesystemProvider + 'static>> = if config.is_swfs() {
+        let mount_manager = MountManagerState::mount_manager().ok_or(RepositoryError::internal(
+            "Loading a SWFS repository without using the service",
+        ))?;
+        Some(
+            mount_manager
+                .get_mount_filesystem_provider(path)
+                .forward::<RepositoryError>("Unable to find mount for SWFS repository")?,
+        )
+    } else {
+        None
+    };
+
     // Keep the remote pending so local-only commands finish without waiting on the
     // background connect. The upgrade path above already forced resolution when needed.
     let remote_state = match (resolved_remote_for_upgrade, remote) {
@@ -2271,7 +2357,7 @@ pub async fn load_and_connect_with_token(
         instance_id,
         remote_state,
         filter,
-        None,
+        filesystem,
     );
     let repository = match repo_lock {
         Some(lock) => repository.with_repository_lock(lock),
@@ -2286,9 +2372,9 @@ pub async fn load_and_connect_with_token(
     // Commit command will look at the global flag and set this explicitly
     repository.set_disable_upload(true);
 
+    repository.set_disable_cache(!(global.cache() || config.is_swfs()));
     let config_file = config.file.unwrap_or_default();
     repository.set_direct_file_write(config_file.direct_write.unwrap_or_default());
-    repository.set_disable_cache(!global.cache());
 
     if global.local() {
         repository.set_disable_upload(true);
@@ -2427,29 +2513,35 @@ pub async fn create_local(
     config: RepositoryConfig,
     no_tracking: bool,
 ) -> Result<Arc<RepositoryContext>, RepositoryError> {
+    require_text_root(path)?;
     let instance_id = InstanceId::generate();
 
-    let dotpath = if config
-        .vfs
-        .as_ref()
-        .is_some_and(|config| config.vfs_type.is_swfs())
-    {
+    let dotpath;
+    let filesystem_provider: Option<Arc<dyn FilesystemProvider + 'static>>;
+    if config.is_swfs() {
         let mount_manager = MountManagerState::mount_manager().ok_or(RepositoryError::internal(
             "Attempting to create an SWFS instance outside the service",
         ))?;
-        mount_manager
-            .create_mount(path, instance_id)
-            .forward::<RepositoryError>("Failed to create mount for SWFS instance")?
+        dotpath = mount_manager
+            .create_mount(path, &config, repository, instance_id)
+            .await
+            .forward::<RepositoryError>("Failed to create mount for SWFS instance")?;
+        filesystem_provider = Some(
+            mount_manager
+                .get_mount_filesystem_provider(path)
+                .forward::<RepositoryError>("Failed to get filesystem provider for fresh mount")?,
+        );
     } else {
-        path.join(DOT_LORE)
+        dotpath = path.join(DOT_LORE);
+        filesystem_provider = None;
     };
     let idpath = dotpath.join(ID);
 
-    if dotpath.exists() {
+    /*if dotpath.exists() {
         return Err(RepositoryError::from(RepositoryAlreadyExists {
             path: path.display().to_string(),
         }));
-    }
+    }*/
 
     let dotpath_display = dotpath.display().to_string();
     lore_io::IoDriver::global()
@@ -2522,7 +2614,7 @@ pub async fn create_local(
             instance_id,
             remote: Err(ProtocolError::from(NoRemote)),
             filter: Arc::default(),
-            filesystem_provider: None,
+            filesystem_provider,
         })
         .with_write_token(token.share()),
     );
@@ -2555,7 +2647,7 @@ pub async fn create_local(
     }
 
     // Set the current branch so that subsequent commands know which branch
-    // we are on, even though there are no commits yet (zero revision).
+    // we are on, even though there are no revisions yet (zero revision).
     crate::instance::store_current_anchor_branch(&repository, default_branch)
         .await
         .forward::<RepositoryError>("Failed to serialize repository anchor")?;
@@ -2569,7 +2661,12 @@ pub async fn create_local(
     Ok(repository)
 }
 
-pub fn load_filter(root_path: &Path) -> Option<Arc<filter::Filter>> {
+/// Loads the ignore and view filters for the repository rooted at `root_path`.
+///
+/// A filter file that cannot be understood fails the load rather than yielding
+/// an empty filter: an empty one excludes nothing, so the caller would go on to
+/// walk and stage everything the file meant to keep out.
+pub fn load_filter(root_path: &Path) -> Result<Arc<filter::Filter>, RepositoryError> {
     let mut ignore_path = root_path.join(DOT_LOREIGNORE);
 
     // Both formats use .loreignore as the primary ignore file; fall back to
@@ -2581,13 +2678,10 @@ pub fn load_filter(root_path: &Path) -> Option<Arc<filter::Filter>> {
         }
     }
 
-    let view_path = get_dot_lore_path(root_path).ok()?.join(VIEW_FILTER);
-
-    if let Ok(filter) = filter::load(&ignore_path, &view_path) {
-        Some(Arc::new(filter))
-    } else {
-        None
-    }
+    let view_path = get_dot_lore_path(root_path)?.join(VIEW_FILTER);
+    let filter = filter::load(&ignore_path, &view_path)
+        .forward::<RepositoryError>("Failed to load repository filter")?;
+    Ok(Arc::new(filter))
 }
 
 fn branch_switch_create_recurse(
@@ -2721,14 +2815,11 @@ pub async fn branch_switch(
 
     let (branch_latest_local, branch_latest_remote, branch_location, branch_signature) = {
         let signature = if let Some(revision) = options.signature.as_ref() {
-            let revision = revision::resolve(
-                repository.clone(),
-                revision,
-                global.search_limit(),
-                global.search_location(),
-            )
-            .await
-            .forward::<RepositoryError>("Invalid revision")?;
+            let resolved =
+                revision::resolve_in_branch(repository.clone(), revision, global.search_location())
+                    .await
+                    .forward::<RepositoryError>("Invalid revision")?;
+            let revision = resolved.revision;
 
             let state = state::State::deserialize(repository.clone(), revision)
                 .await
@@ -4136,6 +4227,31 @@ mod path_optional_tests {
             .require_path()
             .expect("path-bearing context should return path");
         assert_eq!(got, path.as_path());
+    }
+}
+
+#[cfg(test)]
+mod root_text_tests {
+    //! Coverage for [`require_text_root`], the one place a working copy whose path has no
+    //! text spelling is refused.
+    use super::require_text_root;
+
+    #[test]
+    fn a_root_that_is_text_is_accepted() {
+        assert!(require_text_root(std::path::Path::new("/work/repository")).is_ok());
+    }
+
+    /// A root without a text spelling is refused where the working copy is opened, so no
+    /// path built from it is ever reported in a spelling it cannot be parsed back from.
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn a_root_that_is_not_text_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/work/\xff\xfe"));
+        assert!(
+            require_text_root(root).is_err(),
+            "a root with no text spelling must be refused"
+        );
     }
 }
 

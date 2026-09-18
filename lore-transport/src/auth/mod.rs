@@ -47,7 +47,10 @@ pub mod authentication {
             let _ = add("ucs-auth", ucs_auth.clone());
             // Plaintext variant for local development servers.
             let _ = add("ucs-auth-insecure", ucs_auth.clone());
-            let _ = add("https", ucs_auth); // transition fallback
+            // Local test auth services. The implementation only honours
+            // plaintext for loopback hosts. Any other http URL is upgraded
+            // to https (see `ucs_auth::grpc_endpoint`).
+            let _ = add("http", ucs_auth);
         });
 
         let scheme = parse_scheme(auth_url)?;

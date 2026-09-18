@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use lore::error_set::prelude::*;
 use lore::interface::LoreEvent;
+use lore::interface::LoreGlobalArgs;
 use lore::lore_spawn;
 use lore::lore_spawn_blocking;
 use lore::remote::connection::ConnectionError;
@@ -22,18 +23,32 @@ use lore::remote::message::write_v1_message;
 use lore::remote::network::UdsListener;
 use lore::remote::network::UdsStream;
 use lore::remote::network::uds_supported;
+use lore::remote::service_process::ServiceStopRequest;
+use lore::remote::service_process::register_service_process;
+use lore::remote::service_process::service_executable;
 use lore::service::initialization::initialize_service;
 use lore::service::service_main::ServiceMainError;
 use tokio::sync::mpsc;
 
 use crate::eprintln;
 use crate::println;
-use crate::util::listen_for_termination;
+use crate::util::TerminationSignals;
 
 /// Bounds how long shutdown waits for the accept loop to unwind, so that a
 /// wake-up connection that never lands cannot keep the process alive. Anything
 /// left behind is a stale socket, which the next start detects and removes.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the service keeps running after a stop request arrives over IPC, so
+/// that the reply reaches the caller waiting for it before the process tears
+/// itself down. The reply is a few small writes to a socket the caller is
+/// already reading, so this is margin rather than a measured cost. A signal
+/// carries no reply and waits for none of it.
+const STOP_REPLY_DRAIN: Duration = Duration::from_millis(500);
+
+/// Printed once the socket is bound, so that whoever started the service can
+/// tell when it began accepting connections.
+const LISTENING_MESSAGE: &str = "Lore service listening";
 
 /// Where the service parks its working directory. It inherits one from whoever
 /// started it, which is unrelated to the directories its callers run in, and
@@ -55,11 +70,25 @@ fn detached_working_directory() -> std::path::PathBuf {
 }
 
 pub async fn service_main(
+    globals: LoreGlobalArgs,
     listening_signal: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), ServiceMainError> {
     if !uds_supported() {
         return Err(ServiceMainError::internal("IPC not supported on this OS"));
     }
+
+    // Ahead of the socket, because a signal ends the process outright until a
+    // handler is in place: registering after binding leaves a window in which a
+    // service callers can already reach dies rather than stopping, leaving the
+    // socket behind. A registration that fails leaves it stoppable over IPC
+    // alone, which beats refusing to serve.
+    let termination = match TerminationSignals::register() {
+        Ok(signals) => Some(signals),
+        Err(error) => {
+            eprintln!("Failed to listen for termination signals: {error}");
+            None
+        }
+    };
 
     let detached = detached_working_directory();
     if let Err(error) = std::env::set_current_dir(&detached) {
@@ -69,12 +98,18 @@ pub async fn service_main(
         );
     }
 
-    initialize_service()
+    initialize_service(globals)
         .await
         .forward::<ServiceMainError>("Failed initializing service")?;
 
     let listener: UdsListener =
         UdsListener::new().forward::<ServiceMainError>("Failed to start listener socket")?;
+    println!("{LISTENING_MESSAGE}");
+    report_build_that_is_not_the_configured_one().await;
+
+    // Recorded once the socket is bound, so that a process which lost it never
+    // claims to be the service for the moments before it exits.
+    let stop_request = register_service_process();
 
     if let Some(listening_signal) = listening_signal {
         listening_signal
@@ -113,29 +148,78 @@ pub async fn service_main(
         }
     });
 
-    match listen_for_termination(None).await {
-        Ok(()) => {
-            println!("Shutting down Lore service");
-            shutting_down.store(true, Ordering::SeqCst);
-            if let Err(error) = UdsStream::connect() {
-                eprintln!("Failed to wake the accept loop: {error}");
-            }
-            if tokio::time::timeout(SHUTDOWN_TIMEOUT, accept_task)
-                .await
-                .is_err()
-            {
-                eprintln!("Timed out waiting for the accept loop to stop");
-            }
-        }
-        Err(error) => {
-            // Without signal handling there is no graceful path, so keep
-            // serving until the process is killed.
-            eprintln!("Failed to listen for termination signals: {error}");
-            let _ = accept_task.await;
-        }
+    wait_for_stop(&stop_request, termination).await;
+
+    println!("Shutting down Lore service");
+    shutting_down.store(true, Ordering::SeqCst);
+    if let Err(error) = UdsStream::connect() {
+        eprintln!("Failed to wake the accept loop: {error}");
+    }
+    if tokio::time::timeout(SHUTDOWN_TIMEOUT, accept_task)
+        .await
+        .is_err()
+    {
+        eprintln!("Timed out waiting for the accept loop to stop");
     }
 
     Ok(())
+}
+
+/// Reports serving from a build other than the one that would be started
+/// automatically, which is the one the global config names when it names any.
+///
+/// Running a service from a chosen build is allowed: whoever ran this command
+/// picked it. What is not wanted is silence about it afterwards, when a service
+/// started long ago from a stale path is serving a machine and nothing says so.
+async fn report_build_that_is_not_the_configured_one() {
+    let Ok(configured) = service_executable().await else {
+        return;
+    };
+    let Ok(running) = std::env::current_exe() else {
+        return;
+    };
+
+    // Compared through the filesystem where possible, so that a link or a
+    // relative path to the same build does not read as a different one.
+    let resolve =
+        |path: &std::path::Path| std::fs::canonicalize(path).unwrap_or(path.to_path_buf());
+    if resolve(&configured) == resolve(&running) {
+        return;
+    }
+
+    println!(
+        "Serving from {}, which is not the configured Lore service ({})",
+        running.display(),
+        configured.display()
+    );
+}
+
+/// Waits for whichever comes first: a termination signal, or a stop asked for
+/// over IPC by `lore service stop`.
+///
+/// `termination` is registered before the socket binds, so the handlers are in
+/// place for the whole time this service is reachable. Without them there is no
+/// graceful path from a signal, and the IPC request becomes the only way to stop
+/// serving rather than a reason to stop.
+async fn wait_for_stop(stop_request: &ServiceStopRequest, termination: Option<TerminationSignals>) {
+    let stopped_by_signal = if let Some(mut termination) = termination {
+        tokio::select! {
+            () = termination.recv() => true,
+            () = stop_request.requested() => false,
+        }
+    } else {
+        stop_request.requested().await;
+        false
+    };
+
+    // A signal carries no reply, so nothing has to drain before shutdown.
+    if stopped_by_signal {
+        return;
+    }
+
+    // The caller that asked for the stop is waiting for its reply on a
+    // connection this process owns, so the reply drains before the teardown.
+    tokio::time::sleep(STOP_REPLY_DRAIN).await;
 }
 
 #[allow(dead_code)]

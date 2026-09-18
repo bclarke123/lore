@@ -26,6 +26,7 @@ use super::read_content;
 use super::revision_diff;
 use super::revision_info;
 use super::revision_tree;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::timeout_grpc;
 
 type ContentDiffStream =
@@ -57,6 +58,7 @@ impl InstrumentProvider for ThinClientServiceInstrumentProvider {
 pub struct LoreThinClientV1Service {
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     rpc_timeout: Duration,
     revision_diff_config: revision_diff::RevisionDiffConfig,
     history_step_size: u64,
@@ -69,6 +71,7 @@ impl LoreThinClientV1Service {
     pub fn new(
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         rpc_timeout: Duration,
         revision_diff_config: revision_diff::RevisionDiffConfig,
         history_step_size: u64,
@@ -77,6 +80,7 @@ impl LoreThinClientV1Service {
         Self {
             immutable_store,
             mutable_store,
+            repository_authorizer,
             rpc_timeout,
             revision_diff_config,
             history_step_size,
@@ -132,6 +136,7 @@ impl ThinClientService for LoreThinClientV1Service {
             request,
             self.immutable_store.clone(),
             self.mutable_store.clone(),
+            self.repository_authorizer.clone(),
             self.revision_diff_config,
             self.history_step_size,
             self.acceleration,
@@ -149,6 +154,7 @@ impl ThinClientService for LoreThinClientV1Service {
             request,
             self.immutable_store.clone(),
             self.mutable_store.clone(),
+            self.repository_authorizer.clone(),
             self.history_step_size,
             self.acceleration,
         )

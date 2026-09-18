@@ -33,6 +33,7 @@ use super::security_headers::PolicyField;
 use super::tracing::lore_http_tracing;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt_axum_middleware::jwt_axum_verify_authorization;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::http::repositories;
 use crate::util::core_hop::CoreHopLayer;
@@ -62,6 +63,7 @@ pub struct ServerState {
     pub immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     pub mutable_store: Arc<dyn lore_storage::MutableStore>,
     pub jwt_verifier: Option<JwtVerifier>,
+    pub repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     pub max_file_size: u64,
     pub presign_config: Option<PresignConfig>,
     /// Server-local auth; enables the unauthenticated login callback routes.
@@ -286,6 +288,7 @@ impl LoreHttpServer {
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         jwt_verifier: Option<JwtVerifier>,
         local_auth: Option<Arc<crate::auth::local_auth::LocalAuth>>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         signal: impl Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
         let addr = SocketAddr::from_str(format!("{}:{}", settings.host, settings.port).as_str())
@@ -328,6 +331,7 @@ impl LoreHttpServer {
             immutable_store,
             mutable_store,
             jwt_verifier,
+            repository_authorizer,
             max_file_size: settings.max_file_size,
             presign_config,
             local_auth,

@@ -28,7 +28,7 @@ use crate::util::path::RelativePath;
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionDiffFileEventData {
-    /// Path of the file relative to the repository root.
+    /// Path of the file, relative to the root of the working tree.
     pub path: LoreString,
     /// Action applied to the file.
     pub action: LoreFileAction,
@@ -40,20 +40,21 @@ pub struct LoreRevisionDiffFileEventData {
     pub old_address: Address,
     /// Address of the file content on the target side.
     pub new_address: Address,
-    /// Previous path of the file when it was moved or copied. Empty otherwise.
+    /// Previous path of the file when it was moved or copied, relative to the root of the
+    /// working tree. Empty otherwise.
     pub from_path: LoreString,
 }
 
 impl LoreRevisionDiffFileEventData {
     pub fn from_node_change(change: &NodeChange, old_is_file: bool, new_is_file: bool) -> Self {
         LoreRevisionDiffFileEventData {
-            path: LoreString::from(&change.path),
+            path: LoreString::from(change.path()),
             action: LoreFileAction::from(change.action),
             old_is_file: old_is_file.into(),
             new_is_file: new_is_file.into(),
             old_address: change.from.address,
             new_address: change.to.address,
-            from_path: change.from_path.as_ref().map(|path| path.as_str()).into(),
+            from_path: change.move_source().map(|path| path.as_str()).into(),
         }
     }
 
@@ -187,22 +188,27 @@ pub async fn diff(
 
     for change in diff {
         let mut old_is_file = false;
-        if change.from.node != INVALID_NODE {
+        if change.from.mapping.node != INVALID_NODE {
             old_is_file = change
                 .from
+                .mapping
                 .state
-                .node(change.from.repository.clone(), change.from.node)
+                .node(
+                    change.from.mapping.repository.clone(),
+                    change.from.mapping.node,
+                )
                 .await
                 .forward::<DiffError>("deserializing source state")?
                 .is_file();
         }
 
         let mut new_is_file = false;
-        if change.to.node != INVALID_NODE {
+        if change.to.mapping.node != INVALID_NODE {
             new_is_file = change
                 .to
+                .mapping
                 .state
-                .node(change.to.repository.clone(), change.to.node)
+                .node(change.to.mapping.repository.clone(), change.to.mapping.node)
                 .await
                 .forward::<DiffError>("deserializing target state")?
                 .is_file();

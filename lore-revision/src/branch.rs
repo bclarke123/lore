@@ -215,11 +215,10 @@ impl LoreBranchDiffNodeData {
         };
         Self {
             action: LoreFileAction::from(node_change.action),
-            path: display_path(node_change.path.as_str()),
+            path: display_path(node_change.path().as_str()),
             automerged: node_change.flags.is_conflict_automerged().into(),
             from_path: node_change
-                .from_path
-                .as_ref()
+                .move_source()
                 .map(|path| display_path(path.as_str()))
                 .unwrap_or_default(),
         }
@@ -1810,7 +1809,7 @@ async fn create_linked_branches(
 
     for (link_id, mounts) in link_groups {
         lore_spawn!(link_tasks, {
-            let link = Arc::new(repository.to_link_context(link_id).await);
+            let link = repository.to_link_context(link_id).await;
             let link_remote = link.remote().await.forward_with::<BranchError, _>(|| {
                 format!("Failed to connect to link repository {link_id}")
             })?;
@@ -2751,7 +2750,7 @@ async fn try_auto_resolve_conflict(
     change_from: &NodeChange,
     change_to: &NodeChange,
 ) -> Result<Option<NodeChange>, BranchError> {
-    if change_from.path != change_to.path {
+    if change_from.path() != change_to.path() {
         return Ok(None);
     }
     let theirs_path: PathBuf = util::fs::generate_temppath("theirs");
@@ -2773,22 +2772,23 @@ async fn try_auto_resolve_conflict(
         .to_string_lossy()
         .into_owned();
 
-    if change_from.to.node.is_valid_node_id() {
+    if change_from.to.mapping.node.is_valid_node_id() {
         lore_trace!("Change from theirs has valid to node, realize theirs file {theirs_file}");
         let node = change_from
             .to
+            .mapping
             .state
             .block(
-                change_from.to.repository.clone(),
-                NodeBlock::index(change_from.to.node),
+                change_from.to.mapping.repository.clone(),
+                NodeBlock::index(change_from.to.mapping.node),
             )
             .await
             .forward::<BranchError>("Failed to deserialize revisions state")?
-            .node(Node::index(change_from.to.node));
+            .node(Node::index(change_from.to.mapping.node));
         // TODO(vri): UCS-19228 - Links: Realize link node files during branch sync
         if node.is_file() {
             if sync::realize_scratch_file(
-                change_from.to.repository.clone(),
+                change_from.to.mapping.repository.clone(),
                 &theirs_path,
                 node,
                 Arc::default(),
@@ -2810,7 +2810,7 @@ async fn try_auto_resolve_conflict(
             .await;
     }
 
-    if !crate::infer::infer_is_diffable_by_path(&theirs_path)
+    if !crate::infer::infer_is_diffable(&lore_storage::ContentSource::file(&theirs_path))
         .await
         .unwrap_or(false)
     {
@@ -2818,22 +2818,23 @@ async fn try_auto_resolve_conflict(
         return Ok(None);
     }
 
-    if change_from.from.node.is_valid_node_id() {
+    if change_from.from.mapping.node.is_valid_node_id() {
         lore_trace!("Change from base has valid from node, realize base file {base_file}");
         let node = change_from
             .from
+            .mapping
             .state
             .block(
-                change_from.from.repository.clone(),
-                NodeBlock::index(change_from.from.node),
+                change_from.from.mapping.repository.clone(),
+                NodeBlock::index(change_from.from.mapping.node),
             )
             .await
             .forward::<BranchError>("Failed to deserialize revisions state")?
-            .node(Node::index(change_from.from.node));
+            .node(Node::index(change_from.from.mapping.node));
         // TODO(vri): UCS-19228 - Links: Realize link node files during branch sync
         if node.is_file() {
             if sync::realize_scratch_file(
-                change_from.from.repository.clone(),
+                change_from.from.mapping.repository.clone(),
                 &base_path,
                 node,
                 Arc::default(),
@@ -2855,22 +2856,23 @@ async fn try_auto_resolve_conflict(
             .await;
     }
 
-    if change_to.to.node.is_valid_node_id() {
+    if change_to.to.mapping.node.is_valid_node_id() {
         lore_trace!("Change to mine has valid from node, realize mine file {mine_file}");
         let node = change_to
             .to
+            .mapping
             .state
             .block(
-                change_to.to.repository.clone(),
-                NodeBlock::index(change_to.to.node),
+                change_to.to.mapping.repository.clone(),
+                NodeBlock::index(change_to.to.mapping.node),
             )
             .await
             .forward::<BranchError>("Failed to deserialize revisions state")?
-            .node(Node::index(change_to.to.node));
+            .node(Node::index(change_to.to.mapping.node));
         // TODO(vri): UCS-19228 - Links: Realize link node files during branch sync
         if node.is_file() {
             if sync::realize_scratch_file(
-                change_to.to.repository.clone(),
+                change_to.to.mapping.repository.clone(),
                 &mine_path,
                 node,
                 Arc::default(),
@@ -2931,9 +2933,6 @@ async fn try_auto_resolve_conflict(
             flags: change_to.flags | change::Flags::ConflictAutomerged,
             from: change_to.from.clone(),
             to: change_to.to.clone(),
-            path: change_to.path.clone(),
-            from_path: change_to.from_path.clone(),
-            observed: change_to.observed,
         }))
     } else {
         Ok(None)
@@ -4909,21 +4908,23 @@ mod tests {
         path: &str,
         from_path: Option<&str>,
     ) -> NodeChange {
-        let side = |node| change::NodeChangeState {
-            repository: repository.clone(),
-            state: state.clone(),
-            node,
+        let side = |node, side_path: &str| change::NodeChangeState {
+            mapping: state::NodeMapping {
+                repository: repository.clone(),
+                state: state.clone(),
+                path: RelativePathBuf::new().push_and_freeze(side_path),
+                node,
+            },
+            observed: None,
             flags,
             address: Address::default(),
+            mode: 0,
         };
         NodeChange {
             action,
             flags: change::Flags::None,
-            from: side(1),
-            to: side(2),
-            path: RelativePathBuf::new().push_and_freeze(path),
-            from_path: from_path.map(|path| RelativePathBuf::new().push_and_freeze(path)),
-            observed: None,
+            from: side(1, from_path.unwrap_or_default()),
+            to: side(2, path),
         }
     }
 

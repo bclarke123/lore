@@ -272,6 +272,7 @@ impl TokenMinter {
 
         let claims = AuthorizationToken {
             user_id: user_id.clone(),
+            identity: None,
             issuer: self.issuer.clone(),
             issued_at: now,
             expires: now + self.user_token_ttl_seconds,

@@ -89,6 +89,7 @@ mod tests {
 
     fn verifier(minter: &TokenMinter) -> JwtVerifier {
         JwtVerifier {
+            identity_claim: crate::auth::jwt::DEFAULT_IDENTITY_CLAIM.to_string(),
             jwk_service: Arc::new(LocalJwkService::new(minter)),
             jwt_issuer: Some(vec![minter.issuer().to_string()]),
             jwt_audience: Some(minter.audience().to_vec()),
@@ -123,7 +124,6 @@ mod tests {
     #[tokio::test]
     async fn authz_token_roundtrip_carries_resources() {
         use crate::auth::jwt::ResourcePermission;
-        use crate::auth::jwt::verify_authorization;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let minter = minter(dir.path());
@@ -141,7 +141,11 @@ mod tests {
             .expect("mint authz");
 
         let authz_claims = verifier.verify_token(&authz.token).await.expect("verify");
-        verify_authorization(&authz_claims, repo_id).expect("authorized for granted repo");
+        let resources = authz_claims.resources.as_deref().expect("resources claim");
+        assert!(
+            crate::auth::jwt::ResourceMatcher::default().any_match(resources, repo_id),
+            "authorized for granted repo"
+        );
         assert_eq!(authz_claims.user_id, "static:alice");
     }
 
@@ -172,11 +176,13 @@ mod tests {
 
         for bad in [
             JwtVerifier {
+                identity_claim: crate::auth::jwt::DEFAULT_IDENTITY_CLAIM.to_string(),
                 jwk_service: Arc::new(LocalJwkService::new(&minter)),
                 jwt_issuer: Some(vec!["https://other.example.com".to_string()]),
                 jwt_audience: None,
             },
             JwtVerifier {
+                identity_claim: crate::auth::jwt::DEFAULT_IDENTITY_CLAIM.to_string(),
                 jwk_service: Arc::new(LocalJwkService::new(&minter)),
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["other.example.com".to_string()]),

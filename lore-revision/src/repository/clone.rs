@@ -41,9 +41,9 @@ use crate::filter;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::fs::filesystem_provider::FileInfo;
-use crate::fs::filesystem_provider::FilesystemPath;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::create_empty_directory;
 use crate::hash::hash_string_bytes;
 use crate::instance::InstanceId;
 use crate::interface::LoreArray;
@@ -75,7 +75,6 @@ use crate::state::StateNodeChildrenWithNameIterator;
 use crate::state::file_modification;
 use crate::util;
 use crate::util::path::RelativePath;
-use crate::util::path::RepositoryPath;
 use crate::util::serde::u8_as_bool;
 
 #[error_set(clone)]
@@ -339,7 +338,7 @@ pub struct CloneOptions {
 pub struct CloneWorkItem {
     pub repository: Arc<RepositoryContext>,
     pub node: Node,
-    pub repository_path: RepositoryPath,
+    pub repository_path: RelativePath,
 }
 
 /// Shared context for dependency-driven discovery across all block workers.
@@ -363,7 +362,7 @@ struct BlockDiscoverItem {
     /// Filesystem-relative path from the clone root (dispatcher `repository.path`).
     /// In tree walk mode: the parent directory's path.
     /// In dependency mode: the file's own path.
-    repository_path: RepositoryPath,
+    repository_path: RelativePath,
     /// The view filter's verdict for `repository_path`, which each node reached
     /// from this item steps from rather than folding its whole path.
     /// Unused in dependency mode, where each path arrives whole.
@@ -546,22 +545,6 @@ async fn block_discover_task(
     }
 }
 
-/// Create `relative_path` and any missing ancestors, materializing a directory
-/// the view filter left without in-view content: one empty in the revision, or
-/// one whose children were all filtered out.
-async fn create_empty_directory(
-    operation: &Arc<InstanceOperationImpl>,
-    path: &RepositoryPath,
-) -> Result<(), CloneError> {
-    operation
-        .create_dir_all(FilesystemPath::Repository(path))
-        .await
-        .forward_with::<CloneError, _>(|| {
-            format!("Failed to create directory {}", path.absolute().display())
-        })?;
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn process_block_item(
     dispatcher: &Arc<BlockDiscoverDispatcher>,
@@ -594,11 +577,11 @@ async fn process_block_item(
             return Err(CloneError::internal("Failed to deserialize node name"));
         }
 
-        let node_path = item.repository_path.get_child(&node_name);
+        let node_path = item.repository_path.join(&node_name);
 
         let (node_states, excluded) = dispatcher.repository.filter.child_emit_excludes(
             item.states,
-            node_path.relative(),
+            &node_path,
             node.is_directory(),
             FilterMode::View,
         );
@@ -656,7 +639,7 @@ async fn process_block_item(
                 });
             } else if node.is_directory() {
                 if execution_context().globals().dry_run() {
-                    lore_info!("{}", node_path.absolute().display());
+                    lore_info!("{}", node_path);
                 }
 
                 if let Some(first_child) = node.child() {
@@ -672,7 +655,7 @@ async fn process_block_item(
                         visited_child: false,
                     });
                 } else if !execution_context().globals().dry_run() {
-                    create_empty_directory(&dispatcher.operation, &node_path).await?;
+                    create_empty_directory::<CloneError>(&dispatcher.operation, &node_path).await?;
                 }
             }
         }
@@ -700,10 +683,14 @@ async fn process_block_item(
             }
             None => {
                 if !visited_child
-                    && !item.repository_path.relative().is_empty()
+                    && !item.repository_path.is_empty()
                     && !execution_context().globals().dry_run()
                 {
-                    create_empty_directory(&dispatcher.operation, &item.repository_path).await?;
+                    create_empty_directory::<CloneError>(
+                        &dispatcher.operation,
+                        &item.repository_path,
+                    )
+                    .await?;
                 }
                 break;
             }
@@ -725,7 +712,7 @@ async fn process_block_item_dependency(
 
     // In dependency mode, relative_path is the file's own path (not parent's)
     if !dispatcher.repository.filter.emit_excludes(
-        item.repository_path.relative(),
+        &item.repository_path,
         node.is_directory(),
         FilterMode::View,
     ) && node.is_file()
@@ -796,7 +783,7 @@ async fn process_block_item_dependency(
 
             event::LoreEvent::DependencyResolveItem(
                 dependency::LoreDependencyResolveItemEventData {
-                    source: item.repository_path.relative().as_str().into(),
+                    source: item.repository_path.as_str().into(),
                     target: dep_relative.as_str().into(),
                     tags: LoreArray::from_vec(
                         entry
@@ -810,11 +797,12 @@ async fn process_block_item_dependency(
             .send();
 
             // Create parent directories
-            let dep_path = RepositoryPath::from_relative(&dispatcher.repository, dep_relative)?;
-            if let Some(parent) = dep_path.get_parent() {
+            let dep_path = dep_relative;
+            let parent = dep_path.parent_path();
+            if !parent.is_empty() {
                 dispatcher
                     .operation
-                    .create_dir_all(FilesystemPath::Repository(&parent))
+                    .create_dir_all(&parent)
                     .await
                     .forward::<CloneError>("Creating parent directory")?;
             }
@@ -917,7 +905,7 @@ pub async fn clone(
         // server's auth_url. `remote.identity()` is that resolved user_id —
         // the same form (JWT `sub`) that production commits use for
         // `created-by`/`committed-by`, so the display layer's user_id
-        // → name lookup in `lore log` still works.
+        // → name lookup in `lore history` still works.
         let resolved = remote.identity();
         (!resolved.is_empty()).then(|| resolved.to_string())
     };
@@ -930,6 +918,9 @@ pub async fn clone(
         file: Some(FileConfig::default()),
         vfs: options.vfs_options.clone(),
     };
+    repository_config
+        .validate()
+        .forward::<CloneError>("Error validating repository config")?;
 
     let repository_metadata = {
         // Dummy repository context just to be able to load the repository
@@ -1079,32 +1070,16 @@ pub async fn clone(
         None
     };
 
-    let revision = if let Some(revision) = revision {
-        revision::resolve(
-            repository.clone(),
-            revision,
-            call.search_limit(),
-            call.search_location(),
-        )
-        .await
-        .forward::<CloneError>("Invalid revision signature")?
+    // A revision names the branch to clone, and the default branch is cloned
+    // where no revision was given.
+    let (revision, branch_id) = if let Some(revision) = revision {
+        let resolved =
+            revision::resolve_in_branch(repository.clone(), revision, call.search_location())
+                .await
+                .forward::<CloneError>("Invalid revision signature")?;
+        (resolved.revision, resolved.branch)
     } else {
-        Hash::default()
-    };
-
-    // If a revision was given, make sure it's on the expected branch
-    let branch_id = if !revision.is_zero() {
-        let state = state::State::deserialize(repository.clone(), revision)
-            .await
-            .forward::<CloneError>("Failed to load revision state")?;
-        let metadata = metadata::Metadata::deserialize(repository.clone(), state.metadata_hash())
-            .await
-            .forward::<CloneError>("Failed to load revision metadata")?;
-        metadata
-            .get_branch()
-            .forward::<CloneError>("Failed to load revision metadata")?
-    } else {
-        repository_metadata.default_branch
+        (Hash::default(), repository_metadata.default_branch)
     };
 
     let branch = if let Some(branch) = prefetched_branch {
@@ -1273,6 +1248,11 @@ pub async fn clone(
 
     let _ = repository.flush(call.sync_data()).await;
 
+    let operation_result = operation
+        .finalize(true)
+        .await
+        .forward::<CloneError>("Finishing operation");
+
     if !call.dry_run() {
         repository_path_guard.clean_path_on_drop = false;
         dot_directory_guard.clean_path_on_drop = false;
@@ -1288,11 +1268,6 @@ pub async fn clone(
         count: LoreRepositoryCloneCountData::new(&stats),
     })
     .send();
-
-    let operation_result = operation
-        .finalize(true)
-        .await
-        .forward::<CloneError>("Finishing operation");
 
     operation_result.and(materialize_result.and(store_result))
 }
@@ -1321,20 +1296,6 @@ async fn clone_materialize(
         stats,
         ..
     } = ctx.clone();
-    if options
-        .vfs_options
-        .as_ref()
-        .is_some_and(|config| config.vfs_type.is_swfs())
-    {
-        let path = repository.require_path()?;
-        if path.exists() {
-            Err(InvalidPath {
-                path: format!("{}", path.display()),
-            })?;
-        }
-        return Ok(());
-    }
-
     let mut clone_result = Ok(());
     let mut cache_task = None;
 
@@ -1415,7 +1376,7 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
             dispatcher.dispatch(BlockDiscoverItem {
                 node_id: first_child,
                 expected_parent: ROOT_NODE,
-                repository_path: RepositoryPath::from_relative(&repository, RelativePath::new())?,
+                repository_path: RelativePath::new(),
                 states: FilterStates::ROOT,
                 dep_context: None,
                 follow_deps: false,
@@ -1442,9 +1403,9 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
         for root_path in &options.root_files {
             let relative = RelativePath::new_from_initial_path(root_path)
                 .forward_with::<CloneError, _>(|| format!("Invalid path: {root_path}"))?;
-            let repository_path = RepositoryPath::from_relative(&repository, relative)?;
+            let repository_path = relative;
             let node_link = state
-                .find_node_link(repository.clone(), repository_path.relative().as_str())
+                .find_node_link(repository.clone(), repository_path.as_str())
                 .await
                 .forward_with::<CloneError, _>(|| format!("Root file not found: {root_path}"))?;
             if !node_link.is_valid() {
@@ -1453,9 +1414,10 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
                 )));
             }
             let node_id = node_link.node;
-            if let Some(parent) = repository_path.get_parent() {
+            let parent = repository_path.parent_path();
+            if !parent.is_empty() {
                 ctx.operation
-                    .create_dir_all(FilesystemPath::Repository(&parent))
+                    .create_dir_all(&parent)
                     .await
                     .forward::<CloneError>("Failed to root path parent directory")?;
             }
@@ -1509,7 +1471,7 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
 async fn clone_discover_link(
     ctx: CloneContext,
     node: Node,
-    link_path: RepositoryPath,
+    link_path: RelativePath,
     tx: mpsc::Sender<CloneWorkItem>,
 ) -> Result<(), CloneError> {
     let link = node.linked_node();
@@ -1518,7 +1480,7 @@ async fn clone_discover_link(
     let link_node = link.node;
 
     lore_debug!("Resolve link {linked_repository_id} node {link_node}");
-    let linked_repository = Arc::new(ctx.repository.to_link_context(linked_repository_id).await);
+    let linked_repository = ctx.repository.to_link_context(linked_repository_id).await;
     if let Ok(link_remote) = linked_repository.remote().await {
         let correlation_id = execution_context().globals().correlation_id.to_string();
         if link_remote
@@ -1530,23 +1492,15 @@ async fn clone_discover_link(
                 .await
                 .forward::<CloneError>("Failed to load revision state")?;
 
-            lore_info!(
-                "Clone link {} in {}",
-                linked_repository.id,
-                link_path.absolute().display()
-            );
+            lore_info!("Clone link {} in {}", linked_repository.id, link_path);
             // Discovery no longer pre-creates parent dirs; create the full chain here and cache the link dir in stats so later files under it cache-hit.
-            let link_dir_hash =
-                hash_string_bytes(link_path.absolute().as_os_str().as_encoded_bytes());
+            let link_dir_hash = hash_string_bytes(link_path.as_str().as_bytes());
             if !ctx.stats.created_parents.contains(&link_dir_hash) {
                 ctx.operation
-                    .create_dir_all(FilesystemPath::Repository(&link_path))
+                    .create_dir_all(&link_path)
                     .await
                     .forward_with::<CloneError, _>(|| {
-                        format!(
-                            "Failed to create directory {}",
-                            link_path.absolute().display()
-                        )
+                        format!("Failed to create directory {link_path}")
                     })?;
                 ctx.stats.created_parents.insert(link_dir_hash);
             }
@@ -1567,7 +1521,7 @@ async fn clone_discover_link(
                 .forward::<CloneError>("Failed to deserialize revision state node block")?;
 
             if let Some(first_child) = root_node.child() {
-                let link_states = linked_repository.filter.mount_states(link_path.relative());
+                let link_states = linked_repository.filter.mount_states(&link_path);
                 link_dispatcher.dispatch(BlockDiscoverItem {
                     node_id: first_child,
                     expected_parent: link_node,
@@ -1644,7 +1598,7 @@ pub async fn clone_execute(
                         }
                         lore_debug!(
                             "Retrying {} after transient failure: {err}",
-                            item.repository_path.absolute().display()
+                            item.repository_path
                         );
                     }
                     result => break result,
@@ -1706,7 +1660,7 @@ pub async fn clone_execute(
 pub(crate) async fn clone_node(
     ctx: CloneContext,
     storage: Arc<lore_transport::StorageSession>,
-    repository_path: RepositoryPath,
+    repository_path: RelativePath,
     node: NodeID,
     states: FilterStates,
 ) -> Result<(), CloneError> {
@@ -1728,11 +1682,13 @@ pub(crate) async fn clone_node(
         if child_name.is_empty() {
             return Err(CloneError::internal("Failed to deserialize node name"));
         }
-        let child_repository_path = repository_path.get_child(&child_name);
+        // Takes the name by value so its block read lock ends here, rather than reaching the
+        // clone of the child below (see NodeNameLock docs).
+        let child_repository_path = repository_path.join(child_name);
 
         let (child_states, excluded) = repository.filter.child_emit_excludes(
             states,
-            child_repository_path.relative(),
+            &child_repository_path,
             child_node.is_directory(),
             FilterMode::View,
         );
@@ -1784,7 +1740,7 @@ pub(crate) async fn clone_node(
 fn clone_child_node(
     ctx: CloneContext,
     storage: Arc<lore_transport::StorageSession>,
-    repository_path: RepositoryPath,
+    repository_path: RelativePath,
     node: NodeID,
     states: FilterStates,
 ) -> Pin<Box<dyn Future<Output = Result<(), CloneError>> + Send>> {
@@ -1794,34 +1750,29 @@ fn clone_child_node(
 /// Ensure the parent directory of `path` exists; second and later files under the same parent hit the `DashSet` cache and skip the syscall.
 /// A parent that already exists but cannot be created over — the clone root on a container bind mount, a drive root, an ACL'd share — counts as success.
 async fn ensure_parent_dir(
-    repository_path: &RepositoryPath,
+    repository_path: &RelativePath,
     operation: &Arc<InstanceOperationImpl>,
     stats: &CloneStats,
 ) -> Result<(), CloneError> {
-    let Some(parent) = repository_path.get_parent() else {
+    let parent = repository_path.parent_path();
+    if parent.is_empty() {
         return Ok(());
-    };
-    // Hash raw OS-string bytes without allocation; case variants on Windows at worst trigger a redundant idempotent create_dir_all.
-    let parent_hash = hash_string_bytes(parent.absolute().as_os_str().as_encoded_bytes());
+    }
+    // Hash the path's own bytes without allocation; case variants on Windows at worst trigger a redundant idempotent create_dir_all.
+    let parent_hash = hash_string_bytes(parent.as_str().as_bytes());
     if stats.created_parents.contains(&parent_hash) {
         return Ok(());
     }
     // `create_dir_all` only forgives `AlreadyExists`, so check existence ourselves as `spawn_clone_directory` does.
-    if let Err(err) = operation
-        .create_dir_all(FilesystemPath::Repository(&parent))
-        .await
+    if let Err(err) = operation.create_dir_all(&parent).await
         && !operation
-            .file_info(FilesystemPath::Repository(&parent))
+            .file_info(&parent)
             .await
-            .is_ok_and(|info| info.is_dir)
+            .is_ok_and(|info| info.is_dir())
     {
         return Err(CloneError::internal_with_context(
             err,
-            &format!(
-                "Failed to create directory {} as parent of {}",
-                parent.absolute().display(),
-                repository_path.absolute().display()
-            ),
+            &format!("Failed to create directory {parent} as parent of {repository_path}"),
         ));
     }
     stats.created_parents.insert(parent_hash);
@@ -1832,21 +1783,19 @@ async fn ensure_parent_dir(
 /// a bit to compare against. A platform that reports none leaves the file alone.
 async fn match_node_executable(
     operation: &Arc<InstanceOperationImpl>,
-    path: &RepositoryPath,
+    path: &RelativePath,
     node: &Node,
     file_info: &FileInfo,
 ) -> Result<(), CloneError> {
     let node_executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
     if file_info
-        .executable
+        .executable()
         .is_some_and(|observed| observed != node_executable)
     {
         operation
-            .make_executable(FilesystemPath::Repository(path), node_executable)
+            .make_executable(path, node_executable)
             .await
-            .forward_with::<CloneError, _>(|| {
-                format!("Failed to clone file {}", path.absolute().display())
-            })?;
+            .forward_with::<CloneError, _>(|| format!("Failed to clone file {path}"))?;
     }
     Ok(())
 }
@@ -1854,7 +1803,7 @@ async fn match_node_executable(
 async fn clone_file(
     ctx: CloneContext,
     node: Node,
-    repository_path: RepositoryPath,
+    repository_path: RelativePath,
 ) -> Result<Option<(Hash, u64)>, CloneError> {
     let CloneContext {
         repository,
@@ -1867,17 +1816,12 @@ async fn clone_file(
     let context = execution_context();
     let call = context.globals();
     let force = call.force();
-    let file_info = operation
-        .file_info(FilesystemPath::Repository(&repository_path))
-        .await;
+    let file_info = operation.file_info(&repository_path).await;
     if let Ok(file_info) = file_info
-        && file_info.exists
+        && file_info.exists()
     {
         if options.ignore_existing {
-            lore_trace!(
-                "Ignore existing file {}",
-                repository_path.absolute().display()
-            );
+            lore_trace!("Ignore existing file {}", repository_path);
             return Ok(None);
         }
 
@@ -1888,11 +1832,12 @@ async fn clone_file(
             file_modification(
                 repository.clone(),
                 &node,
-                file_info.mtime,
-                file_info.size,
-                repository_path.relative(),
+                file_info.mtime(),
+                file_info.size(),
+                &repository_path,
                 force,
-                None,
+                &operation,
+                &lore_storage::ContentHashes::default(),
             )
             .await,
             Ok(FileModification::UnmodifiedByMtime | FileModification::UnmodifiedByHash)
@@ -1901,51 +1846,46 @@ async fn clone_file(
             // Existing file is identical, just use it
             match_node_executable(&operation, &repository_path, &node, &file_info).await?;
 
-            lore_trace!("Retain {}", repository_path.absolute().display());
+            lore_trace!("Retain {}", repository_path);
             stats.complete.file_retain.fetch_add(1, Ordering::Relaxed);
             stats.complete.file_complete.fetch_add(1, Ordering::Relaxed);
             return Ok(Some(state::file_modified_time_entry(
                 &repository,
-                repository_path.relative(),
-                file_info.mtime,
+                &repository_path,
+                file_info.mtime(),
             )));
         }
         if !force {
             lore_error!(
                 "File already exist in file system and not identical {}",
-                repository_path.absolute().display()
+                repository_path
             );
             return Err(CloneError::internal(format!(
-                "File already exist in file system: {}",
-                repository_path.absolute().display()
+                "File already exist in file system: {repository_path}"
             )));
         }
         if !call.dry_run() {
             let mut retry = util::fs::file_unlink_retry();
 
-            while let Err(err) = operation
-                .remove_recursive(FilesystemPath::Repository(&repository_path))
-                .await
-            {
+            while let Err(err) = operation.remove_recursive(&repository_path).await {
                 lore_trace!(
                     "Unable to unlink local directory {}: {} (attempt {} of {})",
-                    repository_path.absolute().display(),
+                    repository_path,
                     err,
                     retry.counter() + 1,
                     retry.limit()
                 );
                 if !retry.wait().await {
                     return Err(CloneError::internal(format!(
-                        "Failed to force delete existing file {}",
-                        repository_path.absolute().display()
+                        "Failed to force delete existing file {repository_path}"
                     )));
                 }
             }
         }
         stats.complete.file_replace.fetch_add(1, Ordering::Relaxed);
-        lore_trace!("Replace {}", repository_path.absolute().display());
+        lore_trace!("Replace {}", repository_path);
     } else {
-        lore_trace!("Create {}", repository_path.absolute().display());
+        lore_trace!("Create {}", repository_path);
     }
 
     if !call.dry_run() {
@@ -1958,17 +1898,10 @@ async fn clone_file(
         // still need a separate metadata query.
         let captured_file_info = if node.size > 0 {
             let (fragment, file_info) = operation
-                .set_file_to_immutable_store_contents(
-                    repository.clone(),
-                    &node,
-                    FilesystemPath::Repository(&repository_path),
-                )
+                .set_file_to_immutable_store_contents(repository.clone(), &node, &repository_path)
                 .await
                 .forward_with::<CloneError, _>(|| {
-                    format!(
-                        "Failed to clone file {}",
-                        repository_path.absolute().display()
-                    )
+                    format!("Failed to clone file {repository_path}")
                 })?;
             stats
                 .complete
@@ -1978,13 +1911,10 @@ async fn clone_file(
         } else {
             // Zero sized file, just create
             operation
-                .create_file(FilesystemPath::Repository(&repository_path))
+                .create_file(&repository_path)
                 .await
                 .forward_with::<CloneError, _>(|| {
-                    format!(
-                        "Failed to clone file {}",
-                        repository_path.absolute().display()
-                    )
+                    format!("Failed to clone file {repository_path}")
                 })?;
             None
         };
@@ -1993,13 +1923,10 @@ async fn clone_file(
             file_info
         } else {
             operation
-                .file_info(FilesystemPath::Repository(&repository_path))
+                .file_info(&repository_path)
                 .await
                 .forward_with::<CloneError, _>(|| {
-                    format!(
-                        "Failed to clone file {}",
-                        repository_path.absolute().display()
-                    )
+                    format!("Failed to clone file {repository_path}")
                 })?
         };
 
@@ -2012,8 +1939,8 @@ async fn clone_file(
         stats.complete.file_complete.fetch_add(1, Ordering::Relaxed);
         return Ok(Some(state::file_modified_time_entry(
             &repository,
-            repository_path.relative(),
-            file_info.mtime,
+            &repository_path,
+            file_info.mtime(),
         )));
     }
 
@@ -2026,7 +1953,7 @@ async fn spawn_clone_file(
     tasks: &mut JoinSet<Result<(), CloneError>>,
     ctx: CloneContext,
     node: Node,
-    repository_path: RepositoryPath,
+    repository_path: RelativePath,
 ) {
     let spawn_ctx = ctx.clone();
     let CloneContext { stats, .. } = ctx;
@@ -2059,7 +1986,7 @@ fn spawn_clone_link(
     tasks: &mut JoinSet<Result<(), CloneError>>,
     ctx: CloneContext,
     node: Node,
-    repository_path: RepositoryPath,
+    repository_path: RelativePath,
 ) {
     lore_spawn!(tasks, async move {
         let link = node.linked_node();
@@ -2068,8 +1995,7 @@ fn spawn_clone_link(
         let link_node = link.node;
 
         lore_debug!("Resolve link {linked_repository_id} node {link_node}");
-        let linked_repository =
-            Arc::new(ctx.repository.to_link_context(linked_repository_id).await);
+        let linked_repository = ctx.repository.to_link_context(linked_repository_id).await;
         if let Ok(link_remote) = linked_repository.remote().await {
             let correlation_id = execution_context().globals().correlation_id.to_string();
             if let Ok(link_storage) = link_remote
@@ -2080,24 +2006,15 @@ fn spawn_clone_link(
                     .await
                     .forward::<CloneError>("Failed to load revision state")?;
 
-                lore_info!(
-                    "Clone link {} in {}",
-                    linked_repository.id,
-                    repository_path.absolute().display()
-                );
+                lore_info!("Clone link {} in {}", linked_repository.id, repository_path);
                 ctx.operation
-                    .create_dir_all(FilesystemPath::Repository(&repository_path))
+                    .create_dir_all(&repository_path)
                     .await
                     .forward_with::<CloneError, _>(|| {
-                        format!(
-                            "Failed to create directory {}",
-                            repository_path.absolute().display()
-                        )
+                        format!("Failed to create directory {repository_path}")
                     })?;
 
-                let link_states = linked_repository
-                    .filter
-                    .mount_states(repository_path.relative());
+                let link_states = linked_repository.filter.mount_states(&repository_path);
 
                 clone_child_node(
                     CloneContext {
@@ -2127,7 +2044,7 @@ async fn spawn_clone_directory(
     ctx: CloneContext,
     storage: Arc<lore_transport::StorageSession>,
     node: NodeID,
-    repository_path: RepositoryPath,
+    repository_path: RelativePath,
     states: FilterStates,
 ) -> Result<(), CloneError> {
     let stats = ctx.stats.clone();
@@ -2137,21 +2054,23 @@ async fn spawn_clone_directory(
 
     let future = async move {
         if !execution_context().globals().dry_run() {
-            let result = ctx
-                .operation
-                .create_dir_all(FilesystemPath::Repository(&repository_path))
-                .await;
-            if result.is_err() && !repository_path.absolute().is_dir() {
+            let result = ctx.operation.create_dir_all(&repository_path).await;
+            if result.is_err()
+                && !ctx
+                    .operation
+                    .file_info(&repository_path)
+                    .await
+                    .is_ok_and(|info| info.is_dir())
+            {
                 stats
                     .directory_inflight
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 return Err(CloneError::internal(format!(
-                    "Failed to create directory {}",
-                    repository_path.absolute().display()
+                    "Failed to create directory {repository_path}"
                 )));
             }
         } else {
-            lore_info!("{}", repository_path.absolute().display());
+            lore_info!("{}", repository_path);
         }
 
         let result = clone_child_node(ctx, storage, repository_path, node, states).await;
@@ -2208,8 +2127,7 @@ mod tests {
     async fn create_operation() -> (TempDir, Arc<InstanceOperationImpl>) {
         let temp = TempDir::new("lore-clone-temp-path-");
         let os_filesystem = OsFilesystem::new(temp.path());
-        let operation = os_filesystem
-            .begin_operation()
+        let operation = <OsFilesystem as FilesystemProvider>::begin_operation(&os_filesystem)
             .await
             .expect("Starting test operation");
         (temp, operation)
@@ -2219,28 +2137,31 @@ mod tests {
         RelativePath::new_from_initial_path(path).expect("Relative path")
     }
 
+    /// Where `path` is under the root the test operation was opened on, for the fixtures that
+    /// build filesystem state directly rather than through it.
+    fn on_disk(temp: &TempDir, path: &RelativePath) -> std::path::PathBuf {
+        temp.path().join(path.as_str())
+    }
+
     #[tokio::test]
     async fn ensure_parent_dir_creates_missing_ancestors() {
         let (temp, operation) = create_operation().await;
-        let file = RepositoryPath::from_relative_and_root(
-            temp.path(),
-            relative_path("nested/deeper/file.txt"),
-        );
+        let file = relative_path("nested/deeper/file.txt");
         let stats = CloneStats::default();
 
         ensure_parent_dir(&file, &operation, &stats)
             .await
             .expect("missing parent should be created");
 
-        assert!(file.get_parent().expect("parent").absolute().is_dir());
+        assert!(on_disk(&temp, &file.parent_path()).is_dir());
     }
 
     /// The clone root already exists and is not ours to create: files at the top of the tree
     /// take it as their parent, so this must not fail the clone.
     #[tokio::test]
     async fn ensure_parent_dir_accepts_existing_parent() {
-        let (temp, operation) = create_operation().await;
-        let file = RepositoryPath::from_relative_and_root(temp.path(), relative_path("file.txt"));
+        let (_temp, operation) = create_operation().await;
+        let file = relative_path("file.txt");
         let stats = CloneStats::default();
 
         ensure_parent_dir(&file, &operation, &stats)
@@ -2250,11 +2171,10 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_parent_dir_caches_parent_once_per_path() {
-        let (temp, operation) = create_operation().await;
+        let (_temp, operation) = create_operation().await;
         let stats = CloneStats::default();
-        let first = RepositoryPath::from_relative_and_root(temp.path(), relative_path("dir/a.txt"));
-        let second =
-            RepositoryPath::from_relative_and_root(temp.path(), relative_path("dir/b.txt"));
+        let first = relative_path("dir/a.txt");
+        let second = relative_path("dir/b.txt");
 
         ensure_parent_dir(&first, &operation, &stats)
             .await
@@ -2271,13 +2191,13 @@ mod tests {
     #[tokio::test]
     async fn ensure_parent_dir_rejects_parent_that_is_a_file() {
         let (temp, operation) = create_operation().await;
-        let blocker = RepositoryPath::from_relative_and_root(temp.path(), relative_path("blocker"));
-        tokio::fs::File::create(blocker.absolute())
+        let blocker = relative_path("blocker");
+        tokio::fs::File::create(on_disk(&temp, &blocker))
             .await
             .expect("create blocker file");
         let stats = CloneStats::default();
 
-        let err = ensure_parent_dir(&blocker.get_child("file.txt"), &operation, &stats)
+        let err = ensure_parent_dir(&blocker.join("file.txt"), &operation, &stats)
             .await
             .expect_err("a file where the parent belongs must fail");
 
@@ -2292,22 +2212,27 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let (temp, operation) = create_operation().await;
-        let locked = RepositoryPath::from_relative_and_root(temp.path(), relative_path("locked"));
-        tokio::fs::create_dir(locked.absolute())
+        let locked = relative_path("locked");
+        tokio::fs::create_dir(on_disk(&temp, &locked))
             .await
             .expect("create locked dir");
-        tokio::fs::set_permissions(locked.absolute(), std::fs::Permissions::from_mode(0o500))
-            .await
-            .expect("drop write permission");
+        tokio::fs::set_permissions(
+            on_disk(&temp, &locked),
+            std::fs::Permissions::from_mode(0o500),
+        )
+        .await
+        .expect("drop write permission");
         let stats = CloneStats::default();
 
-        let result =
-            ensure_parent_dir(&locked.get_child("child/file.txt"), &operation, &stats).await;
+        let result = ensure_parent_dir(&locked.join("child/file.txt"), &operation, &stats).await;
 
         // Restore write permission first so the temp dir can be cleaned up.
-        tokio::fs::set_permissions(locked.absolute(), std::fs::Permissions::from_mode(0o700))
-            .await
-            .expect("restore write permission");
+        tokio::fs::set_permissions(
+            on_disk(&temp, &locked),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .await
+        .expect("restore write permission");
         let err = result.expect_err("uncreatable parent must fail");
         assert!(err.to_string().contains("Failed to create directory"));
         assert!(stats.created_parents.is_empty());
@@ -2317,12 +2242,12 @@ mod tests {
     #[tokio::test]
     async fn adversarial_dangling_symlink_parent() {
         let (temp, operation) = create_operation().await;
-        let link = RepositoryPath::from_relative_and_root(temp.path(), relative_path("link"));
-        std::os::unix::fs::symlink(temp.path().join("nowhere"), link.absolute())
+        let link = relative_path("link");
+        std::os::unix::fs::symlink(temp.path().join("nowhere"), on_disk(&temp, &link))
             .expect("create dangling symlink");
         let stats = CloneStats::default();
 
-        let result = ensure_parent_dir(&link.get_child("file.txt"), &operation, &stats).await;
+        let result = ensure_parent_dir(&link.join("file.txt"), &operation, &stats).await;
 
         assert!(result.is_err(), "a dangling symlink is not a usable parent");
     }
@@ -2331,15 +2256,16 @@ mod tests {
     #[tokio::test]
     async fn adversarial_symlink_to_file_parent() {
         let (temp, operation) = create_operation().await;
-        let target = RepositoryPath::from_relative_and_root(temp.path(), relative_path("target"));
-        tokio::fs::File::create(target.absolute())
+        let target = relative_path("target");
+        tokio::fs::File::create(on_disk(&temp, &target))
             .await
             .expect("create target file");
-        let link = RepositoryPath::from_relative_and_root(temp.path(), relative_path("link"));
-        std::os::unix::fs::symlink(target.absolute(), link.absolute()).expect("create symlink");
+        let link = relative_path("link");
+        std::os::unix::fs::symlink(on_disk(&temp, &target), on_disk(&temp, &link))
+            .expect("create symlink");
         let stats = CloneStats::default();
 
-        let result = ensure_parent_dir(&link.get_child("file.txt"), &operation, &stats).await;
+        let result = ensure_parent_dir(&link.join("file.txt"), &operation, &stats).await;
 
         assert!(
             result.is_err(),
@@ -2351,15 +2277,16 @@ mod tests {
     #[tokio::test]
     async fn adversarial_symlink_to_directory_parent() {
         let (temp, operation) = create_operation().await;
-        let target = RepositoryPath::from_relative_and_root(temp.path(), relative_path("target"));
-        tokio::fs::create_dir(target.absolute())
+        let target = relative_path("target");
+        tokio::fs::create_dir(on_disk(&temp, &target))
             .await
             .expect("create target dir");
-        let link = RepositoryPath::from_relative_and_root(temp.path(), relative_path("link"));
-        std::os::unix::fs::symlink(target.absolute(), link.absolute()).expect("create symlink");
+        let link = relative_path("link");
+        std::os::unix::fs::symlink(on_disk(&temp, &target), on_disk(&temp, &link))
+            .expect("create symlink");
         let stats = CloneStats::default();
 
-        ensure_parent_dir(&link.get_child("file.txt"), &operation, &stats)
+        ensure_parent_dir(&link.join("file.txt"), &operation, &stats)
             .await
             .expect("a symlink to a directory is a usable parent");
     }
@@ -2367,14 +2294,13 @@ mod tests {
     #[tokio::test]
     async fn adversarial_parent_nested_under_a_file() {
         let (temp, operation) = create_operation().await;
-        let blocker = RepositoryPath::from_relative_and_root(temp.path(), relative_path("blocker"));
-        tokio::fs::File::create(blocker.absolute())
+        let blocker = relative_path("blocker");
+        tokio::fs::File::create(on_disk(&temp, &blocker))
             .await
             .expect("create blocker file");
         let stats = CloneStats::default();
 
-        let result =
-            ensure_parent_dir(&blocker.get_child("deep/file.txt"), &operation, &stats).await;
+        let result = ensure_parent_dir(&blocker.join("deep/file.txt"), &operation, &stats).await;
 
         assert!(result.is_err(), "a file cannot contain a directory");
     }
@@ -2385,43 +2311,30 @@ mod tests {
         let stats = CloneStats::default();
 
         // Filesystem root: no parent to create.
-        ensure_parent_dir(
-            &RepositoryPath::from_relative_and_root(Path::new(""), relative_path("/")),
-            &operation,
-            &stats,
-        )
-        .await
-        .expect("root must be a no-op");
+        ensure_parent_dir(&relative_path("/"), &operation, &stats)
+            .await
+            .expect("root must be a no-op");
         // Bare relative name: parent is the empty path.
-        ensure_parent_dir(
-            &RepositoryPath::from_relative_and_root(Path::new(""), relative_path("file.txt")),
-            &operation,
-            &stats,
-        )
-        .await
-        .expect("a bare relative name must be a no-op");
+        ensure_parent_dir(&relative_path("file.txt"), &operation, &stats)
+            .await
+            .expect("a bare relative name must be a no-op");
         // Empty path.
-        ensure_parent_dir(
-            &RepositoryPath::from_relative_and_root(Path::new(""), RelativePath::new()),
-            &operation,
-            &stats,
-        )
-        .await
-        .expect("empty path must be a no-op");
+        ensure_parent_dir(&RelativePath::new(), &operation, &stats)
+            .await
+            .expect("empty path must be a no-op");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn adversarial_concurrent_calls_same_parent() {
         let (temp, operation) = create_operation().await;
         let stats = Arc::new(CloneStats::default());
-        let parent =
-            RepositoryPath::from_relative_and_root(temp.path(), relative_path("shared/nested"));
+        let parent = relative_path("shared/nested");
 
         let mut tasks = Vec::new();
         for index in 0..16 {
             let operation = operation.clone();
             let stats = stats.clone();
-            let file = parent.get_child(&format!("file-{index}.txt"));
+            let file = parent.join(format!("file-{index}.txt"));
             tasks.push(lore_spawn!(async move {
                 ensure_parent_dir(&file, &operation, &stats).await
             }));
@@ -2432,7 +2345,7 @@ mod tests {
                 .expect("concurrent creation of the same parent must not fail");
         }
 
-        assert!(parent.absolute().is_dir());
+        assert!(on_disk(&temp, &parent).is_dir());
         assert_eq!(stats.created_parents.len(), 1);
     }
 }

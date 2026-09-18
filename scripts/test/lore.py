@@ -12,7 +12,6 @@ import shutil
 import string
 import subprocess
 import sys
-import typing
 import uuid
 from collections.abc import Iterable
 from pathlib import Path
@@ -25,30 +24,31 @@ from error_types import (
     get_error_type,
 )
 from lore_parsers import (
-    BranchList,
-    BranchDescription,
-    RevisionInfo,
     BisectResults,
+    BranchDescription,
+    BranchList,
     FileDescription,
     LockAcquire,
-    LockRelease,
     LockQuery,
+    LockRelease,
     LockStatus,
-    can_parse_output,
-    parse_lock_acquire,
-    parse_lock_release,
-    parse_lock_query,
-    parse_lock_status,
-    parse_branch_list,
-    parse_branch_info,
-    parse_revision_list,
-    parse_revision_bisect,
-    parse_file_info,
-    parse_shared_store_info,
+    RevisionInfo,
     SharedStoreInfo,
-    parse_shared_store_list,
     SharedStoreList,
+    can_parse_output,
+    parse_branch_info,
+    parse_branch_list,
+    parse_file_info,
+    parse_lock_acquire,
+    parse_lock_query,
+    parse_lock_release,
+    parse_lock_status,
+    parse_revision_bisect,
+    parse_revision_list,
+    parse_shared_store_info,
+    parse_shared_store_list,
 )
+from service_util import name_service_executable
 
 logger = logging.getLogger(__name__)
 
@@ -229,16 +229,37 @@ class Lore:
             return ".urcignore"
         return ".loreignore"
 
-    def _subprocess_env(self) -> dict[str, str]:
-        """Environment for any subprocess this repository drives."""
+    def sandboxed_env(self, **extra: str) -> dict[str, str]:
+        """The environment a Lore command must run in to stay inside this test.
+
+        Commands run through this wrapper get it already. A test that spawns the
+        binary itself -- to kill it, or to read its output as it streams -- has
+        to ask for it, or the command reads the developer's global config and
+        credentials rather than the ones this test set up. `extra` wins over
+        what this repository sets.
+        """
         env = os.environ.copy()
         for k, v in self.environment_vars.items():
             env[k] = v
         env["LORE_GLOBAL_PATH"] = self.global_dir
-        # Isolate the auth token store per test so a developer's
-        # locally cached credentials don't leak into smoke runs.
-        env.setdefault("LORE_AUTH_PATH", self.global_dir)
-        return env
+        # Isolate the auth token store per test so a developer's locally cached
+        # credentials don't leak into smoke runs. Assigned rather than defaulted:
+        # `env` starts from the ambient environment, so a `LORE_AUTH_PATH` a
+        # developer or CI already exports would win and the command would read
+        # that store. A test that names its own keeps it -- `test_auth_online`
+        # gives each actor a store through `environment_vars`.
+        if "LORE_AUTH_PATH" not in self.environment_vars:
+            env["LORE_AUTH_PATH"] = self.global_dir
+        # Ahead of naming the executable, which reads `LORE_USE_SERVICE`: a
+        # caller turning relaying on through `extra` has to be the value that
+        # decision sees, or the command relays with no executable named and
+        # quietly runs locally instead.
+        env.update(extra)
+        return name_service_executable(env, self.lore_executable_path)
+
+    def _subprocess_env(self) -> dict[str, str]:
+        """Environment for any subprocess this repository drives."""
+        return self.sandboxed_env()
 
     def run(
         self,
@@ -257,6 +278,8 @@ class Lore:
         remote: bool = False,
         local: bool = False,
         identity: str | None = None,
+        identity_token: str | None = None,
+        access_token: str | None = None,
         max_connections: int | None = None,
         file_count_limit: int | None = None,
         file_size_limit: int | None = None,
@@ -289,6 +312,8 @@ class Lore:
             + (["--remote"] if remote else [])
             + (["--local"] if local else [])
             + (["--identity", identity] if identity else [])
+            + (["--identity-token", identity_token] if identity_token else [])
+            + (["--access-token", access_token] if access_token else [])
             + (["--max-connections", str(max_connections)] if max_connections else [])
             + (
                 ["--file-count-limit", str(file_count_limit)]
@@ -408,11 +433,14 @@ class Lore:
             + (["--shared-store-path", shared_store_path] if shared_store_path else []),
             **kwargs,
         )
-        self._ensure_test_identity_in_config()
+        self._ensure_test_identity_in_config(kwargs.get("identity"))
         return output
 
-    def _ensure_test_identity_in_config(self) -> None:
+    def _ensure_test_identity_in_config(self, identity: str | None = None) -> None:
         """Seed `identity = "test-user"` into .lore/config.toml when absent.
+
+        A caller that passed `identity=` to `repository_create` gets that
+        identity seeded instead.
 
         Test infra avoids passing --identity globally because repository
         create/delete have an asymmetric server-side ownership check
@@ -426,6 +454,7 @@ class Lore:
 
         Pass identity="..." on individual commands to override per-call.
         """
+        identity = identity or "test-user"
         config = Path(self.dot_path()) / "config.toml"
         if not config.exists():
             return
@@ -436,11 +465,11 @@ class Lore:
         inserted = False
         for line in lines:
             if not inserted and line.strip().startswith("["):
-                out.append('identity = "test-user"')
+                out.append(f'identity = "{identity}"')
                 inserted = True
             out.append(line)
         if not inserted:
-            out.append('identity = "test-user"')
+            out.append(f'identity = "{identity}"')
         config.write_text("\n".join(out) + "\n")
 
     def repository_delete(
@@ -1698,6 +1727,7 @@ class Lore:
         command_args = [
             sys.executable,
             str(Path(__file__).with_name("lore_ffi.py")),
+            "auth-user-info",
             library_path,
             self.path,
             *user_ids,
@@ -1718,6 +1748,39 @@ class Lore:
         logger.info(
             "Lore C API driver (%s) exited %s, output:\n%s",
             command_string,
+            result.returncode,
+            result.stdout + result.stderr,
+        )
+        return result.returncode
+
+    def service_capi(self, library_path: str, command: str) -> int:
+        """Start or stop the service through the public C API, returning the FFI
+        code. `command` is `service-start` or `service-stop`.
+
+        The CLI's `service start`/`stop` wrap these, so a test driving the CLI
+        covers the wrapper rather than the entry point an SDK consumer calls.
+        Run in a subprocess for the reasons `auth_user_info_capi` is: this
+        repository's isolated directories, and a crash failing one test rather
+        than the pytest worker. It matters twice over here — the library records
+        a service running in its own process, which no later test could undo.
+        """
+        command_args = [
+            sys.executable,
+            str(Path(__file__).with_name("lore_ffi.py")),
+            command,
+            library_path,
+        ]
+        logger.info("Executing Lore C API driver: %s", " ".join(command_args))
+        result = subprocess.run(
+            command_args,
+            capture_output=True,
+            text=True,
+            env=self._subprocess_env(),
+            cwd=self.path if os.path.isdir(self.path) else None,
+        )
+        logger.info(
+            "Lore C API driver (%s) exited %s, output:\n%s",
+            command,
             result.returncode,
             result.stdout + result.stderr,
         )
@@ -1905,7 +1968,7 @@ class Lore:
         # Recorded before the directory exists, so a clone that fails partway
         # through still has its half-written tree removed with the test.
         self.created_paths.append(str(new_repo_path))
-        if not kwargs.get("dry_run"):
+        if not kwargs.get("dry_run") and vfs != "swfs":
             new_repo_path.mkdir(exist_ok=True)
         root_file_args = []
         for rf in root_files or []:
@@ -2196,12 +2259,14 @@ class Lore:
         self,
         name: str | None = None,
         fast_forward_merge: bool = False,
+        stats: bool = False,
         **kwargs: Unpack[GlobalOptions],
     ):
         return self.run(
             ["push"]
             + ([name] if name else [])
-            + (["--fast-forward-merge"] if fast_forward_merge else []),
+            + (["--fast-forward-merge"] if fast_forward_merge else [])
+            + (["--stats"] if stats else []),
             **kwargs,
         )
 
@@ -2409,8 +2474,8 @@ class Lore:
     def service_start(self, **kwargs: Unpack[GlobalOptions]):
         return self.run(["service", "start"], **kwargs)
 
-    def service_stop(self, stop_all: bool = False, **kwargs: Unpack[GlobalOptions]):
-        return self.run(["service", "stop", "true" if stop_all else "false"], **kwargs)
+    def service_stop(self, **kwargs: Unpack[GlobalOptions]):
+        return self.run(["service", "stop"], **kwargs)
 
     def notification_subscribe(
         self, timeout: int | None = None, **kwargs: Unpack[GlobalOptions]
@@ -2435,9 +2500,7 @@ class Lore:
             self.make_dirs(os.path.dirname(file_name))
             write_mode = "w+b" if type(contents) is bytes else "w+"
             with self.open_file(file_name, write_mode) as output_file:
-                if type(contents) is bytes:
-                    output_file.write(contents)
-                elif type(contents) is str:
+                if type(contents) is bytes or type(contents) is str:
                     output_file.write(contents)
                 else:
                     output_file.writelines(contents)
@@ -2525,7 +2588,7 @@ class Lore:
         os.makedirs(self._fix_path(path), exist_ok=True)
 
     def get_id(self):
-        raw_repo_id = bytes()
+        raw_repo_id = b""
         with open(os.path.join(self.dot_path(), "id"), "rb") as id_file:
             raw_repo_id = id_file.read(32)
         processed_repo_id = raw_repo_id.hex()
@@ -2534,7 +2597,7 @@ class Lore:
     def get_name(self):
         return self.name
 
-    def list_paths(self, prefix: Path | None = None) -> typing.List[Path]:
+    def list_paths(self, prefix: Path | None = None) -> list[Path]:
         if prefix is None:
             prefix = Path()
         if prefix == Path(".lore"):
@@ -2641,6 +2704,8 @@ class GlobalOptions(TypedDict, total=False):
     remote: bool
     local: bool
     identity: str
+    identity_token: str
+    access_token: str
     max_connections: int
     file_count_limit: int
     file_size_limit: int

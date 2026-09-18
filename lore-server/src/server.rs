@@ -44,12 +44,14 @@ use lore_storage::hash::StringHash;
 use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
 use lore_telemetry::execution_state::ServerExecutionState;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
+use lore_transport::make_user_agent_with_component;
 use lore_transport::quic::client;
 use lore_transport::quic::client::ClientCerts;
 use lore_transport::quic::client::STREAM_COUNT;
 use lore_transport::quic::client::ServiceClient;
 use lore_transport::quic::storage_service::client::StorageClient;
-use lore_transport::set_user_agent;
+use lore_transport::set_fallback_user_agent_product;
+use lore_transport::user_agent_product;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::resource::ResourceDetector;
 use rustls::server::NoClientAuth;
@@ -66,6 +68,7 @@ use tracing::warn;
 use crate::auth::jwk::JwkServiceImpl;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::local_auth::LocalAuth;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::GrpcInternalServerBuilder;
 use crate::grpc::GrpcServerBuilder;
 use crate::grpc::forwarded_requests::ForwardedRequests;
@@ -176,7 +179,7 @@ pub struct Cli {
 /// lore_server::server::server_main(ServerConfig::default()).unwrap();
 /// ```
 pub fn server_main(config: ServerConfig) -> Result<()> {
-    set_user_agent(format!("lore-server/{}", LORE_LIBRARY_VERSION.as_str()));
+    set_fallback_user_agent_product("lore-server".to_string());
     assume_server_policies();
 
     let cli = Cli::parse();
@@ -416,7 +419,7 @@ async fn launch_quinn_server(
 /// compiled with. Reported through the `ServerInfo` RPC so clients and tests
 /// can detect capabilities that are only present in some builds (for example
 /// `failure_generator`, which enables fault-injection used by smoke tests).
-fn compiled_features() -> Vec<String> {
+pub fn compiled_features() -> Vec<String> {
     let mut features = Vec::new();
     if cfg!(feature = "failure_generator") {
         features.push("failure_generator".to_string());
@@ -438,6 +441,7 @@ async fn launch_grpc_server(
     lock_store: Option<Arc<dyn LockStore>>,
     jwt_verifier: Option<JwtVerifier>,
     local_auth: Option<Arc<LocalAuth>>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     settings: Settings,
     notification_sender: Arc<dyn NotificationSender>,
     notification_service: Option<NotificationService>,
@@ -519,7 +523,7 @@ async fn launch_grpc_server(
             user_agent_filter,
             forwarded_requests,
         )
-        .with_jwt_verifier(jwt_verifier, local_auth)?
+        .with_jwt_verifier(jwt_verifier, local_auth, repository_authorizer)?
         .serve(addr, async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
         })
@@ -584,6 +588,8 @@ async fn launch_grpc_internal_server(
     mutable_store: Arc<dyn MutableStore>,
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
+    jwt_verifier: Option<JwtVerifier>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let grpc_settings = settings
@@ -619,6 +625,8 @@ async fn launch_grpc_internal_server(
             notification_sender,
             hook_dispatcher,
             settings.environment.clone().unwrap_or_default(),
+            jwt_verifier,
+            repository_authorizer,
         )?
         .with_tls_config(cert_path, key_path, cert_chain_path)?
         .with_http2_config(
@@ -670,6 +678,7 @@ async fn launch_http_server(
     mutable_store: Arc<dyn MutableStore>,
     jwt_verifier: Option<JwtVerifier>,
     local_auth: Option<Arc<LocalAuth>>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     LoreHttpServer::serve(
@@ -678,6 +687,7 @@ async fn launch_http_server(
         mutable_store,
         jwt_verifier,
         local_auth,
+        repository_authorizer,
         async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
         },
@@ -741,6 +751,7 @@ impl QuicPublicStreamHandler {
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
         jwt_verifier: Option<JwtVerifier>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         limits: AdmissionLimits,
         user_agent_filter: Arc<UserAgentFilter>,
     ) -> Self {
@@ -750,10 +761,12 @@ impl QuicPublicStreamHandler {
             |immutable_store: Arc<dyn ImmutableStore>,
              local_store: Arc<dyn ImmutableStore>,
              mutable_store: Arc<dyn MutableStore>,
-             jwt_verifier: Option<JwtVerifier>| {
+             jwt_verifier: Option<JwtVerifier>,
+             repository_authorizer: Arc<dyn RepositoryAuthorizer>| {
                 Box::new(move |context: Arc<AttributeMap>| {
                     let storage_protocol = StorageService::new(
                         Arc::new(jwt_verifier.clone()),
+                        repository_authorizer.clone(),
                         immutable_store.clone(),
                         local_store.clone(),
                         mutable_store.clone(),
@@ -773,6 +786,7 @@ impl QuicPublicStreamHandler {
                 local_store.clone(),
                 mutable_store.clone(),
                 jwt_verifier.clone(),
+                repository_authorizer.clone(),
             ),
         );
         {
@@ -780,12 +794,14 @@ impl QuicPublicStreamHandler {
             let local_store = local_store.clone();
             let mutable_store = mutable_store.clone();
             let jwt_verifier = jwt_verifier.clone();
+            let repository_authorizer = repository_authorizer.clone();
             let user_agent_filter = user_agent_filter.clone();
             service_store.add_service(
                 StorageClient::ALPN,
                 Box::new(move |context: Arc<AttributeMap>| {
                     let v4_service = crate::quic::storage_service_v4::StorageServiceV4::new(
                         Arc::new(jwt_verifier.clone()),
+                        repository_authorizer.clone(),
                         immutable_store.clone(),
                         local_store.clone(),
                         mutable_store.clone(),
@@ -1242,6 +1258,10 @@ async fn configure_replicated_immutable_store(
     if let Some(expected_rtt_ms) = settings.expected_rtt_ms {
         factory.transport_config.expected_rtt_ms = expected_rtt_ms;
     }
+    factory.user_agent = Some(make_user_agent_with_component(
+        user_agent_product(),
+        "replicated-immutable-store",
+    ));
 
     let container_config = ClientContainerConfig {
         regenerate_retry_policy: (&settings.regenerate_retry).into(),
@@ -1438,6 +1458,7 @@ async fn configure_composite_substore(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn configure_notification(
     endpoints: &mut JoinSet<Result<()>>,
     registry: &PluginRegistry,
@@ -1445,6 +1466,8 @@ async fn configure_notification(
     notification_settings: &Option<NotificationSettings>,
     immutable_store: Option<&Arc<dyn ImmutableStore>>,
     plugins: &HashMap<String, toml::Value>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    authorization_timeout: Duration,
 ) -> Result<(Arc<dyn NotificationSender>, Option<NotificationService>)> {
     let mode = notification_settings
         .as_ref()
@@ -1453,7 +1476,14 @@ async fn configure_notification(
         "local" => {
             info!("Starting local notification service");
             let sender = Arc::new(crate::notification::local::NotificationSender::default());
-            Ok((sender.clone(), Some(NotificationService::new(sender))))
+            Ok((
+                sender.clone(),
+                Some(NotificationService::new(
+                    sender,
+                    repository_authorizer,
+                    authorization_timeout,
+                )),
+            ))
         }
         plugin_name => {
             info!(plugin_name = plugin_name, "Creating notification plugin");
@@ -1872,11 +1902,23 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     jwk_service: Arc::new(jwk_service),
                     jwt_issuer: auth.jwt_issuer.clone(),
                     jwt_audience: auth.jwt_audience.clone(),
+                    identity_claim: auth.identity_claim.clone(),
                 })
             }
             None => None,
         }
     };
+
+    // One shared authorizer, selected by the configuration (D8's four-way
+    // flowchart), threaded into the gRPC, QUIC and HTTP servers.
+    let repository_authorizer = crate::authnz::repository_authorizer::repository_authorizer(
+        settings.server.auth.as_ref(),
+        settings
+            .environment
+            .as_ref()
+            .and_then(|environment| environment.endpoint.as_ref())
+            .and_then(|endpoint| endpoint.auth_url.clone()),
+    )?;
 
     let forwarded_requests: Option<Arc<dyn ForwardedRequests>> =
         if let Some(forwarded_requests_settings) =
@@ -1899,6 +1941,17 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     });
 
     if !is_maintenance {
+        // The subscribe authorization check runs under the same handler
+        // timeout as the gRPC endpoint the service registers on. Without a
+        // gRPC endpoint the service is unreachable and the fallback (the
+        // config default) is moot.
+        let notification_authorization_timeout = Duration::from_secs(
+            settings
+                .server
+                .grpc
+                .as_ref()
+                .map_or(50, |grpc| grpc.request_handler_timeout_seconds),
+        );
         let (notification, notification_service) = configure_notification(
             &mut endpoints,
             &plugin_registry,
@@ -1906,6 +1959,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             &settings.notification,
             local_store().as_ref(),
             &settings.plugins,
+            repository_authorizer.clone(),
+            notification_authorization_timeout,
         )
         .await?;
 
@@ -1931,6 +1986,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let lock_store = lock_store.clone();
             let jwt_verifier = jwt_verifier.clone();
             let local_auth = local_auth.clone();
+            let repository_authorizer = repository_authorizer.clone();
             let settings = settings.clone();
             let notification = notification.clone();
             let user_agent_filter = user_agent_filter.clone();
@@ -1949,6 +2005,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 lock_store,
                 jwt_verifier,
                 local_auth,
+                repository_authorizer,
                 settings,
                 notification,
                 notification_service,
@@ -1981,6 +2038,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 let mutable_store = mutable_store.clone();
                 let notification_sender = notification.clone();
                 let hook_dispatcher = hook_dispatcher.clone();
+                let jwt_verifier = jwt_verifier.clone();
+                let repository_authorizer = repository_authorizer.clone();
                 let shutdown_rx = _shutdown_rx.clone();
                 launch_grpc_internal_server(
                     settings,
@@ -1989,6 +2048,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     mutable_store,
                     notification_sender,
                     hook_dispatcher,
+                    jwt_verifier,
+                    repository_authorizer,
                     shutdown_rx,
                 )
             });
@@ -2029,6 +2090,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let mutable_store = mutable_store.clone();
             let settings = settings.clone();
             let jwt_verifier = jwt_verifier.clone();
+            let repository_authorizer = repository_authorizer.clone();
             let user_agent_filter = user_agent_filter.clone();
             let shutdown_rx = _shutdown_rx.clone();
 
@@ -2070,6 +2132,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     local_immutable_store,
                     mutable_store,
                     jwt_verifier,
+                    repository_authorizer,
                     limits,
                     user_agent_filter,
                 )),
@@ -2173,6 +2236,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     mutable_store,
                     jwt_verifier,
                     local_auth,
+                    repository_authorizer,
                     shutdown_rx,
                 )
             );

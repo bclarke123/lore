@@ -26,6 +26,7 @@ mod storage_remote_tests {
     use lore_revision::interface::LoreEventCallback;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
+    use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use lore_server::grpc::server::FeatureSettings;
     use lore_server::grpc::server::GrpcServerBuilder;
     use lore_server::hooks::HookDispatcher;
@@ -365,7 +366,7 @@ mod storage_remote_tests {
                     Default::default(),
                     None,
                 )
-                .with_jwt_verifier(None)
+                .with_jwt_verifier(None, Arc::new(AllowAllRepositoryAuthorizer))
                 .unwrap()
                 .serve_with_listener(listener, async {
                     shutdown_rx.await.ok();
@@ -986,6 +987,309 @@ mod storage_remote_tests {
                     );
 
                     close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// What an item delivering into its own buffer reported: whether any `GET_DATA` arrived, the
+    /// content size the header carried, and the code the item completed with.
+    #[derive(Clone, Copy, Default)]
+    struct DataOutOutcome {
+        data_events: usize,
+        size_content: Option<u64>,
+        code: Option<lore_revision::event::LoreErrorCode>,
+    }
+
+    fn data_out_sink() -> (Arc<Mutex<DataOutOutcome>>, LoreEventCallback) {
+        let outcome: Arc<Mutex<DataOutOutcome>> = Arc::new(Mutex::new(DataOutOutcome::default()));
+        let outcome_for_cb = outcome.clone();
+        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+            let mut outcome = outcome_for_cb.lock().unwrap();
+            match event {
+                LoreEvent::StorageGetData(_) => outcome.data_events += 1,
+                LoreEvent::StorageGetHeader(d) => outcome.size_content = Some(d.size_content),
+                LoreEvent::StorageGetItemComplete(d) => outcome.code = Some(d.error_code),
+                _ => {}
+            }
+        }));
+        (outcome, callback)
+    }
+
+    /// A payload only the remote holds reaches the caller's buffer, and no `GET_DATA` is emitted
+    /// for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_data_out_fills_the_buffer_from_remote_on_local_miss() -> TestResult {
+        use bytes::Bytes;
+        use lore::storage::get;
+        use lore::storage::get::LoreStorageGetArgs;
+        use lore::storage::get::LoreStorageGetItem;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Fragment;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreBytesMut;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-get-data-out".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+
+                    let content = b"remote payload landing in the caller's buffer".to_vec();
+                    let payload = Bytes::from(content.clone());
+                    let partition = Partition::from([0xc1u8; 16]);
+                    let address = Address {
+                        hash: lore_storage::hash_slice(payload.as_ref()),
+                        context: Context::default(),
+                    };
+                    server
+                        .backend_immutable
+                        .clone()
+                        .put(
+                            partition,
+                            address,
+                            Fragment {
+                                flags: 0,
+                                size_payload: payload.len() as u32,
+                                size_content: payload.len() as u64,
+                            },
+                            Some(payload),
+                            false,
+                        )
+                        .await
+                        .expect("seed server with payload");
+
+                    let handle_id = open_remote_handle(&server).await;
+                    let mut buffer = vec![0u8; content.len()];
+                    let (outcome, callback) = data_out_sink();
+                    let status = get::get(
+                        LoreGlobalArgs::default(),
+                        LoreStorageGetArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id },
+                            items: LoreArray::from_vec(vec![LoreStorageGetItem {
+                                id: 11,
+                                partition,
+                                address,
+                                data_out: LoreBytesMut {
+                                    ptr: buffer.as_mut_ptr().cast(),
+                                    len: buffer.len(),
+                                },
+                                ..Default::default()
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(status, 0, "get must succeed against a remote-only address");
+
+                    let outcome = *outcome.lock().unwrap();
+                    assert_eq!(outcome.code, Some(LoreErrorCode::None));
+                    assert_eq!(outcome.data_events, 0, "no GET_DATA may be emitted");
+                    assert_eq!(outcome.size_content, Some(content.len() as u64));
+                    assert_eq!(buffer, content, "the buffer must hold the remote content");
+
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// A compressed payload only the remote holds expands into the caller's buffer rather than
+    /// into a buffer of its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_data_out_expands_a_compressed_remote_payload() -> TestResult {
+        use lore::storage::get;
+        use lore::storage::get::LoreStorageGetArgs;
+        use lore::storage::get::LoreStorageGetItem;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Fragment;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreBytesMut;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-get-data-out-lz4".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+
+                    let content: Vec<u8> = (0..4096).map(|index| (index / 64) as u8).collect();
+                    let plain = Fragment {
+                        flags: 0,
+                        size_payload: content.len() as u32,
+                        size_content: content.len() as u64,
+                    };
+                    let (fragment, payload) = lore_storage::compress::compress(
+                        plain,
+                        &content,
+                        lore_storage::CompressionMode::Lz4,
+                    )
+                    .expect("compress seed content");
+                    assert!(
+                        (payload.len() as u64) < fragment.size_content,
+                        "seed must compress to fewer bytes than it expands to",
+                    );
+
+                    let partition = Partition::from([0xc2u8; 16]);
+                    let address = Address {
+                        hash: lore_storage::hash_slice(&content),
+                        context: Context::default(),
+                    };
+                    server
+                        .backend_immutable
+                        .clone()
+                        .put(partition, address, fragment, Some(payload), false)
+                        .await
+                        .expect("seed server with compressed payload");
+
+                    let handle_id = open_remote_handle(&server).await;
+                    let mut buffer = vec![0u8; content.len()];
+                    let (outcome, callback) = data_out_sink();
+                    let status = get::get(
+                        LoreGlobalArgs::default(),
+                        LoreStorageGetArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id },
+                            items: LoreArray::from_vec(vec![LoreStorageGetItem {
+                                id: 12,
+                                partition,
+                                address,
+                                data_out: LoreBytesMut {
+                                    ptr: buffer.as_mut_ptr().cast(),
+                                    len: buffer.len(),
+                                },
+                                ..Default::default()
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(
+                        status, 0,
+                        "get must succeed against a compressed remote address"
+                    );
+
+                    let outcome = *outcome.lock().unwrap();
+                    assert_eq!(outcome.code, Some(LoreErrorCode::None));
+                    assert_eq!(outcome.data_events, 0, "no GET_DATA may be emitted");
+                    assert_eq!(outcome.size_content, Some(content.len() as u64));
+                    assert_eq!(buffer, content, "the buffer must hold the expanded content");
+
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// Content the remote holds as a list of fragments is written into the caller's buffer leaf by
+    /// leaf, with no buffer holding the whole of it on the way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_resolved_data_out_assembles_remote_fragments_into_the_buffer() -> TestResult {
+        use lore::storage::get_resolved;
+        use lore::storage::get_resolved::LoreStorageGetResolvedArgs;
+        use lore::storage::get_resolved::LoreStorageGetResolvedItem;
+        use lore::storage::put_resolved;
+        use lore::storage::put_resolved::LoreStoragePutResolvedArgs;
+        use lore::storage::put_resolved::LoreStoragePutResolvedItem;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreBytes;
+        use lore_revision::event::LoreBytesMut;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-resolved-data-out".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = Partition::from([0xc3u8; 16]);
+                    let key = Hash::hash_buffer(b"fragmented-into-caller-buffer");
+                    let content: Vec<u8> = (0..(512 * 1024u32))
+                        .map(|index| (index % 251) as u8)
+                        .collect();
+
+                    let writer = open_remote_handle(&server).await;
+                    let put_codes: Arc<Mutex<Vec<LoreErrorCode>>> =
+                        Arc::new(Mutex::new(Vec::new()));
+                    let put_cb = put_codes.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
+                        if let LoreEvent::StoragePutItemComplete(d) = e {
+                            put_cb.lock().unwrap().push(d.error_code);
+                        }
+                    }));
+                    put_resolved::put_resolved(
+                        LoreGlobalArgs::default(),
+                        LoreStoragePutResolvedArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id: writer },
+                            items: LoreArray::from_vec(vec![LoreStoragePutResolvedItem {
+                                id: 1,
+                                partition,
+                                key,
+                                context: Context::default(),
+                                data: LoreBytes {
+                                    ptr: content.as_ptr().cast(),
+                                    len: content.len(),
+                                },
+                                remote_write: 1,
+                                local_cache: 0,
+                                fixed_size_chunk: 64 * 1024,
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(put_codes.lock().unwrap().clone(), vec![LoreErrorCode::None]);
+                    close_handle(writer).await;
+
+                    // A fresh handle so the content is reached across the wire rather than out of
+                    // the writer's own store.
+                    let reader = open_remote_handle(&server).await;
+                    let mut buffer = vec![0u8; content.len()];
+                    let (outcome, callback) = data_out_sink();
+                    let status = get_resolved::get_resolved(
+                        LoreGlobalArgs::default(),
+                        LoreStorageGetResolvedArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id: reader },
+                            items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                                data_out: LoreBytesMut {
+                                    ptr: buffer.as_mut_ptr().cast(),
+                                    len: buffer.len(),
+                                },
+                                id: 13,
+                                partition,
+                                key,
+                                context: Context::default(),
+                                local_cache: 0,
+                                streaming: 0,
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(
+                        status, 0,
+                        "get_resolved must succeed against remote content"
+                    );
+
+                    let outcome = *outcome.lock().unwrap();
+                    assert_eq!(outcome.code, Some(LoreErrorCode::None));
+                    assert_eq!(outcome.data_events, 0, "no GET_DATA may be emitted");
+                    assert_eq!(outcome.size_content, Some(content.len() as u64));
+                    assert_eq!(
+                        buffer, content,
+                        "the buffer must hold the assembled content"
+                    );
+
+                    close_handle(reader).await;
                 }
                 Ok(())
             })
@@ -1782,10 +2086,9 @@ mod storage_remote_tests {
             .await
     }
 
-    async fn upload_one_item(
+    async fn upload_items(
         handle_id: u64,
-        partition: lore_base::types::Partition,
-        address: lore_base::types::Address,
+        items: Vec<lore::storage::upload::LoreStorageUploadItem>,
     ) -> (
         i32,
         Vec<(
@@ -1797,7 +2100,6 @@ mod storage_remote_tests {
     ) {
         use lore::storage::upload;
         use lore::storage::upload::LoreStorageUploadArgs;
-        use lore::storage::upload::LoreStorageUploadItem;
         use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
@@ -1819,17 +2121,112 @@ mod storage_remote_tests {
             LoreGlobalArgs::default(),
             LoreStorageUploadArgs {
                 handle: lore::storage::handle::LoreStore { handle_id },
-                items: LoreArray::from_vec(vec![LoreStorageUploadItem {
-                    id: 51,
-                    partition,
-                    address,
-                }]),
+                items: LoreArray::from_vec(items),
             },
             callback,
         )
         .await;
         let events = captured.lock().unwrap().clone();
         (status, events)
+    }
+
+    async fn upload_one_item(
+        handle_id: u64,
+        partition: lore_base::types::Partition,
+        address: lore_base::types::Address,
+    ) -> (
+        i32,
+        Vec<(
+            u64,
+            lore_base::types::Address,
+            u8,
+            lore_revision::event::LoreErrorCode,
+        )>,
+    ) {
+        upload_items(
+            handle_id,
+            vec![lore::storage::upload::LoreStorageUploadItem {
+                id: 51,
+                partition,
+                address,
+            }],
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upload_batch_reports_each_item_independently() -> TestResult {
+        use lore::storage::upload::LoreStorageUploadItem;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+        use lore_storage::immutable_store::query_one;
+        use lore_storage::store_types::StoreMatch;
+
+        let execution = setup_execution("storage-remote-upload-batch".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = Partition::from([0xa9u8; 16]);
+                    let handle_id = open_remote_handle(&server).await;
+
+                    let payload = b"batched upload payload".to_vec();
+                    let stored =
+                        put_local_via_handle(handle_id, partition, payload.as_slice()).await;
+                    let absent = Address {
+                        hash: Hash::from([0xfbu8; 32]),
+                        context: Context::default(),
+                    };
+
+                    let (status, mut events) = upload_items(
+                        handle_id,
+                        vec![
+                            LoreStorageUploadItem {
+                                id: 1,
+                                partition,
+                                address: stored,
+                            },
+                            LoreStorageUploadItem {
+                                id: 2,
+                                partition,
+                                address: absent,
+                            },
+                        ],
+                    )
+                    .await;
+                    assert_ne!(status, 0, "the absent address fails the call");
+
+                    // Items resolve concurrently, so the events are not in the request order.
+                    events.sort_by_key(|(id, _, _, _)| *id);
+                    assert_eq!(events.len(), 2, "one terminal event per item");
+                    assert_eq!(
+                        (events[0].2, events[0].3),
+                        (0, LoreErrorCode::None),
+                        "the local-only payload uploads",
+                    );
+                    assert_eq!(
+                        (events[1].2, events[1].3),
+                        (0, LoreErrorCode::AddressNotFound),
+                        "the absent address reports its own miss",
+                    );
+
+                    let on_server = query_one(&server.backend_immutable.clone(), partition, stored)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        on_server.match_made,
+                        StoreMatch::MatchFull,
+                        "the uploaded item must reach the server despite its neighbour failing",
+                    );
+
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2713,6 +3110,87 @@ mod storage_remote_tests {
                     let events = captured.lock().unwrap().clone();
                     assert_eq!(events.len(), 1);
                     assert_eq!(events[0].1, LoreErrorCode::AddressNotFound);
+
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bound_remote_get_metadata_still_checks_arguments() -> TestResult {
+        use lore::storage::get_metadata;
+        use lore::storage::get_metadata::LoreStorageGetMetadataArgs;
+        use lore::storage::get_metadata::LoreStorageGetMetadataItem;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-bound-remote-getmd-args".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let bound = LoreGlobalArgs {
+                        remote: 1,
+                        ..Default::default()
+                    };
+                    let handle_id = open_remote_handle_with_globals(&server, bound).await;
+
+                    let captured: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> =
+                        Arc::new(Mutex::new(Vec::new()));
+                    let captured_for_cb = captured.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                        if let LoreEvent::StorageGetMetadataItemComplete(data) = event {
+                            captured_for_cb
+                                .lock()
+                                .unwrap()
+                                .push((data.id, data.error_code));
+                        }
+                    }));
+                    let status = get_metadata::get_metadata(
+                        LoreGlobalArgs::default(),
+                        LoreStorageGetMetadataArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id },
+                            items: LoreArray::from_vec(vec![
+                                LoreStorageGetMetadataItem {
+                                    id: 1,
+                                    partition: Partition::default(),
+                                    address: Address {
+                                        hash: Hash::from([0x5au8; 32]),
+                                        context: Context::default(),
+                                    },
+                                },
+                                LoreStorageGetMetadataItem {
+                                    id: 2,
+                                    partition: Partition::from([0xcbu8; 16]),
+                                    address: Address {
+                                        hash: Hash::default(),
+                                        context: Context::default(),
+                                    },
+                                },
+                            ]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_ne!(status, 0, "the zero partition fails the call");
+
+                    let mut events = captured.lock().unwrap().clone();
+                    events.sort_by_key(|(id, _)| *id);
+                    assert_eq!(
+                        events,
+                        vec![
+                            (1, LoreErrorCode::InvalidArguments),
+                            (2, LoreErrorCode::None),
+                        ],
+                        "a remote-bound handle answers the argument checks as a local one does, \
+                         without reaching the wire",
+                    );
 
                     close_handle(handle_id).await;
                 }
@@ -3613,6 +4091,7 @@ mod storage_remote_tests {
 
                 let items = vec![
                     LoreStorageGetResolvedItem {
+                        data_out: Default::default(),
                         id: 1,
                         partition,
                         key: missing,
@@ -3621,6 +4100,7 @@ mod storage_remote_tests {
                         streaming: 0,
                     },
                     LoreStorageGetResolvedItem {
+                        data_out: Default::default(),
                         id: 2,
                         partition,
                         key: present,
@@ -3679,6 +4159,7 @@ mod storage_remote_tests {
                     LoreStorageGetResolvedArgs {
                         handle: lore::storage::handle::LoreStore { handle_id },
                         items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                        data_out: Default::default(),
                             id: 3,
                             partition,
                             key: present,
@@ -3833,6 +4314,7 @@ mod storage_remote_tests {
                                 handle_id: reader_handle,
                             },
                             items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                                data_out: Default::default(),
                                 id: 2,
                                 partition,
                                 key,
@@ -3943,6 +4425,7 @@ mod storage_remote_tests {
                             LoreStorageGetResolvedArgs {
                                 handle: lore::storage::handle::LoreStore { handle_id },
                                 items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                                    data_out: Default::default(),
                                     id: 2,
                                     partition,
                                     key,
@@ -4135,6 +4618,7 @@ mod storage_remote_tests {
 
                     let items = vec![
                         LoreStorageGetResolvedItem {
+                            data_out: Default::default(),
                             id: 1,
                             partition,
                             key: cached_key,
@@ -4143,6 +4627,7 @@ mod storage_remote_tests {
                             streaming: 0,
                         },
                         LoreStorageGetResolvedItem {
+                            data_out: Default::default(),
                             id: 2,
                             partition,
                             key: uncached_key,
@@ -4296,6 +4781,7 @@ mod storage_remote_tests {
                         LoreStorageGetResolvedArgs {
                             handle: lore::storage::handle::LoreStore { handle_id: reader },
                             items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                                data_out: Default::default(),
                                 id: 9,
                                 partition,
                                 key: keys[1],
@@ -4617,6 +5103,7 @@ mod storage_remote_tests {
                         LoreStorageGetResolvedArgs {
                             handle: lore::storage::handle::LoreStore { handle_id: reader },
                             items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                                data_out: Default::default(),
                                 id: 2,
                                 partition,
                                 key,
@@ -4734,6 +5221,7 @@ mod storage_remote_tests {
                         LoreStorageGetResolvedArgs {
                             handle: lore::storage::handle::LoreStore { handle_id: reader },
                             items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                                data_out: Default::default(),
                                 id: 2,
                                 partition,
                                 key,
@@ -6106,6 +6594,59 @@ mod storage_remote_tests {
     /// `RemoteImmutableStore::get_metadata` maps `NotFound` to `MatchNone`. The miss is
     /// dispatched first for the same reason as in the Get case.
     #[tokio::test]
+    async fn get_metadata_single_remote_item_resolves_without_spawning() -> TestResult {
+        use bytes::Bytes;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+
+        let execution = setup_execution("storage-remote-get-metadata-single".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let partition = Partition::from([0xc3u8; 16]);
+                let payload = Bytes::from_static(b"single remote metadata payload");
+                // Seeded on the server only, so the local probe misses and the item takes the
+                // remote leg — the one part of this op that a batch of several would spawn.
+                let address = seed_server(&server, partition, &payload).await;
+                let handle_id = open_remote_handle(&server).await;
+
+                let outcome: Arc<Mutex<Option<(LoreErrorCode, u32)>>> = Arc::new(Mutex::new(None));
+                let outcome_for_cb = outcome.clone();
+                let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                    if let LoreEvent::StorageGetMetadataItemComplete(data) = event {
+                        *outcome_for_cb.lock().unwrap() =
+                            Some((data.error_code, data.fragment.size_payload));
+                    }
+                }));
+
+                let status = lore::storage::get_metadata::get_metadata(
+                    LoreGlobalArgs::default(),
+                    lore::storage::get_metadata::LoreStorageGetMetadataArgs {
+                        handle: lore::storage::handle::LoreStore { handle_id },
+                        items: lore_revision::interface::LoreArray::from_vec(vec![
+                            lore::storage::get_metadata::LoreStorageGetMetadataItem {
+                                id: 1,
+                                partition,
+                                address,
+                            },
+                        ]),
+                    },
+                    callback,
+                )
+                .await;
+                assert_eq!(status, 0, "a server-held address must resolve");
+
+                let (code, size_payload) = outcome.lock().unwrap().expect("terminal event missing");
+                assert_eq!(code, LoreErrorCode::None);
+                assert!(size_payload > 0, "the wire fetch must carry the fragment");
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn get_metadata_batch_survives_missing_address() -> TestResult {
         use bytes::Bytes;
         use lore_base::types::Address;

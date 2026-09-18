@@ -394,6 +394,7 @@ mod tests {
         let (immutable, mutable, execution) = test_store_create().await.expect("test stores");
         // Verifier is unused by the store-level tests; any instance works.
         let verifier = JwtVerifier {
+            identity_claim: crate::auth::jwt::DEFAULT_IDENTITY_CLAIM.to_string(),
             jwk_service: Arc::new(crate::auth::jwk::JwkServiceImpl::default()),
             jwt_issuer: None,
             jwt_audience: None,
@@ -421,6 +422,7 @@ mod tests {
         let (immutable, mutable_old, execution) = test_store_create().await.expect("test stores");
         let (_imm2, mutable_new, _exec2) = test_store_create().await.expect("fresh stores");
         let verifier = || JwtVerifier {
+            identity_claim: crate::auth::jwt::DEFAULT_IDENTITY_CLAIM.to_string(),
             jwk_service: Arc::new(crate::auth::jwk::JwkServiceImpl::default()),
             jwt_issuer: None,
             jwt_audience: None,

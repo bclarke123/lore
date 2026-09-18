@@ -4,7 +4,7 @@ The `lore` command-line client drives every local and remote Lore operation: cre
 
 This page documents the command surface only. For a guided first run, see the [Quickstart](../tutorials/quickstart.md); to install the client, see [Install the Lore CLI](../how-to/install-lore-cli.md).
 
-This page is generated from `lore --markdown-help` (CLI `0.9.1-nightly+803`). Everything below the marker is generated — change the CLI, not this section. To regenerate in place (preserving this header), run from the repository root:
+This page is generated from `lore --markdown-help` (CLI `0.9.1-nightly+1031`). Everything below the marker is generated — change the CLI, not this section. To regenerate in place (preserving this header), run from the repository root:
 
 ```bash
 printf '%s\n' "$( { sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-commands.md; lore --markdown-help | tail -n +4; } )" > docs/reference/.cli.tmp && mv docs/reference/.cli.tmp docs/reference/lore-cli-commands.md
@@ -164,6 +164,8 @@ printf '%s\n' "$( { sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-comma
 * [`lore service run`↴](#lore-service-run)
 * [`lore service start`↴](#lore-service-start)
 * [`lore service stop`↴](#lore-service-stop)
+* [`lore service set-executable`↴](#lore-service-set-executable)
+* [`lore service set-use-automatically`↴](#lore-service-set-use-automatically)
 * [`lore notification`↴](#lore-notification)
 * [`lore notification subscribe`↴](#lore-notification-subscribe)
 * [`lore completions`↴](#lore-completions)
@@ -398,7 +400,7 @@ Delete a repository
 
 ###### **Arguments:**
 
-* `<url>` — URL of repository
+* `<url>` — URL of repository, or a bare name or ID resolved against this repository's remote
 
 
 
@@ -1165,7 +1167,7 @@ Synchronize to a given state of a repository
 
 ###### **Arguments:**
 
-* `<revision>` — Revision hash signature to synchronize to. Can be a signature on any branch — if the target revision is on a different branch, the current branch is updated accordingly. Can be a partial hash signature
+* `<revision>` — Revision to synchronize to: a whole hash signature, `[branch]@<number>`, `[branch]@LATEST`, or `<branch>@<hash>`. The `@` is optional, a target given without it applying to the branch you are on. A revision identifies the branch it was created on, and syncing moves onto that branch. A branch point can also identify the child branch by naming that child branch
 
 ###### **Options:**
 
@@ -2018,7 +2020,8 @@ Display identity information for the current user or specified user IDs
 
 ###### **Options:**
 
-* `--with-token` — Include cached tokens in the output
+* `--with-identity-token` — Include cached identity tokens in the output
+* `--with-access-token` — Include the current repository's access token in the output
 
 
 
@@ -2543,7 +2546,7 @@ Synchronize to a repository state
 
 ###### **Arguments:**
 
-* `<revision>` — Revision hash signature to synchronize to. Can be a signature on any branch — if the target revision is on a different branch, the current branch is updated accordingly. Can be a partial hash signature
+* `<revision>` — Revision to synchronize to: a whole hash signature, `[branch]@<number>`, `[branch]@LATEST`, or `<branch>@<hash>`. The `@` is optional, a target given without it applying to the branch you are on. A revision identifies the branch it was created on, and syncing moves onto that branch. A branch point can also identify the child branch by naming that child branch
 
 ###### **Options:**
 
@@ -2661,8 +2664,10 @@ Manage the repository in a service process
 ###### **Subcommands:**
 
 * `run` — Run this process as the service
-* `start` — Start service for a repository
-* `stop` — Stop service for a repository
+* `start` — Start the service, unless one is already running
+* `stop` — Stop the running service
+* `set-executable` — Set which executable is started as the service
+* `set-use-automatically` — Set whether commands are carried out by the service
 
 
 
@@ -2676,7 +2681,7 @@ Run this process as the service
 
 ## `lore service start`
 
-Start service for a repository
+Start the service, unless one is already running
 
 **Usage:** `lore service start`
 
@@ -2684,13 +2689,35 @@ Start service for a repository
 
 ## `lore service stop`
 
-Stop service for a repository
+Stop the running service
 
-**Usage:** `lore service stop [all]`
+**Usage:** `lore service stop`
+
+
+
+## `lore service set-executable`
+
+Set which executable is started as the service
+
+**Usage:** `lore service set-executable [path]`
 
 ###### **Arguments:**
 
-* `<all>` — Flag to stop servicing all repositories
+* `<path>` — Path of the executable to start as the service. Leave empty to clear it
+
+
+
+## `lore service set-use-automatically`
+
+Set whether commands are carried out by the service
+
+**Usage:** `lore service set-use-automatically <enabled>`
+
+###### **Arguments:**
+
+* `<enabled>` — Whether to carry commands out in the service
+
+   `Set` rather than the default a `bool` field is given: this reads a value rather than being present or absent, and clap refuses a positional whose action takes none.
 
   Possible values: `true`, `false`
 

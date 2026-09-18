@@ -701,11 +701,6 @@ mod tests {
             .verify_token(&exchanged.user_token)
             .await
             .expect("verify");
-        crate::auth::jwt::verify_authorization(
-            &claims,
-            lore_revision::lore::RepositoryId::default(),
-        )
-        .expect("authorized");
         let resources = claims.resources.expect("resources claim");
         assert_eq!(resources.len(), 1);
         assert_eq!(resources[0].resource_id, resource);

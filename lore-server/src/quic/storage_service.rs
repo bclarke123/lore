@@ -30,6 +30,7 @@ use tracing::info_span;
 
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
@@ -260,7 +261,7 @@ fn request_identifiers_from_context(
     let correlation_id =
         correlation_id.map_or_else(|| NO_CORRELATION_ID.to_string(), |id| id.to_string());
     let user_id = authorization_token
-        .map(|token| token.user_id.clone())
+        .map(|token| token.identity().to_string())
         .filter(|user_id| !user_id.is_empty())
         .unwrap_or_else(|| NO_USER_ID.to_string());
     (
@@ -439,6 +440,7 @@ pub fn is_internal_error(error: &MessageHandleError) -> bool {
 
 pub struct StorageService {
     jwt_verifier: Arc<Option<JwtVerifier>>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
@@ -447,12 +449,14 @@ pub struct StorageService {
 impl StorageService {
     pub fn new(
         jwt_verifier: Arc<Option<JwtVerifier>>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
     ) -> Self {
         Self {
             jwt_verifier,
+            repository_authorizer,
             immutable_store,
             local_store,
             mutable_store,
@@ -486,7 +490,11 @@ impl QuicService for StorageService {
         let lore_response = match request {
             ParsedStorageRequest::Connect(request) => {
                 request
-                    .handle_auth(context, self.jwt_verifier.clone())
+                    .handle_auth(
+                        context,
+                        self.jwt_verifier.clone(),
+                        self.repository_authorizer.clone(),
+                    )
                     .await
             }
             ParsedStorageRequest::MutableLoad(_)
@@ -497,9 +505,23 @@ impl QuicService for StorageService {
                     .await
             }
             ParsedStorageRequest::Verify(verify) => {
-                verify.handle(context, self.local_store.clone()).await
+                verify
+                    .handle(
+                        context,
+                        self.local_store.clone(),
+                        self.repository_authorizer.clone(),
+                    )
+                    .await
             }
-            other => other.handle(context, self.immutable_store.clone()).await,
+            other => {
+                other
+                    .handle(
+                        context,
+                        self.immutable_store.clone(),
+                        self.repository_authorizer.clone(),
+                    )
+                    .await
+            }
         }?;
 
         Ok(lore_response.data())

@@ -12,6 +12,8 @@ use crate::event;
 use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
 use crate::fs::filesystem_provider::FilesystemDiffTree;
+use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreFileAction;
 use crate::link::LoreLinkChangeEventData;
@@ -26,6 +28,7 @@ use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::stage;
 use crate::state;
+use crate::state::NodeMapping;
 use crate::state::State;
 use crate::util::path::RelativePath;
 
@@ -44,20 +47,19 @@ pub async fn remove(
 
     // Resolve through any parent links so mutations target the owning repo.
     let chain = crate::link::resolve_link_chain(
-        repository.clone(),
-        state_staged.clone(),
+        NodeMapping::root(repository.clone(), state_staged.clone()),
         state_current.clone(),
         link_path.clone(),
         parent_branch,
     )
     .await?;
-    let inner_repository = chain.innermost_repository.clone();
-    let inner_state = chain.innermost_state.clone();
+    let inner_repository = chain.innermost.repository.clone();
+    let inner_state = chain.innermost.state.clone();
 
     let node_link = inner_state
         .find_relative_node_link(
             inner_repository.clone(),
-            chain.innermost_base_node,
+            chain.innermost.node,
             chain.remainder_path.as_str(),
         )
         .await
@@ -86,28 +88,25 @@ pub async fn remove(
     let link_id: RepositoryId = link_node.address.context.into();
     let is_staged_add = link_node.is_staged_add();
 
-    if !execution_context().globals().force() {
-        verify_no_local_changes_under_link(
-            repository.clone(),
-            state_current.clone(),
-            state_staged.clone(),
-            &link_path,
-        )
-        .await?;
-    }
+    // One operation covers the removal: the working tree read to find local changes is the one
+    // the mount is then deleted from.
+    with_operation(repository.file_system(), true, async |operation| {
+        if !execution_context().globals().force() {
+            verify_no_local_changes_under_link(
+                &operation,
+                repository.clone(),
+                state_current.clone(),
+                state_staged.clone(),
+                &link_path,
+            )
+            .await?;
+        }
 
-    // On-disk path is the full link path regardless of nesting.
-    let absolute_path = link_path.to_absolute_path(repository.require_path()?);
-    crate::util::fs::unlink_recursive(absolute_path.as_path())
-        .await
-        .internal_with(|| format!("Failed to delete directory {}", absolute_path.display()))?;
+        remove_link_mount(&operation, &link_path, is_staged_add).await
+    })
+    .await?;
 
     if is_staged_add {
-        // Recreate the empty directory so it appears as an unstaged change
-        let _ = lore_io::IoDriver::global()
-            .create_dir_all(absolute_path.as_path())
-            .await;
-
         // Link was added but never committed — discard the node from the staged tree
         lore_debug!("Link node was staged for add, discarding instead of staging delete");
         state::node_discard_patch(
@@ -125,6 +124,7 @@ pub async fn remove(
         stage::stage_delete(
             inner_repository.clone(),
             inner_state.clone(),
+            link_path.clone(),
             node_link.node,
             NodeFlags::NoFlags,
             Arc::default(),
@@ -181,6 +181,7 @@ pub async fn remove(
 /// Removing a link deletes its mounted directory from disk, taking any
 /// uncommitted work inside it with no way back.
 async fn verify_no_local_changes_under_link(
+    operation: &Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     state_current: Arc<State>,
     state_staged: Arc<State>,
@@ -190,42 +191,60 @@ async fn verify_no_local_changes_under_link(
     // `find_relative_node_link` returns a mount as the parent's own link node,
     // so `diff_filesystem` has nothing to resolve and walks a node with no
     // children, reporting every file under the mount as added.
-    let filesystem = repository.file_system();
-    let changes = with_operation(filesystem, false, async |operation| {
-        let mut changes = Vec::new();
-        state::diff_filesystem(
-            &operation,
-            FilesystemDiffTree {
-                repository: repository.clone(),
-                state: state_staged,
-            },
-            FilesystemDiffTree {
-                repository,
-                state: state_current,
-            },
-            None,
-            // Not `Full`: removal deletes the mount with `unlink_recursive`, which
-            // takes ignored files with it, so they have to count as local changes.
-            FilterMode::View,
-            FilesystemDiffIntent::Report,
-            Arc::new(Vec::new()),
-            &mut changes,
-        )
+    let changes = state::diff_filesystem(
+        operation,
+        FilesystemDiffTree {
+            repository: repository.clone(),
+            state: state_staged,
+        },
+        FilesystemDiffTree {
+            repository,
+            state: state_current,
+        },
+        None,
+        // Not `Full`: removal takes the whole mount, ignored files with it, so
+        // they have to count as local changes.
+        FilterMode::View,
+        FilesystemDiffIntent::Report,
+        Arc::new(Vec::new()),
+    )
+    .await
+    .forward::<LinkError>("Failed comparing link content with the file system")?;
+    let modified = changes
+        .any(|change| link_path.covers_ignore_case(change.path()))
         .await
         .forward::<LinkError>("Failed comparing link content with the file system")?;
-        Ok::<_, LinkError>(changes)
-    })
-    .await?;
 
-    if changes
-        .iter()
-        .any(|change| link_path.covers_ignore_case(&change.path))
-    {
+    if modified {
         lore_warn!(
             "Link at '{}' has locally modified files (use --force to discard)",
             link_path.as_str()
         );
         return Err(LocalModifications.into());
+    }
+
+    Ok(())
+}
+
+/// Deletes the directory a link was mounted at, and leaves an empty one behind where the link
+/// was only ever staged for add.
+///
+/// The mount sits at the full link path regardless of nesting, the spelling the operation
+/// resolves. A link staged for add replaced whatever the path held, so removing it leaves the
+/// path reporting as an unstaged change rather than as a deletion of content the repository
+/// never committed.
+async fn remove_link_mount(
+    operation: &InstanceOperationImpl,
+    link_path: &RelativePath,
+    is_staged_add: bool,
+) -> Result<(), LinkError> {
+    operation
+        .remove_recursive(link_path)
+        .await
+        .forward_with::<LinkError, _>(|| format!("Failed to delete directory {link_path}"))?;
+
+    if is_staged_add {
+        let _ = operation.create_dir_all(link_path).await;
     }
 
     Ok(())

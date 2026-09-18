@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::sync::Arc;
 
 use bitflags::bitflags;
 use lore_error_set::prelude::*;
@@ -8,10 +7,10 @@ use lore_error_set::prelude::*;
 use crate::bitflagsops;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::lore::Address;
+use crate::lore::Context;
 use crate::lore::RepositoryId;
 use crate::node::*;
-use crate::repository::RepositoryContext;
-use crate::state::State;
+use crate::state::NodeMapping;
 use crate::state::StateError;
 use crate::util::path::RelativePath;
 
@@ -124,69 +123,134 @@ impl Flags {
     }
 }
 
+/// One end of a change: what stood at a path before it, or what stands there after.
+///
+/// A side is one of three things, which its first two fields tell apart:
+///
+/// - a node in a revision, which `mapping` names and `flags` and `address` describe
+/// - the file system, which holds no node and states `observed` in its place
+/// - nothing at all, which holds neither: the `from` of an add and the `to` of a delete
+///
+/// A change compares two sides, and a walk against the file system is simply one whose `to` side
+/// is the file system. Nothing else distinguishes it.
 #[derive(Clone, Debug)]
 pub struct NodeChangeState {
-    pub repository: Arc<RepositoryContext>,
-    pub state: Arc<State>,
-    pub node: NodeID,
+    /// The node this side holds, mapped to the path it stands at.
+    ///
+    /// The path is set even where the side holds no node, so it always states where the change is
+    /// made. A move records its source path here, so an empty one on the `from` of a move is a
+    /// source the walk could not spell.
+    pub mapping: NodeMapping,
+    /// What the file system held at the mapping's path, where this side is the file system.
+    ///
+    /// `None` where the side is a revision's node or nothing at all. A consumer that needs the
+    /// size or the times a walk already measured reads them here rather than reaching for the
+    /// path a second time.
+    pub observed: Option<FileInfo>,
+    /// What the node is and what it is staged for: its type, and the add, delete, move or merge
+    /// a stage left on it. Carries the type alone where the side is the file system.
     pub flags: NodeFlags,
+    /// The content the node holds and the file it is: the hash answers what the content is, and
+    /// the context which file holds it, which a move carries across and a copy mints anew.
+    ///
+    /// Two sides hold the same content where their hashes agree. Default where the side holds no
+    /// node, and where the file system holds content that has not been fragmented and so has no
+    /// address yet.
     pub address: Address,
+    /// The mode the node holds, which is the executable bit and nothing else. Zero where the side
+    /// holds no node, the file system's own being what `observed` answers.
+    pub mode: u16,
 }
 
 impl NodeChangeState {
-    pub fn invalid(&self) -> Self {
+    /// The side a change does not have, standing at `path` and holding nothing there: an add has
+    /// no `from` and a delete no `to`. `path` is the change's own, which is not this side's own
+    /// path where it is derived from an ancestor.
+    pub fn invalid(&self, path: RelativePath) -> Self {
         NodeChangeState {
-            repository: self.repository.clone(),
-            state: self.state.clone(),
-            node: INVALID_NODE,
+            mapping: NodeMapping {
+                repository: self.mapping.repository.clone(),
+                state: self.mapping.state.clone(),
+                path,
+                node: INVALID_NODE,
+            },
+            observed: None,
             flags: NodeFlags::NoFlags,
             address: Address::default(),
+            mode: 0,
         }
     }
 
-    /// Create a `NodeChangeState` for a child node, inheriting repository and state from parent.
-    pub fn from_child(&self, child_id: NodeID, child_node: &Node) -> Self {
+    /// The child `path` names, in the tree this side walks.
+    pub fn from_child(&self, child_id: NodeID, child_node: &Node, path: RelativePath) -> Self {
         NodeChangeState {
-            repository: self.repository.clone(),
-            state: self.state.clone(),
-            node: child_id,
+            mapping: NodeMapping {
+                repository: self.mapping.repository.clone(),
+                state: self.mapping.state.clone(),
+                path,
+                node: child_id,
+            },
+            observed: None,
             flags: NodeFlags::from_bits_retain(child_node.flags),
             address: child_node.address,
+            mode: child_node.mode,
         }
     }
 
-    pub async fn subtree(&self, node_id: NodeID) -> Self {
-        let Ok(node) = self.state.node(self.repository.clone(), node_id).await else {
-            return self.invalid();
-        };
-        NodeChangeState {
-            repository: self.repository.clone(),
-            state: self.state.clone(),
-            node: node_id,
-            flags: NodeFlags::from_bits_retain(node.flags),
-            address: node.address,
-        }
+    /// Whether the two sides hold the file differently, which is a modification either way: its
+    /// content differs, or its content stands and the executable bit does not.
+    pub fn differs_from(&self, other: &Self) -> bool {
+        self.address.hash != other.address.hash
+            || crate::util::fs::mode_changed(self.mode, other.mode)
     }
 
     pub async fn get_node(&self) -> Result<Node, StateError> {
-        self.state.node(self.repository.clone(), self.node).await
+        self.mapping
+            .state
+            .node(self.mapping.repository.clone(), self.mapping.node)
+            .await
+    }
+
+    /// Whether this side is a link node, whose `address.context` names the
+    /// repository it mounts rather than a file identity.
+    pub fn is_link(&self) -> bool {
+        self.flags.contains(NodeFlags::Link)
     }
 }
 
+/// What a walk found at one path between two sides: a node's two ends, and what became of it.
+///
+/// The two answers are independent and are stated separately. `action` says what became of the
+/// node's *location* — added, deleted, kept in place, moved or copied — and `flags` say what
+/// became of its *content* and how it got there. So a file both renamed and edited is a
+/// [`FileAction::Move`] carrying [`Flags::Modify`], and one renamed with its content intact is a
+/// move carrying neither.
 #[derive(Clone, Debug)]
 pub struct NodeChange {
+    /// What became of the node's location.
     pub action: FileAction,
+    /// What became of the node's content, and what a stage or a merge left on it.
     pub flags: Flags,
+    /// What stood at the path before the change, which a walk reads from its source revision.
     pub from: NodeChangeState,
+    /// What stands at the path after it, which is the file system for a walk that measured one.
     pub to: NodeChangeState,
-    pub path: RelativePath,
-    pub from_path: Option<RelativePath>,
-    /// What a filesystem diff measured at `path`, so a consumer does not re-stat
-    /// it. `None` for a change between two revisions, which consulted no filesystem.
-    pub observed: Option<FileInfo>,
 }
 
 impl NodeChange {
+    /// The path the change stands at, as a relative path from the top-level repository instance
+    /// root. A move stands at its destination and records its source in [`Self::move_source`].
+    pub fn path(&self) -> &RelativePath {
+        &self.resolved_side().mapping.path
+    }
+
+    /// The path a move came from, which its `from` side stands at. `None` where the change is not
+    /// a move, and where it is one whose source the walk could not spell.
+    pub fn move_source(&self) -> Option<&RelativePath> {
+        (self.action == FileAction::Move && !self.from.mapping.path.is_empty())
+            .then_some(&self.from.mapping.path)
+    }
+
     /// The side the change resolves to: `from` for a delete, `to` otherwise.
     pub fn resolved_side(&self) -> &NodeChangeState {
         match self.action {
@@ -195,15 +259,27 @@ impl NodeChange {
         }
     }
 
+    /// The identity a move is keyed on, or zero where the change has none to
+    /// offer. A link node's context is shared by every mount of the repository
+    /// it names, so it identifies no single node.
+    pub fn move_identity(&self) -> Context {
+        let side = self.resolved_side();
+        if side.is_link() {
+            Context::default()
+        } else {
+            side.address.context
+        }
+    }
+
     /// Repository a consumer must fetch this change's content from. A link
     /// node's content is the revision it points at, which lives in the target
     /// repository rather than the one the change was walked from.
     pub fn content_repository_id(&self) -> RepositoryId {
         let side = self.resolved_side();
-        if side.flags.contains(NodeFlags::Link) {
+        if side.is_link() {
             side.address.context.into()
         } else {
-            side.repository.id
+            side.mapping.repository.id
         }
     }
 
@@ -211,14 +287,15 @@ impl NodeChange {
     /// An unresolvable link reference falls back to pinned.
     pub async fn is_tracking_link(&self) -> bool {
         let side = self.resolved_side();
-        if !side.flags.contains(NodeFlags::Link) {
+        if !side.is_link() {
             return false;
         }
-        side.state
+        side.mapping
+            .state
             .link_find(
-                side.repository.clone(),
+                side.mapping.repository.clone(),
                 side.address.context.into(),
-                side.node,
+                side.mapping.node,
             )
             .await
             .is_ok_and(|link_reference| link_reference.is_tracking())
@@ -235,12 +312,6 @@ impl NodeChange {
             }
         } else if self.action == FileAction::Add || self.action == FileAction::Copy {
             self.action = FileAction::Delete;
-        } else if self.action == FileAction::Move
-            && let Some(from_path) = self.from_path.take()
-        {
-            let path = self.path.clone();
-            self.path = from_path;
-            self.from_path = Some(path);
         }
 
         // Reverse nodes
@@ -255,44 +326,28 @@ impl NodeChange {
     }
 
     pub async fn is_directory(&self) -> Result<bool, StateError> {
-        if self.to.node.is_valid_node_id() {
-            let iblock = NodeBlock::index(self.to.node);
-            let inode = Node::index(self.to.node);
+        if self.to.mapping.node.is_valid_node_id() {
+            let iblock = NodeBlock::index(self.to.mapping.node);
+            let inode = Node::index(self.to.mapping.node);
             let block = self
                 .to
+                .mapping
                 .state
-                .block(self.to.repository.clone(), iblock)
+                .block(self.to.mapping.repository.clone(), iblock)
                 .await?;
             let noderef = block.node(inode);
             Ok(noderef.is_directory())
         } else {
-            let iblock = NodeBlock::index(self.from.node);
-            let inode = Node::index(self.from.node);
+            let iblock = NodeBlock::index(self.from.mapping.node);
+            let inode = Node::index(self.from.mapping.node);
             let block = self
                 .from
+                .mapping
                 .state
-                .block(self.from.repository.clone(), iblock)
+                .block(self.from.mapping.repository.clone(), iblock)
                 .await?;
             let noderef = block.node(inode);
             Ok(noderef.is_directory())
-        }
-    }
-
-    /// Translate paths from inner path inside the layer to the outer path in the main repository
-    pub fn translate_from_layer_path(&mut self, inner_path: &str, outer_path: &str) {
-        if self.path.as_str().starts_with(inner_path) {
-            self.path = RelativePath::new_from_clean_parts(
-                outer_path,
-                &self.path.as_str()[inner_path.len()..],
-            );
-        }
-        if let Some(from_path) = self.from_path.as_mut()
-            && from_path.as_str().starts_with(inner_path)
-        {
-            *from_path = RelativePath::new_from_clean_parts(
-                outer_path,
-                &from_path.as_str()[inner_path.len()..],
-            );
         }
     }
 }
@@ -319,12 +374,12 @@ pub async fn is_conflict(
         if path_equal {
             return Ok(true);
         }
-        if first.path.len() <= second.path.len()
+        if first.path().len() <= second.path().len()
             && (!is_first_directory || first.action == FileAction::Delete)
         {
             return Ok(true);
         }
-        if second.path.len() <= first.path.len()
+        if second.path().len() <= first.path().len()
             && (!is_second_directory || second.action == FileAction::Delete)
         {
             return Ok(true);
@@ -344,11 +399,11 @@ pub async fn is_conflict(
 }
 
 pub fn sort_by_path(changes: &mut [NodeChange]) {
-    changes.sort_unstable_by(|lhs, rhs| lhs.path.as_str().cmp(rhs.path.as_str()));
+    changes.sort_unstable_by(|lhs, rhs| lhs.path().as_str().cmp(rhs.path().as_str()));
 }
 
 pub fn sort_conflict_by_path(conflicts: &mut [(NodeChange, NodeChange)]) {
-    conflicts.sort_unstable_by(|lhs, rhs| lhs.1.path.as_str().cmp(rhs.1.path.as_str()));
+    conflicts.sort_unstable_by(|lhs, rhs| lhs.1.path().as_str().cmp(rhs.1.path().as_str()));
 }
 
 pub fn reverse(changes: &mut [NodeChange]) {

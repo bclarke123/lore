@@ -185,6 +185,7 @@ mod tests {
     use rand::random;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::http::server::LoreHttpServerSettings;
     use crate::http::server::ServerHealth;
     use crate::http::server::create_router;
@@ -202,6 +203,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     jwt_verifier: None,
+                    repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
                     max_file_size: 100,
                     presign_config: None,
                     local_auth: None,
@@ -229,6 +231,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     jwt_verifier: None,
+                    repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
                     max_file_size: 100,
                     presign_config: None,
                     local_auth: None,
@@ -257,6 +260,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     jwt_verifier: None,
+                    repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
                     max_file_size: 100,
                     presign_config: None,
                     local_auth: None,
@@ -302,6 +306,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     jwt_verifier: None,
+                    repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
                     max_file_size: 100,
                     presign_config: None,
                     local_auth: None,
@@ -346,6 +351,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     jwt_verifier: None,
+                    repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
                     max_file_size: 100,
                     presign_config: None,
                     local_auth: None,
@@ -407,6 +413,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     jwt_verifier: None,
+                    repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
                     max_file_size: 100,
                     presign_config: None,
                     local_auth: None,
@@ -445,6 +452,7 @@ mod tests {
                     idp: Some("test".to_string()),
                     root_domains: None,
                     extra: Default::default(),
+                    identity: None,
                 };
                 let jwt_key = EncodingKey::from_secret("test-secret".as_ref());
                 let bearer = encode(&jwt_header, &jwt_claims, &jwt_key).unwrap();

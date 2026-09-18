@@ -74,10 +74,13 @@ exclude = ["FileInfo", "FilterState", "FilterStates"]
 # `LoreNodeStagedAction` names the values of the `staged_action` field on the
 # child and node-info records; the field is a `uint32_t` there, as `kind` is, so
 # nothing declares the enum type and cbindgen cannot reach it on its own.
+# `CompressionMode` names the values `lore_set_compression_mode` takes, whose
+# parameter is a `uint32_t` for the same reason.
 include = [
     "LoreStore",
     "LoreRevisionTree",
     "LoreNodeStagedAction",
+    "CompressionMode",
     "LoreRevisionTreeLoadArgs",
     "LoreRevisionTreeCloseArgs",
     "LoreRevisionTreeResolvePathArgs",
@@ -99,6 +102,7 @@ include = [
 [export.rename]
 "Address" = "lore_address_t"
 "BranchId" = "lore_branch_id_t"
+"CompressionMode" = "lore_compression_mode_t"
 "Context" = "lore_context_t"
 "Fragment" = "lore_fragment_t"
 "Hash" = "lore_hash_t"
@@ -227,6 +231,7 @@ include = [
 "LoreBranchUnprotectArgs" = "lore_branch_unprotect_args_t"
 "LoreBranchUnprotectEventData" = "lore_branch_unprotect_event_data_t"
 "LoreBytes" = "lore_bytes_t"
+"LoreBytesMut" = "lore_bytes_mut_t"
 "LoreCompleteEventData" = "lore_complete_event_data_t"
 "LoreEndEventData" = "lore_end_event_data_t"
 "LoreErrorCode" = "lore_error_code_t"
@@ -412,6 +417,7 @@ include = [
 "LoreRevisionMetadataListArgs" = "lore_revision_metadata_list_args_t"
 "LoreRevisionMetadataSetArgs" = "lore_revision_metadata_set_args_t"
 "LoreRevisionResolveEventData" = "lore_revision_resolve_event_data_t"
+"LoreRevisionResolveTarget" = "lore_revision_resolve_target_t"
 "LoreRevisionSyncArgs" = "lore_revision_sync_args_t"
 "LoreRevisionSyncFileEventData" = "lore_revision_sync_file_event_data_t"
 "LoreRevisionSyncProgressEventData" = "lore_revision_sync_progress_event_data_t"
@@ -440,6 +446,8 @@ include = [
 "LoreSharedStoreSetUseAutomaticallyArgs" = "lore_shared_store_set_use_automatically_args_t"
 "LoreServiceStartArgs" = "lore_service_start_args_t"
 "LoreServiceStopArgs" = "lore_service_stop_args_t"
+"LoreServiceSetExecutableArgs" = "lore_service_set_executable_args_t"
+"LoreServiceSetUseAutomaticallyArgs" = "lore_service_set_use_automatically_args_t"
 "LoreStore" = "lore_store_t"
 "LoreStorageCloseArgs" = "lore_storage_close_args_t"
 "LoreStorageFlushArgs" = "lore_storage_flush_args_t"

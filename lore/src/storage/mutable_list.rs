@@ -11,7 +11,6 @@
 use std::sync::Arc;
 
 use lore_base::error::InvalidArguments;
-use lore_base::lore_spawn;
 use lore_base::types::Hash;
 use lore_base::types::KeyType;
 use lore_base::types::Partition;
@@ -27,7 +26,6 @@ use lore_revision::store::event::LoreStorageMutableListEntryEventData;
 use lore_revision::store::event::LoreStorageMutableListItemCompleteEventData;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -100,7 +98,7 @@ async fn mutable_list_local(
         args,
         mutable_list,
         async move |store, args| {
-            let items = args.items.as_slice().to_vec();
+            let items = args.items.as_slice();
             if items.is_empty() {
                 return Ok::<(), MutableListError>(());
             }
@@ -112,14 +110,10 @@ async fn mutable_list_local(
                     reason: "mutable_list is only supported on the local store".into(),
                 }));
             }
-            let total = items.len();
-            let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            for item in items {
+            crate::storage::fan_out_items!(items, "mutable_list", |item| {
                 let store = store.clone();
-                lore_spawn!(tasks, async move { list_item(store, item).await });
-            }
-            let codes = crate::storage::drain_codes(tasks).await;
-            crate::storage::build_call_error(&codes, total, "mutable_list")
+                async move { list_item(store, &item).await }
+            })
         },
     )
     .await
@@ -127,7 +121,7 @@ async fn mutable_list_local(
 
 /// List one item's local mutable key-value pairs. Entries are emitted as they arrive, then a
 /// single terminal event closes the item. Remote listing is rejected before reaching here.
-async fn list_item(store: Arc<StoreInternal>, item: LoreStorageMutableListItem) -> LoreErrorCode {
+async fn list_item(store: Arc<StoreInternal>, item: &LoreStorageMutableListItem) -> LoreErrorCode {
     match store
         .mutable
         .clone()
@@ -137,11 +131,11 @@ async fn list_item(store: Arc<StoreInternal>, item: LoreStorageMutableListItem) 
         Ok(stream) => {
             let mut receiver = stream.channel();
             while let Some((key, value)) = receiver.recv().await {
-                emit_entry(&item, key, value);
+                emit_entry(item, key, value);
             }
-            emit_complete(&item, LoreErrorCode::None)
+            emit_complete(item, LoreErrorCode::None)
         }
-        Err(err) => emit_complete(&item, crate::storage::store_error_to_code(&err)),
+        Err(err) => emit_complete(item, crate::storage::store_error_to_code(&err)),
     }
 }
 

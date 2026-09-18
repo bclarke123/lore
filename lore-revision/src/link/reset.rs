@@ -5,25 +5,27 @@ use std::sync::Arc;
 use lore_error_set::prelude::*;
 
 use super::LinkError;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::link;
 use crate::link::LinkFlags;
 use crate::lore::Hash;
 use crate::node::Node;
 use crate::node::NodeBlock;
-use crate::node::NodeID;
-use crate::repository::RepositoryContext;
+use crate::state::NodeMapping;
 use crate::state::State;
 use crate::util;
-use crate::util::path::RelativePath;
 
 pub(crate) async fn reset_staged_add_link(
-    repository: Arc<RepositoryContext>,
+    at: NodeMapping,
     state_current: Arc<State>,
-    state_staged: Arc<State>,
-    link_node_id: NodeID,
     staged_link_node: Node,
-    link_path: RelativePath,
 ) -> Result<(), LinkError> {
+    let NodeMapping {
+        repository,
+        state: state_staged,
+        path: link_path,
+        node: link_node_id,
+    } = at;
     let link_id = staged_link_node.linked_node().repository;
     let absolute_path = link_path.to_absolute_path(repository.require_path()?);
 
@@ -99,14 +101,23 @@ pub(crate) async fn reset_staged_add_link(
     Ok(())
 }
 
+/// Restores the link registry entry a staged removal dropped and re-realizes the pinned content
+/// at the mount.
+///
+/// Realizes through `operation`, the caller's: a filesystem holds one operation at a time and
+/// unstaging opens one for the whole walk.
 pub(crate) async fn reset_staged_remove_link(
-    repository: Arc<RepositoryContext>,
+    operation: &Arc<InstanceOperationImpl>,
+    at: NodeMapping,
     state_current: Arc<State>,
-    state_staged: Arc<State>,
-    link_node_id: NodeID,
     current_link_node: Node,
-    link_path: RelativePath,
 ) -> Result<(), LinkError> {
+    let NodeMapping {
+        repository,
+        state: state_staged,
+        path: link_path,
+        node: link_node_id,
+    } = at;
     let link_id = current_link_node.linked_node().repository;
 
     let current_link_ref = state_current
@@ -114,7 +125,7 @@ pub(crate) async fn reset_staged_remove_link(
         .await
         .forward::<LinkError>("Failed to find link registry entry")?;
 
-    let linked_repository = Arc::new(repository.to_link_context(link_id).await);
+    let linked_repository = repository.to_link_context(link_id).await;
 
     // A mount added while this removal was staged can overlap the one being
     // restored.
@@ -149,7 +160,8 @@ pub(crate) async fn reset_staged_remove_link(
         .await
         .internal("recreating the link directory")?;
 
-    link::realize_link_pin_change(
+    link::realize_link_pin_change_in_operation(
+        operation,
         repository.clone(),
         linked_repository,
         link_path,
@@ -162,15 +174,23 @@ pub(crate) async fn reset_staged_remove_link(
     Ok(())
 }
 
+/// Puts a link whose pin move was staged back to the pin the current revision holds, on disk and
+/// in the registry.
+///
+/// Realizes through the caller's `operation`, as [`reset_staged_remove_link`] does.
 pub(crate) async fn reset_staged_update_link(
-    repository: Arc<RepositoryContext>,
+    operation: &Arc<InstanceOperationImpl>,
+    at: NodeMapping,
     state_current: Arc<State>,
-    state_staged: Arc<State>,
-    link_node_id: NodeID,
     staged_link_node: Node,
     current_link_node: Node,
-    link_path: RelativePath,
 ) -> Result<(), LinkError> {
+    let NodeMapping {
+        repository,
+        state: state_staged,
+        path: link_path,
+        node: link_node_id,
+    } = at;
     let link_id = current_link_node.linked_node().repository;
     let staged_pin = staged_link_node.address.hash;
     let current_pin = current_link_node.address.hash;
@@ -180,8 +200,9 @@ pub(crate) async fn reset_staged_update_link(
         .await
         .forward::<LinkError>("Failed to find link registry entry")?;
 
-    let linked_repository = Arc::new(repository.to_link_context(link_id).await);
-    link::realize_link_pin_change(
+    let linked_repository = repository.to_link_context(link_id).await;
+    link::realize_link_pin_change_in_operation(
+        operation,
         repository.clone(),
         linked_repository,
         link_path,

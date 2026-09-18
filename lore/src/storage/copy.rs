@@ -135,7 +135,7 @@ async fn copy_local(
         args,
         copy,
         async move |store, args| {
-            let items = args.items.as_slice().to_vec();
+            let items = args.items.as_slice();
             if items.is_empty() {
                 return Ok::<(), CopyError>(());
             }
@@ -147,7 +147,7 @@ async fn copy_local(
             if store.remote.is_some() && !effective.no_remote {
                 let mut unique_sources: std::collections::HashSet<Partition> =
                     std::collections::HashSet::new();
-                for item in &items {
+                for item in items {
                     if item.source_partition != Partition::default()
                         && item.source_partition != item.target_partition
                     {
@@ -161,34 +161,39 @@ async fn copy_local(
 
             let total = items.len();
             let mut reuse = crate::storage::store::SessionReuse::default();
-            let mut tasks: JoinSet<CopyOutcome> = JoinSet::new();
-            for item in items {
+            let mut local_mirror_errors = 0usize;
+
+            let call_result = if let [item] = items {
                 let session =
                     reuse.session_for(&store, item.target_partition, !effective.no_remote);
-                let store = store.clone();
-                lore_spawn!(tasks, async move {
-                    copy_item(store, item, effective, session).await
-                });
-            }
-            let mut codes: Vec<LoreErrorCode> = Vec::with_capacity(total);
-            let mut local_mirror_errors = 0usize;
-            while let Some(result) = tasks.join_next().await {
-                let outcome = result.unwrap_or(CopyOutcome::failed(LoreErrorCode::Internal));
-                codes.push(outcome.code);
-                if outcome.local_mirror_failed {
-                    local_mirror_errors += 1;
+                let outcome = copy_item(store, *item, effective, session).await;
+                local_mirror_errors += usize::from(outcome.local_mirror_failed);
+                crate::storage::build_call_error(&[outcome.code], total, "copy")
+            } else {
+                let mut tasks: JoinSet<CopyOutcome> = JoinSet::new();
+                for item in items.iter().copied() {
+                    let session =
+                        reuse.session_for(&store, item.target_partition, !effective.no_remote);
+                    let store = store.clone();
+                    lore_spawn!(tasks, async move {
+                        copy_item(store, item, effective, session).await
+                    });
                 }
-            }
+                let mut codes: Vec<LoreErrorCode> = Vec::with_capacity(total);
+                while let Some(result) = tasks.join_next().await {
+                    let outcome = result.unwrap_or(CopyOutcome::failed(LoreErrorCode::Internal));
+                    codes.push(outcome.code);
+                    local_mirror_errors += usize::from(outcome.local_mirror_failed);
+                }
+                crate::storage::build_call_error(&codes, total, "copy")
+            };
+
             if local_mirror_errors > 0 {
                 lore_debug!(
                     "copy: {local_mirror_errors}/{total} items had benign local-mirror failures (remote was authoritative)"
                 );
             }
-            crate::storage::build_call_error(
-                &codes,
-                total,
-                "copy",
-            )
+            call_result
         },
     )
     .await
@@ -271,7 +276,7 @@ async fn copy_item(
         )
         .await
     {
-        Ok(()) => return mirror_local_durable(&store, &item, effective).await,
+        Ok(()) => return mirror_local_durable(&store, item, effective).await,
         Err(ProtocolError::NotFound(_) | ProtocolError::NotAuthorized(_)) => {
             if effective.no_local {
                 return CopyOutcome::failed(emit_complete(&item, LoreErrorCode::AddressNotFound));
@@ -315,7 +320,7 @@ async fn copy_item(
             crate::storage::protocol_error_to_code(&err),
         ));
     }
-    mirror_local_durable(&store, &item, effective).await
+    mirror_local_durable(&store, item, effective).await
 }
 
 /// Best-effort local mirror after a successful remote round-trip. The destination tuple is
@@ -329,11 +334,11 @@ async fn copy_item(
 /// to mirror to.
 async fn mirror_local_durable(
     store: &Arc<StoreInternal>,
-    item: &LoreStorageCopyItem,
+    item: LoreStorageCopyItem,
     effective: crate::storage::store::EffectiveFlags,
 ) -> CopyOutcome {
     if effective.no_local {
-        emit_complete(item, LoreErrorCode::None);
+        emit_complete(&item, LoreErrorCode::None);
         return CopyOutcome::ok();
     }
     let local_failed = store
@@ -348,7 +353,7 @@ async fn mirror_local_durable(
         )
         .await
         .is_err();
-    emit_complete(item, LoreErrorCode::None);
+    emit_complete(&item, LoreErrorCode::None);
     CopyOutcome {
         code: LoreErrorCode::None,
         local_mirror_failed: local_failed,

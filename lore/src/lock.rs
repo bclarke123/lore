@@ -7,8 +7,6 @@ use lore_revision::lock::file::acquire::AcquireOptions;
 use lore_revision::lock::file::query::QueryOptions;
 use lore_revision::lock::file::release::ReleaseOptions;
 use lore_revision::lock::file::status::StatusOptions;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call::repository_call_read;
 use crate::call_delegation::dispatch_call;
@@ -17,7 +15,7 @@ use crate::interface::LoreString;
 
 /// Arguments for acquiring file locks on the given paths for a branch.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(file_acquire_local)]
 pub struct LoreLockFileAcquireArgs {
     /// Paths to acquire locks on
@@ -55,11 +53,11 @@ pub async fn file_acquire(
     dispatch_call(globals, args, callback, file_acquire_local).await
 }
 
-async fn file_acquire_local(
+fn file_acquire_local(
     globals: LoreGlobalArgs,
     args: LoreLockFileAcquireArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
@@ -75,7 +73,6 @@ async fn file_acquire_local(
             lore_revision::lock::file::acquire::acquire(repository, options)
         },
     )
-    .await
 }
 
 pub async fn file_acquire_as_owner(
@@ -104,7 +101,7 @@ pub async fn file_acquire_as_owner(
 
 /// Arguments for returning the lock status of the given files on a branch.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(file_status_local)]
 pub struct LoreLockFileStatusArgs {
     /// Paths to get the lock status of
@@ -142,11 +139,11 @@ pub async fn file_status(
     dispatch_call(globals, args, callback, file_status_local).await
 }
 
-async fn file_status_local(
+fn file_status_local(
     globals: LoreGlobalArgs,
     args: LoreLockFileStatusArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
@@ -161,12 +158,11 @@ async fn file_status_local(
             lore_revision::lock::file::status::status(repository, options)
         },
     )
-    .await
 }
 
 /// Arguments for querying file locks on a branch, optionally filtered by owner and path.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(file_query_local)]
 pub struct LoreLockFileQueryArgs {
     /// Branch to query locks on
@@ -206,11 +202,11 @@ pub async fn file_query(
     dispatch_call(globals, args, callback, file_query_local).await
 }
 
-async fn file_query_local(
+fn file_query_local(
     globals: LoreGlobalArgs,
     args: LoreLockFileQueryArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
@@ -226,12 +222,11 @@ async fn file_query_local(
             lore_revision::lock::file::query::query(repository, options)
         },
     )
-    .await
 }
 
 /// Arguments for releasing file locks on the given paths for a branch and owner.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(file_release_local)]
 pub struct LoreLockFileReleaseArgs {
     /// Paths to release locks on
@@ -273,11 +268,11 @@ pub async fn file_release(
     dispatch_call(globals, args, callback, file_release_local).await
 }
 
-async fn file_release_local(
+fn file_release_local(
     globals: LoreGlobalArgs,
     args: LoreLockFileReleaseArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
@@ -294,5 +289,4 @@ async fn file_release_local(
             lore_revision::lock::file::release::release(repository, options)
         },
     )
-    .await
 }

@@ -6,9 +6,11 @@ publish = false
 
 [lib]
 name = "lore_io"
+test = false
 
 [dependencies]
 bytes = { workspace = true }
+lore-macro = { workspace = true }
 parking_lot = { workspace = true }
 
 # The uring backend is the only part of the library that calls libc, for eventfd and poll.
@@ -42,14 +44,16 @@ windows-sys = { workspace = true, features = [
 # the tests' own runtime, and futures drives the case that proves the point without one. lore-base
 # is here for its `#[global_allocator]`: the read path's design rests on the process allocator
 # caching spans per thread, so a benchmark on glibc malloc measures a different program than the
-# one that ships. Dev-only, so the library's own dependency graph is unchanged.
+# one that ships. lore-io itself is here with `test-util`, which opens its internals to the unit
+# tests in tests/unit. Dev-only, so the library's own dependency graph is unchanged.
 [dev-dependencies]
 futures = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
+lore-io = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true }
 
 # A named pipe is the only thing a unit test can make defer on demand, and deferring is the whole
-# of what the completion-port backend is for. See `iocp::tests::overlapped_pipe_pair`. The
+# of what the completion-port backend is for. See `overlapped_pipe_pair` in tests/unit/iocp.rs. The
 # conformance suite names `ERROR_SHARING_VIOLATION` and `FILE_SHARE_READ` when it pins the share
 # modes, hence the foundation and filesystem modules here as well.
 [target.'cfg(target_family = "windows")'.dev-dependencies]
@@ -58,3 +62,9 @@ windows-sys = { workspace = true, features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Pipes",
 ] }
+
+[features]
+test-util = []
+
+[lints]
+workspace = true

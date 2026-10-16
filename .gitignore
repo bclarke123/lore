@@ -3,9 +3,13 @@
 **/target/
 *.dSYM
 
+# mkdocs build output
+/site/
+
 # Local files
 lore-server/config/local*.toml
 **/.grafana.local.yaml
+contrib/bazel/.rbe-state/
 
 #################
 ## Visual Studio
@@ -155,6 +159,9 @@ xcuserdata
 *.local.*
 .claude/
 .claude-worktrees/
+context/
+AGENTS.md
+CLAUDE.md
 
 # test report
 ctrf/
@@ -164,3 +171,5 @@ ctrf/
 
 # lychee link checker cache
 .lycheecache
+
+.crowd/

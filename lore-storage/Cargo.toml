@@ -6,9 +6,11 @@ publish = false
 
 [lib]
 name = "lore_storage"
+test = false
 
 [dependencies]
 async-trait = { workspace = true }
+bitcode = { workspace = true }
 bitflags = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
@@ -20,11 +22,13 @@ lore-base = { workspace = true }
 hex = { workspace = true }
 libc = { workspace = true }
 lore-io = { workspace = true }
+lore-macro = { workspace = true }
 lore-transport = { workspace = true }
 lz4-sys = { workspace = true }
 zstd-sys = { workspace = true }
 opentelemetry = { workspace = true }
 parking_lot = { workspace = true }
+pin-project = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 smallvec = { workspace = true }
@@ -42,11 +46,13 @@ zerocopy = { workspace = true }
 default = []
 failure_generator = []
 oodle = []
+test-util = []
 trace_log = []
 
 [dev-dependencies]
-# The shared test temp-directory helper, re-exported by src/test_util.rs.
+# The shared test temp-directory helper.
 lore-base = { workspace = true, features = ["test-util"] }
+lore-storage = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(target_family = "windows")'.dependencies]
 # `Win32_Storage_FileSystem` does not imply `Win32_Foundation`, and the packstore reads its error
@@ -56,3 +62,6 @@ windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
 ] }
+
+[lints]
+workspace = true

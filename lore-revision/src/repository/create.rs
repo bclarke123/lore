@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use super::FileConfig;
@@ -14,6 +13,7 @@ use super::SharedStoreToUseConfig;
 use super::StoreConfig;
 use super::VfsConfig;
 use super::get_dot_lore_path;
+use super::load_repository_config_from_dot_dir;
 use crate::branch;
 use crate::errors::*;
 use crate::event;
@@ -30,7 +30,7 @@ use crate::util;
 
 /// Data for the event emitted when a repository is created.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryCreateEventData {
     /// Identifier of the created repository.
@@ -143,15 +143,16 @@ fn directory_name(path: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-pub async fn create(
+/// Boxed version of [`create_with_metadata`] for cross-crate use, without metadata.
+pub fn create_boxed(
     repository_url: &str,
-    path: impl AsRef<Path>,
+    path: impl AsRef<Path> + Send,
     options: CreateOptions,
-) -> Result<(), CreateError> {
-    create_with_metadata(repository_url, path, options, None).await
+) -> crate::BoxFuture<'_, Result<(), CreateError>> {
+    create_with_metadata_boxed(repository_url, path, options, None)
 }
 
-pub async fn create_with_metadata(
+pub(crate) async fn create_with_metadata(
     repository_url: &str,
     path: impl AsRef<Path>,
     options: CreateOptions,
@@ -215,7 +216,10 @@ pub async fn create_with_metadata(
 
     let existing_dot_dir = get_dot_lore_path(path)?;
     if existing_dot_dir.exists() {
-        if call.force() {
+        let existing_repository_is_swfs =
+            load_repository_config_from_dot_dir(existing_dot_dir.as_path())
+                .is_ok_and(|config| config.is_swfs());
+        if call.force() && !existing_repository_is_swfs {
             lore_io::IoDriver::global()
                 .remove_dir_all(existing_dot_dir.as_path())
                 .await
@@ -356,9 +360,10 @@ pub async fn create_with_metadata(
     // The create command goes through dispatch_call, not repository_call,
     // so the normal spawn_flush_stores path that flushes dirty mutable store
     // buckets after each command does not run. Flush explicitly to ensure
-    // branch creation, instance registration, and metadata are persisted
-    // before the process exits.
-    let _ = repository.flush(true).await;
+    // branch creation, instance registration, and metadata are written
+    // before the process exits — synced to disk only under `--sync-data`, as
+    // every other command's flush is.
+    let _ = repository.flush(call.sync_data()).await;
 
     drop(repository);
     drop(connection);
@@ -371,4 +376,20 @@ pub async fn create_with_metadata(
     .send();
 
     Ok(())
+}
+
+/// Boxed version of [`create_with_metadata`] for cross-crate use.
+pub fn create_with_metadata_boxed(
+    repository_url: &str,
+    path: impl AsRef<Path> + Send,
+    options: CreateOptions,
+    metadata: Option<CreateMetadata>,
+) -> crate::BoxFuture<'_, Result<(), CreateError>> {
+    let path = path.as_ref().to_path_buf();
+    Box::pin(create_with_metadata(
+        repository_url,
+        path,
+        options,
+        metadata,
+    ))
 }

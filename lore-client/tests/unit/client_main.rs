@@ -1,0 +1,53 @@
+// SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-License-Identifier: MIT
+use clap::Parser;
+use lore_client::cli::LoreCli;
+use lore_client::cli::LoreCommands;
+use lore_client::client_main::runs_the_service;
+
+fn command_of(args: &[&str]) -> LoreCommands {
+    LoreCli::try_parse_from(args)
+        .expect("the arguments must parse")
+        .command
+        .expect("the arguments must name a command")
+}
+
+/// `service run` is the service. Sizing it for relaying would leave the
+/// process that does all the work with the pools of one that does none.
+#[test]
+fn the_command_that_runs_the_service_is_not_sized_for_relaying() {
+    assert!(runs_the_service(&command_of(&["lore", "service", "run"])));
+}
+
+/// Every other `service` command is a client of the service, including the
+/// two that ask for one to start and stop.
+#[test]
+fn the_commands_that_act_on_the_service_are_sized_for_relaying() {
+    for args in [
+        vec!["lore", "service", "start"],
+        vec!["lore", "service", "stop"],
+        vec!["lore", "service", "set-executable", "/opt/lore/bin/lore"],
+        vec!["lore", "service", "set-use-automatically", "true"],
+        vec!["lore", "status"],
+    ] {
+        assert!(
+            !runs_the_service(&command_of(&args)),
+            "{} is a client of the service",
+            args.join(" ")
+        );
+    }
+}
+
+/// `--trust-remote` reaches the command's globals, and without it the remote is not trusted.
+#[test]
+fn trusting_the_remote_reaches_the_globals() {
+    for (args, trusted) in [
+        (vec!["lore", "status"], 0),
+        (vec!["lore", "status", "--trust-remote"], 1),
+    ] {
+        let cli = LoreCli::try_parse_from(&args).expect("the arguments must parse");
+        let globals =
+            lore_client::cli::lore_globals_from_args(&cli).expect("the globals must resolve");
+        assert_eq!(globals.trust_remote, trusted, "{}", args.join(" "));
+    }
+}

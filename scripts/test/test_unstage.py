@@ -417,6 +417,32 @@ def test_unstage_discard_counts(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_stage_and_unstage_of_a_removed_dirty_add_leave_nothing(new_lore_repo):
+    """A file created, marked dirty and removed again was never tracked, so
+    staging stages nothing for it and unstaging leaves no entry behind for a
+    path that does not exist."""
+
+    repo: Lore = new_lore_repo()
+    with repo.open_file("initial.txt", "w+") as f:
+        f.write("initial content\n")
+    repo.stage(scan=True)
+    repo.commit()
+
+    with repo.open_file("phantom.txt", "w+") as f:
+        f.write("never tracked\n")
+    repo.dirty("phantom.txt")
+    repo.remove_file("phantom.txt")
+
+    repo.stage(".")
+    after_stage = parse_status_json(repo.status(json=True))
+    assert after_stage == [], f"stage recorded a never-tracked path: {after_stage}"
+
+    repo.unstage(".")
+    after_unstage = parse_status_json(repo.status(json=True))
+    assert after_unstage == [], f"unstage left an entry behind: {after_unstage}"
+
+
+@pytest.mark.smoke
 def test_restage_after_unstage_promotes_dirty_add_back_to_staged_add(new_lore_repo):
     """A staged add that is unstaged becomes a dirty add (the file is still
     pending — the user just dropped the intent to include it in the next

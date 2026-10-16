@@ -78,6 +78,7 @@ pub fn effective_authorization(
 /// Repository-scoped gRPC methods that only read repository state. Requests
 /// to these methods carry the repository id in metadata, so public-ness is
 /// decided before the request reaches the service.
+#[lore_macro::test_pub]
 const READ_ONLY_METHODS: &[&str] = &[
     // Legacy urc.rpc data plane (the stock client).
     "/urc.rpc.StorageService/Get",
@@ -116,6 +117,7 @@ const READ_ONLY_METHODS: &[&str] = &[
 /// repository id is known. Anonymous requests are let through with a
 /// synthesized token carrying no resources; the repository-query handler
 /// itself requires the resolved repository to be public.
+#[lore_macro::test_pub]
 const LOOKUP_METHODS: &[&str] = &[
     "/urc.rpc.RepositoryService/RepositoryQuery",
     "/lore.repository.v1.RepositoryService/RepositoryGet",
@@ -213,48 +215,4 @@ async fn public(access: &Arc<AccessControl>, repository: RepositoryId) -> Option
 fn repository_from_headers(headers: &http::HeaderMap) -> Option<RepositoryId> {
     let metadata = MetadataMap::from_headers(headers.clone());
     crate::grpc::get_repository(&metadata).ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn allowlist_contains_no_mutating_methods() {
-        for method in READ_ONLY_METHODS.iter().chain(LOOKUP_METHODS) {
-            for verb in [
-                "Put",
-                "Copy",
-                "Verify",
-                "MutableStore",
-                "MutableCompareAndSwap",
-                "Create",
-                "Delete",
-                "Push",
-                "Set",
-                "Protect",
-                "Obliterate",
-            ] {
-                assert!(
-                    !method.contains(verb),
-                    "{method} looks like a mutating method"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn anonymous_token_is_read_scoped() {
-        let repository = RepositoryId::default();
-        let token = anonymous_token(repository);
-        assert!(is_anonymous(&token));
-        let resources = token.resources.expect("resources");
-        assert_eq!(resources.len(), 1);
-        assert_eq!(resources[0].permission, vec!["read"]);
-
-        // The lookup token authenticates but authorizes nothing.
-        let lookup = anonymous_lookup_token();
-        assert!(is_anonymous(&lookup));
-        assert_eq!(lookup.resources, Some(vec![]));
-    }
 }

@@ -13,7 +13,7 @@ use crate::lore::Hash;
 use crate::state;
 use crate::util::path::RelativePath;
 
-pub async fn dump(
+pub(crate) async fn dump(
     repository: Arc<RepositoryContext>,
     revision: Option<Hash>,
     path: Option<RelativePath>,
@@ -46,7 +46,7 @@ pub async fn dump(
     })
     .send();
 
-    let _ = state.cache_fragments(repository.clone()).await;
+    let _ = state.cache_fragments(repository.clone(), false).await;
 
     let dump_result = state::dump::dump(state, repository.clone(), path, max_depth)
         .await
@@ -55,4 +55,14 @@ pub async fn dump(
     event::LoreEvent::RepositoryDumpEnd(LoreRepositoryDumpEndEventData::default()).send();
 
     dump_result
+}
+
+/// Boxed version of [`dump`] for cross-crate use.
+pub fn dump_boxed(
+    repository: Arc<RepositoryContext>,
+    revision: Option<Hash>,
+    path: Option<RelativePath>,
+    max_depth: usize,
+) -> crate::BoxFuture<'static, Result<(), RepositoryError>> {
+    Box::pin(dump(repository, revision, path, max_depth))
 }

@@ -9,7 +9,6 @@ use std::sync::Arc;
 use lore_base::types::Hash;
 use lore_error_set::prelude::*;
 use lore_storage::store_types::KeyType;
-use serde::Deserialize;
 use serde::Serialize;
 use zerocopy::FromBytes;
 use zerocopy::Immutable;
@@ -68,7 +67,8 @@ pub const ANCHOR_STAGED: &str = "anchor-staged";
     FromBytes,
     Immutable,
     Serialize,
-    Deserialize,
+    bitcode::Encode,
+    bitcode::Decode,
 )]
 pub struct InstanceId {
     /// The raw 16-byte identifier
@@ -539,7 +539,7 @@ pub async fn instances_on_branch(
 
 /// Event data warning that several instances share the same checked-out branch.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMultipleInstanceEventData {
     /// The branch checked out by more than one instance
@@ -579,7 +579,7 @@ pub async fn warn_branch_multiple_instance(
 /// The revision comes from `ANCHOR_CURRENT`, the branch from
 /// `ANCHOR_CURRENT_BRANCH`. If the branch key exists but the revision
 /// is zero, the repository has no revisions yet (fresh repo after create).
-pub async fn load_current_anchor(
+pub(crate) async fn load_current_anchor(
     repository: &Arc<RepositoryContext>,
 ) -> Result<(Hash, BranchId), AnchorError> {
     let (rev_key, rev_key_type) =
@@ -625,6 +625,13 @@ pub async fn load_current_anchor(
     }
 
     Err(AnchorError::internal("anchor branch is missing"))
+}
+
+/// Boxed version of [`load_current_anchor`] for cross-crate use.
+pub fn load_current_anchor_boxed(
+    repository: &Arc<RepositoryContext>,
+) -> crate::BoxFuture<'_, Result<(Hash, BranchId), AnchorError>> {
+    Box::pin(load_current_anchor(repository))
 }
 
 /// Load the staged revision hash for this instance from the mutable store.
@@ -822,7 +829,32 @@ fn names_unreachable_volume(_error: &io::Error) -> bool {
 /// The instance file is looked up through
 /// [`crate::repository::get_dot_lore_path`], so a legacy `.urc` directory and
 /// an SWFS mount whose `.lore` lives outside the path are both resolved.
+///
+/// Outside the service no mount manager resolves an SWFS instance, whose path
+/// is absent or an empty mount point while it is not mounted. An SWFS instance
+/// cannot be removed by hand, so its external `.lore` in the global data
+/// directory is evidence it still exists, and outweighs a missing path or
+/// checkout.
 pub async fn instance_staleness(path: &str, instance_id: InstanceId) -> InstanceStaleness {
+    let staleness = path_staleness(path, instance_id).await;
+    // SWFS instances will seem stale, so if the result would be stale AND there is an external
+    // config AND that config is an SWFS instance, then override the result.
+    if matches!(
+        staleness,
+        InstanceStaleness::PathMissing | InstanceStaleness::CheckoutMissing
+    ) && let Ok(external) = crate::global::external_dir::external_lore_dir(instance_id)
+        && external_dot_lore_names_swfs(&external).await
+    {
+        InstanceStaleness::Active
+    } else {
+        staleness
+    }
+}
+
+/// Classify the registration of `instance_id` at `path` by what the path
+/// holds, as [`instance_staleness`] does before consulting external `.lore`
+/// directories.
+async fn path_staleness(path: &str, instance_id: InstanceId) -> InstanceStaleness {
     if path.is_empty() {
         return InstanceStaleness::Active;
     }
@@ -852,6 +884,19 @@ pub async fn instance_staleness(path: &str, instance_id: InstanceId) -> Instance
         Err(err) if is_absent(&err) => InstanceStaleness::CheckoutMissing,
         Err(_) => InstanceStaleness::Active,
     }
+}
+
+/// Whether the external `.lore` directory at `dot_lore` holds the config of an
+/// SWFS-backed instance. An absent config names none; one that is present but
+/// cannot be read or parsed is not evidence against an SWFS instance, so it
+/// counts as one.
+#[lore_macro::test_pub]
+async fn external_dot_lore_names_swfs(dot_lore: &Path) -> bool {
+    crate::util::config::load::<crate::repository::RepositoryConfig>(
+        dot_lore.join(crate::repository::CONFIG),
+    )
+    .await
+    .map_or(true, |config| config.is_swfs())
 }
 
 /// The branch (ID and name) and revision an instance has checked out, read
@@ -895,7 +940,7 @@ use crate::event::LoreEvent;
 
 /// Event data describing an instance — used for both listing and prune notifications.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryInstanceEventData {
     /// Identifier of the instance
@@ -980,7 +1025,8 @@ pub async fn instance_list(repository: Arc<RepositoryContext>) -> Result<(), Ins
 
 /// Prune stale instances: those whose path no longer exists, those whose path
 /// now holds a repository with a different current instance, and those whose
-/// path holds no checkout at all.
+/// path holds no checkout at all. An SWFS instance with an external `.lore` is
+/// kept whether or not it is mounted; see [`instance_staleness`].
 /// Emits a `RepositoryInstance` event for each pruned instance.
 pub async fn instance_prune(repository: Arc<RepositoryContext>) -> Result<u32, InstanceError> {
     if repository.try_write_token().is_none() {
@@ -1012,73 +1058,5 @@ impl fmt::Display for InstanceId {
 impl fmt::Debug for InstanceId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "InstanceId({})", hex::encode(self.data))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::repository::SALT_LORE;
-
-    #[test]
-    fn instance_key_is_deterministic() {
-        let id = InstanceId::generate();
-        let (key1, typ1) = instance_key(SALT_LORE, id);
-        let (key2, typ2) = instance_key(SALT_LORE, id);
-        assert_eq!(key1, key2);
-        assert_eq!(typ1, typ2);
-        assert_eq!(typ1, KeyType::Instance);
-    }
-
-    #[test]
-    fn instance_key_differs_for_different_ids() {
-        let a = InstanceId::generate();
-        let b = InstanceId::generate();
-        let (key_a, _) = instance_key(SALT_LORE, a);
-        let (key_b, _) = instance_key(SALT_LORE, b);
-        assert_ne!(key_a, key_b);
-    }
-
-    #[test]
-    fn anchor_keys_differ_for_current_vs_staged() {
-        let id = InstanceId::generate();
-        let (current, typ_c) = anchor_key(SALT_LORE, ANCHOR_CURRENT, id);
-        let (staged, typ_s) = anchor_key(SALT_LORE, ANCHOR_STAGED, id);
-        assert_ne!(current, staged);
-        assert_eq!(typ_c, KeyType::Untyped);
-        assert_eq!(typ_s, KeyType::Untyped);
-    }
-
-    #[test]
-    fn generate_produces_nonzero_unique_values() {
-        let a = InstanceId::generate();
-        let b = InstanceId::generate();
-        assert!(!a.is_zero());
-        assert!(!b.is_zero());
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn default_is_zero() {
-        let id = InstanceId::default();
-        assert!(id.is_zero());
-    }
-
-    #[test]
-    fn roundtrip_bytes() {
-        let id = InstanceId::generate();
-        let bytes = id.as_bytes().to_vec();
-        assert_eq!(bytes.len(), 16);
-        let mut restored = InstanceId::default();
-        restored.as_mut_bytes().copy_from_slice(&bytes);
-        assert_eq!(id, restored);
-    }
-
-    #[test]
-    fn display_is_hex() {
-        let id = InstanceId::generate();
-        let s = id.to_string();
-        assert_eq!(s.len(), 32); // 16 bytes = 32 hex chars
-        assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

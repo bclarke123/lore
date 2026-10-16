@@ -17,6 +17,7 @@ use crate::logging;
 /// The service does the work its callers relay to it, so its pools are sized for
 /// working even on a machine whose clients relay. Sizing it for relaying would
 /// leave the process that does all the work with the pools of one that does none.
+#[lore_macro::test_pub]
 fn runs_the_service(command: &LoreCommands) -> bool {
     matches!(
         command,
@@ -77,7 +78,13 @@ pub fn client_main() -> ExitCode {
         lore::size_threads_for_relaying();
     }
 
-    let mut globals = lore_globals_from_args(&cli);
+    let mut globals = match lore_globals_from_args(&cli) {
+        Ok(globals) => globals,
+        Err(err) => {
+            crate::eprintln!("Error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     if let Err(err) = globals.validate() {
         crate::eprintln!("Error: {err}");
         return ExitCode::FAILURE;
@@ -92,44 +99,4 @@ pub fn client_main() -> ExitCode {
     }
 
     return ExitCode::from(result);
-}
-
-#[cfg(test)]
-mod tests {
-    use clap::Parser;
-
-    use super::*;
-
-    fn command_of(args: &[&str]) -> LoreCommands {
-        LoreCli::try_parse_from(args)
-            .expect("the arguments must parse")
-            .command
-            .expect("the arguments must name a command")
-    }
-
-    /// `service run` is the service. Sizing it for relaying would leave the
-    /// process that does all the work with the pools of one that does none.
-    #[test]
-    fn the_command_that_runs_the_service_is_not_sized_for_relaying() {
-        assert!(runs_the_service(&command_of(&["lore", "service", "run"])));
-    }
-
-    /// Every other `service` command is a client of the service, including the
-    /// two that ask for one to start and stop.
-    #[test]
-    fn the_commands_that_act_on_the_service_are_sized_for_relaying() {
-        for args in [
-            vec!["lore", "service", "start"],
-            vec!["lore", "service", "stop"],
-            vec!["lore", "service", "set-executable", "/opt/lore/bin/lore"],
-            vec!["lore", "service", "set-use-automatically", "true"],
-            vec!["lore", "status"],
-        ] {
-            assert!(
-                !runs_the_service(&command_of(&args)),
-                "{} is a client of the service",
-                args.join(" ")
-            );
-        }
-    }
 }

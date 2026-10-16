@@ -257,6 +257,7 @@ impl PsyncDriver {
         temporary_path: PathBuf,
         final_path: PathBuf,
         buffers: B,
+        durable: bool,
     ) -> std::io::Result<()> {
         SyscallPool::global()
             .submit(move || {
@@ -277,14 +278,18 @@ impl PsyncDriver {
                 // here: the sync and the rename below touch the page cache and the directory,
                 // never the caller's memory.
                 drop(buffers);
-                file.sync_all()?;
+                if durable {
+                    file.sync_all()?;
+                }
                 drop(file);
                 std::fs::rename(&temporary_path, &final_path)?;
                 // Directory sync is best-effort: the rename is already
                 // durable in content, and a lost directory entry after a
                 // crash reproduces the pre-write state the caller already
                 // handles.
-                let _ = sync_parent_dir(&final_path);
+                if durable {
+                    let _ = sync_parent_dir(&final_path);
+                }
                 Ok(())
             })
             .await
@@ -416,6 +421,7 @@ impl PsyncDriver {
 /// a Windows container bind-mount root instead fails `mkdir` with `PermissionDenied` while
 /// remaining a directory. This restores the pre-1.94 contract every caller here was written
 /// against: success means the directory exists, however that came to be true.
+#[lore_macro::test_pub]
 fn forgive_existing_dir(
     result: std::io::Result<()>,
     path: &std::path::Path,
@@ -787,50 +793,4 @@ fn write_vectored_impl<B: StableBufList>(
         offset += done as u64;
     }
     Ok(total)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The shape of a Windows container bind-mount root: `mkdir` fails, but the target already
-    /// stats as a directory, so the failure is forgiven.
-    #[test]
-    fn forgive_existing_dir_forgives_a_failure_on_an_existing_directory() {
-        let dir = lore_base::test_util::TempDir::new("lore-io-psync-forgive-");
-        let synthetic_error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-
-        forgive_existing_dir(Err(synthetic_error), dir.path())
-            .expect("an existing directory must not fail the caller");
-    }
-
-    #[test]
-    fn forgive_existing_dir_propagates_a_failure_on_a_file() {
-        let dir = lore_base::test_util::TempDir::new("lore-io-psync-forgive-");
-        let file_path = dir.path().join("blocker");
-        std::fs::File::create(&file_path).expect("create blocker file");
-        let synthetic_error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-
-        let error = forgive_existing_dir(Err(synthetic_error), &file_path)
-            .expect_err("a file where a directory belongs must still fail");
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-    }
-
-    #[test]
-    fn forgive_existing_dir_propagates_a_failure_on_a_missing_path() {
-        let dir = lore_base::test_util::TempDir::new("lore-io-psync-forgive-");
-        let missing_path = dir.path().join("nowhere");
-        let synthetic_error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-
-        let error = forgive_existing_dir(Err(synthetic_error), &missing_path)
-            .expect_err("a genuinely missing path must still fail");
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-    }
-
-    #[test]
-    fn forgive_existing_dir_passes_success_through() {
-        let dir = lore_base::test_util::TempDir::new("lore-io-psync-forgive-");
-
-        forgive_existing_dir(Ok(()), dir.path()).expect("success must not become a failure");
-    }
 }

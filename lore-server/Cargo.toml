@@ -9,6 +9,7 @@ autobins = false
 
 [dependencies]
 anyhow = { workspace = true }
+async-channel = { workspace = true }
 async-stream = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }
@@ -73,14 +74,16 @@ lore-telemetry = { workspace = true }
 uuid = { workspace = true }
 x509-parser = { workspace = true }
 zerocopy = { workspace = true }
+# Stands in for the replication client in this crate's own tests, behind `test-util`.
+mockall = { workspace = true, optional = true }
 
 [build-dependencies]
-anyhow = { workspace = true }
 tonic-prost-build = { workspace = true }
 vergen = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The unit-test binary's store policies, set before the harness starts; see tests/unit/main.rs.
 ctor = { workspace = true }
 lore-credential = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
@@ -92,9 +95,11 @@ indexmap = { workspace = true }
 mockall = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 temp-env = { workspace = true }
+lore-server = { workspace = true, features = ["test-util"] }
 
 [features]
 default = []
+test-util = ["dep:mockall"]
 oodle = ["lore-revision/oodle"]
 integration_tests = []
 test_random = []
@@ -105,9 +110,12 @@ failure_generator = ["lore-storage/failure_generator"]
 
 [[bin]]
 name = "loreserver"
+# The binary holds no unit tests; the library it drives does.
+test = false
 
 [lib]
 name = "lore_server"
+test = false
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+[lints]
+workspace = true

@@ -55,6 +55,7 @@ use crate::telemetry::Transport;
 /// between v0 (`LoreStorageService`) and v4 (`StorageServiceV4`); the caller
 /// passes its `StorageProtocol` so v0 and v4 are distinguishable in traces via
 /// the `protocol` attribute.
+#[lore_macro::test_pub]
 pub(crate) fn build_storage_protocol_request_span(
     cmd: QuicOpCode,
     protocol: StorageProtocol,
@@ -407,6 +408,7 @@ pub fn message_handle_error_to_label(value: &MessageHandleError) -> &'static str
         MessageHandleError::InvalidFragment => "InvalidFragment",
         MessageHandleError::HandlerTimeout => "HandlerTimeout",
         MessageHandleError::SessionLimitReached => "SessionLimitReached",
+        MessageHandleError::InvalidArgument(_) => "InvalidArgument",
     }
 }
 
@@ -428,7 +430,8 @@ pub fn is_internal_error(error: &MessageHandleError) -> bool {
         | MessageHandleError::Metadata
         | MessageHandleError::HashFailed
         | MessageHandleError::InvalidFragment
-        | MessageHandleError::SessionLimitReached => false,
+        | MessageHandleError::SessionLimitReached
+        | MessageHandleError::InvalidArgument(_) => false,
         MessageHandleError::HandlerTimeout
         | MessageHandleError::InternalError
         | MessageHandleError::NotImplemented

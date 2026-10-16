@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::branch;
@@ -37,7 +36,7 @@ use crate::util::path::RelativePath;
 
 /// Data for the event describing one entry in a file's history.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileHistoryEventData {
     /// Path of the file.
@@ -564,6 +563,10 @@ async fn history_start(
     Ok(node_link)
 }
 
+/// Reports the history of the file at `path` along the first-parent line, reading and reporting
+/// each earlier revision at the node ID the history records for the file there. Where the file has
+/// no first-parent history before a revision, as for a file the second parent of a merge of
+/// divergent history added, the walk takes the second-parent line.
 pub async fn history(
     repository: Arc<RepositoryContext>,
     path: String,
@@ -608,10 +611,15 @@ pub async fn history(
                 node_id,
                 metadata_node
             );
+            let slot = if metadata_node.revision[0].is_zero() {
+                1
+            } else {
+                0
+            };
             (
-                metadata_node.action[0],
-                metadata_node.revision[0],
-                metadata_node.node[0],
+                metadata_node.action[slot],
+                metadata_node.revision[slot],
+                metadata_node.node[slot],
             )
         };
 
@@ -623,6 +631,7 @@ pub async fn history(
         state = state::State::deserialize(repository.clone(), signature_next)
             .await
             .forward::<FileHistoryError>("Failed to deserialize state")?;
+        node_id = node_id_next;
 
         history_state(repository.clone(), state.clone(), node_id, action).await?;
 
@@ -631,8 +640,6 @@ pub async fn history(
             break;
         }
 
-        // Next.
-        node_id = node_id_next;
         limit -= 1;
     }
 

@@ -11,8 +11,6 @@ pub use lore_revision::link::LinkFlags;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::util::path::RelativePath;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call::repository_call_read;
 use crate::call::repository_call_write;
@@ -22,7 +20,7 @@ use crate::interface::LoreString;
 
 /// Arguments for adding a new link to a linked repository at the given path.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(add_local)]
 pub struct LoreLinkAddArgs {
     /// Link repository URL
@@ -68,11 +66,11 @@ pub async fn add(
     dispatch_call(globals, args, callback, add_local).await
 }
 
-async fn add_local(
+fn add_local(
     globals: LoreGlobalArgs,
     args: LoreLinkAddArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -80,7 +78,6 @@ async fn add_local(
         add,
         |repository, token, args| async move { add_impl(repository, &token, args).await },
     )
-    .await
 }
 
 async fn add_impl(
@@ -115,7 +112,7 @@ async fn add_impl(
 
 /// Arguments for removing a link from the repository at the given path.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(remove_local)]
 pub struct LoreLinkRemoveArgs {
     /// Path within this repository where the link is removed
@@ -150,11 +147,11 @@ pub async fn remove(
     dispatch_call(globals, args, callback, remove_local).await
 }
 
-async fn remove_local(
+fn remove_local(
     globals: LoreGlobalArgs,
     args: LoreLinkRemoveArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -162,7 +159,6 @@ async fn remove_local(
         remove,
         |repository, token, args| async move { remove_impl(repository, &token, args).await },
     )
-    .await
 }
 
 async fn remove_impl(
@@ -174,12 +170,12 @@ async fn remove_impl(
         RelativePath::new_from_user_path(repository.require_path()?, args.link_path.as_str())
             .forward::<LinkError>("resolving link path")?;
 
-    lore_revision::link::remove::remove(repository, token, link_path).await
+    lore_revision::link::remove::remove_boxed(repository, token, link_path).await
 }
 
 /// Arguments for listing all linked repositories in the current repository.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(list_local)]
 pub struct LoreLinkListArgs {}
 
@@ -211,20 +207,19 @@ pub async fn list(
     dispatch_call(globals, args, callback, list_local).await
 }
 
-async fn list_local(
+fn list_local(
     globals: LoreGlobalArgs,
     args: LoreLinkListArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(globals, callback, args, list, move |repository, _args| {
         lore_revision::link::list::list(repository)
     })
-    .await
 }
 
 /// Arguments for reading detailed information about a single link.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(info_local)]
 pub struct LoreLinkInfoArgs {
     /// Path within this repository of the link to describe
@@ -259,11 +254,11 @@ pub async fn info(
     dispatch_call(globals, args, callback, info_local).await
 }
 
-async fn info_local(
+fn info_local(
     globals: LoreGlobalArgs,
     args: LoreLinkInfoArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
@@ -276,26 +271,62 @@ async fn info_local(
             )
             .forward::<LinkError>("resolving link path")?;
 
-            lore_revision::link::info::info(repository, link_path).await
+            lore_revision::link::info::info_boxed(repository, link_path).await
         },
     )
-    .await
 }
 
-pub async fn list_staged(globals: LoreGlobalArgs, callback: LoreEventCallback) -> i32 {
+/// Arguments for listing the links whose linked repositories hold staged changes.
+#[repr(C)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[handler(list_staged_local)]
+pub struct LoreLinkListStagedArgs {}
+
+/// Lists the links whose linked repositories hold staged changes, including nested links.
+///
+/// # Events
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
+///
+/// ## Link Events
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::LinkStagedEntry`](crate::interface::LoreEvent::LinkStagedEntry) | Emitted for each link with staged changes |
+pub async fn list_staged(
+    globals: LoreGlobalArgs,
+    args: LoreLinkListStagedArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    dispatch_call(globals, args, callback, list_staged_local).await
+}
+
+fn list_staged_local(
+    globals: LoreGlobalArgs,
+    args: LoreLinkListStagedArgs,
+    callback: LoreEventCallback,
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
-        (),
+        args,
         list_staged,
         move |repository, _args| lore_revision::link::list::list_staged(repository),
     )
-    .await
 }
 
 /// Arguments for updating the pin or properties of an existing link.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(update_local)]
 pub struct LoreLinkUpdateArgs {
     /// Path within this repository of the link to update
@@ -332,11 +363,11 @@ pub async fn update(
     dispatch_call(globals, args, callback, update_local).await
 }
 
-async fn update_local(
+fn update_local(
     globals: LoreGlobalArgs,
     args: LoreLinkUpdateArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -344,7 +375,6 @@ async fn update_local(
         update,
         |repository, token, args| async move { update_impl(repository, &token, args).await },
     )
-    .await
 }
 
 async fn update_impl(
@@ -356,5 +386,5 @@ async fn update_impl(
         RelativePath::new_from_user_path(repository.require_path()?, args.link_path.as_str())
             .forward::<LinkError>("resolving link path")?;
 
-    lore_revision::link::update::update(repository, token, link_path, args.pin.into()).await
+    lore_revision::link::update::update_boxed(repository, token, link_path, args.pin.into()).await
 }

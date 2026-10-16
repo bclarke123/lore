@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use lore_error_set::prelude::*;
 use lore_storage::options::ReadOptions;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::branch;
@@ -342,7 +341,7 @@ pub async fn cache_revision_list_states(
 
 /// Data for the event reporting a revision found by a search.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionFindEventData {
     /// Signature of the revision that was found.
@@ -354,7 +353,7 @@ pub enum FindOptions {
     Number(u64),
 }
 
-pub async fn find_impl(
+pub(crate) async fn find(
     repository: Arc<RepositoryContext>,
     options: FindOptions,
 ) -> Result<(), FindError> {
@@ -401,4 +400,12 @@ pub async fn find_impl(
             Err(err)
         }
     }
+}
+
+/// Boxed version of [`find`] for cross-crate use.
+pub fn find_boxed(
+    repository: Arc<RepositoryContext>,
+    options: FindOptions,
+) -> crate::BoxFuture<'static, Result<(), FindError>> {
+    Box::pin(find(repository, options))
 }

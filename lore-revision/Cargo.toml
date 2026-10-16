@@ -6,11 +6,13 @@ publish = false
 
 [lib]
 name = "lore_revision"
+test = false
 
 [dependencies]
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
+bitcode = { workspace = true }
 blake3 = { workspace = true }
 bitflags = { workspace = true }
 bytes = { workspace = true }
@@ -69,12 +71,15 @@ zerocopy = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_ProjectedFileSystem", "Win32_Storage_FileSystem", "Win32_System_Diagnostics", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_Security"] }
 
 [dev-dependencies]
-# The non-self-describing format an event crosses the service boundary in.
-bitcode = { workspace = true }
+ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
-lore-storage = { workspace = true }
+lore-revision = { workspace = true, features = ["test-util"] }
+lore-storage = { workspace = true, features = ["test-util"] }
+lore-transport = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }
 serde = { workspace = true }
+# `start_paused` for the tests that drive a polling loop on a virtual clock.
+tokio = { workspace = true, features = ["test-util"] }
 trybuild = { workspace = true }
 
 [features]
@@ -87,7 +92,11 @@ seeding = []
 trace_log = ["lore-base/trace_log"]
 vfs = []
 swfs = []
+test-util = []
 
 [[test]]
 name = "compile_fail"
 required-features = ["compile_fail_tests"]
+
+[lints]
+workspace = true

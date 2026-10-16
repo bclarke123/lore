@@ -1537,6 +1537,44 @@ def test_branch_diff_auto_resolve_no_write_required(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_branch_diff_auto_resolve_keeps_a_conflict_the_merge_cannot_resolve(
+    new_lore_repo,
+):
+    """`branch diff --auto-resolve` reports a file both branches changed on the
+    same line as a conflict: the text merge leaves markers, so the conflict
+    passes through unresolved."""
+    repo: Lore = new_lore_repo()
+
+    shared = "shared.txt"
+    repo.write_commit_push(
+        "Base commit",
+        {shared: "line 1\nline 2\nline 3\n"},
+        offline=True,
+    )
+
+    repo.branch_create("feature", offline=True)
+    repo.write_commit_push(
+        "Feature edits line 2",
+        {shared: "line 1\nfeature line 2\nline 3\n"},
+        offline=True,
+    )
+
+    repo.branch_switch("main", offline=True)
+    repo.write_commit_push(
+        "Main edits line 2",
+        {shared: "line 1\nmain line 2\nline 3\n"},
+        offline=True,
+    )
+
+    output = repo.branch_diff("main", source="feature", auto_resolve=True, offline=True)
+
+    assert f"C {shared}" in output, (
+        "A conflict the text merge cannot resolve should stay a conflict\n"
+        "Output:\n" + output
+    )
+
+
+@pytest.mark.smoke
 def test_branch_diff_change_carries_the_move_source_path(new_lore_repo):
     """A file moved on a branch must come out of `branch diff` as one move
     event naming the path it was moved from. Without the source path a

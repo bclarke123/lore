@@ -2,19 +2,12 @@
 // SPDX-License-Identifier: MIT
 pub mod cert_metrics;
 pub mod core_hop;
+pub mod local_store_monitor;
 
 use lore_revision::interface::LoreGlobalArgs;
 
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::ResourcePermission;
-
-#[cfg(test)]
-pub fn address_with_random_context(address: lore_storage::Address) -> lore_storage::Address {
-    lore_storage::Address {
-        context: rand::random::<lore_storage::Context>(),
-        hash: address.hash,
-    }
-}
 
 pub const REPLICATION_USER_ID: &str = "<replication-user>";
 
@@ -40,14 +33,6 @@ pub fn setup_execution(
     std::sync::Arc::new(ctx)
 }
 
-#[cfg(test)]
-pub fn setup_test_execution() -> std::sync::Arc<lore_revision::interface::ExecutionContext> {
-    std::sync::Arc::new(lore_revision::interface::ExecutionContext::new_client(
-        LoreGlobalArgs::default(),
-        lore_revision::relay::EventDispatcher::no_dispatch(),
-    ))
-}
-
 pub fn get_user_id_from_token_ref(maybe_token: Option<&AuthorizationToken>) -> String {
     if let Some(token) = maybe_token {
         token.identity().to_string()
@@ -68,25 +53,4 @@ pub fn resources_from_token(token: Option<AuthorizationToken>) -> Vec<ResourcePe
     }
 
     Vec::new()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn setup_execution_stores_server_execution_state() {
-        let span = tracing::info_span!("test_request");
-        let _guard = span.enter();
-
-        let ctx = setup_execution("test", "test-corr".to_string(), "test-user".to_string());
-
-        let state = ctx
-            .caller_state()
-            .expect("caller_state should be set")
-            .clone();
-        let downcasted =
-            std::sync::Arc::downcast::<crate::execution_state::ServerExecutionState>(state);
-        assert!(downcasted.is_ok());
-    }
 }

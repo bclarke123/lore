@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use lore_revision::lore::*;
+use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::*;
 
 #[cfg(test)]
@@ -1045,7 +1046,16 @@ mod tests {
                 // legacy cross-partition behavior).
                 store
                     .clone()
-                    .copy(repo_a, address, repo_b, address.context, false)
+                    .copy(
+                        repo_a,
+                        address,
+                        repo_b,
+                        address.context,
+                        CopyBehavior {
+                            durable: false,
+                            do_not_replicate: false,
+                        },
+                    )
                     .await
                     .expect("Failed to copy fragment from repo A to repo B");
 
@@ -1083,7 +1093,16 @@ mod tests {
                 // Second copy call must be idempotent (Ok)
                 store
                     .clone()
-                    .copy(repo_a, address, repo_b, address.context, false)
+                    .copy(
+                        repo_a,
+                        address,
+                        repo_b,
+                        address.context,
+                        CopyBehavior {
+                            durable: false,
+                            do_not_replicate: false,
+                        },
+                    )
                     .await
                     .expect("Second copy call should return Ok(()) (idempotent)");
             })
@@ -1113,7 +1132,16 @@ mod tests {
 
                 let result = store
                     .clone()
-                    .copy(repo_a, address, repo_b, address.context, false)
+                    .copy(
+                        repo_a,
+                        address,
+                        repo_b,
+                        address.context,
+                        CopyBehavior {
+                            durable: false,
+                            do_not_replicate: false,
+                        },
+                    )
                     .await;
                 assert!(
                     result.as_ref().is_err_and(|e| e.is_address_not_found()),
@@ -1165,7 +1193,7 @@ mod tests {
                 // Copy using repo_b as source should fail — fragment is not in repo_b.
                 let result = store
                     .clone()
-                    .copy(repo_b, address, repo_c, address.context, false)
+                    .copy(repo_b, address, repo_c, address.context, CopyBehavior { durable: false, do_not_replicate: false })
                     .await;
                 assert!(
                     result.as_ref().is_err_and(|e| e.is_address_not_found()),

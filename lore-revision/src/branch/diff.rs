@@ -139,7 +139,7 @@ pub async fn diff(
         .map(|metadata| branch::name(&metadata).unwrap_or_default().to_string())
         .unwrap_or_default();
 
-    let diff = Box::pin(branch::diff3_collect(
+    let diff = branch::diff3_collect(
         repository,
         source_branch.id,
         source_latest,
@@ -148,7 +148,7 @@ pub async fn diff(
         path,
         false, /* Do not include identical changes */
         auto_resolve,
-    ))
+    )
     .await?;
 
     branch::dispatch_diff_events(

@@ -7,7 +7,7 @@
 //!
 //! C ABI types referenced by the API live in their original crates:
 //! `Partition` in `lore_base::types`, `StoreMatch` in
-//! `lore_storage::store_types`, `LoreBytes` and `LoreErrorCode` in
+//! `lore_storage::store_types`, `LoreBytes` and `LoreErrorDetail` in
 //! `lore_revision::event`. The handle type [`handle::LoreStore`] is defined
 //! here.
 //!
@@ -16,7 +16,7 @@
 //! The item-taking entry points fan out through `fan_out_items`: one task per item for a batch of
 //! several, the calling task for a batch of one. `lore_storage_copy` and
 //! `lore_storage_get_metadata` fan out by hand — the first carries a per-item outcome wider than
-//! an error code, the second spawns only the items its local probe missed.
+//! the item's result, the second spawns only the items its local probe missed.
 //!
 //! # Callback contract
 //!
@@ -48,7 +48,10 @@
 //! // ... pass `callback` to lore::storage::put / get / etc.
 //! ```
 
+#[cfg(not(feature = "test-util"))]
 pub(crate) mod call;
+#[cfg(feature = "test-util")]
+pub mod call;
 pub mod close;
 pub mod copy;
 pub mod flush;
@@ -68,18 +71,23 @@ pub mod put;
 pub mod put_file;
 pub mod put_file_resolved;
 pub mod put_resolved;
+#[cfg(not(feature = "test-util"))]
 pub(crate) mod remote;
+#[cfg(feature = "test-util")]
+pub mod remote;
+#[cfg(not(feature = "test-util"))]
 pub(crate) mod store;
+#[cfg(feature = "test-util")]
+pub mod store;
 pub mod upload;
 
-use lore_base::error::InvalidArguments;
 use lore_base::types::Address;
-use lore_error_set::internal::SupportsInternalError;
-use lore_revision::event::LoreErrorCode;
+use lore_error_set::prelude::*;
+use lore_revision::event::LoreErrorDetail;
+use lore_revision::event::LoreEvent;
+use lore_revision::store::event::LoreStoragePutItemCompleteEventData;
 use lore_storage::StorageError;
-use lore_storage::StoreError;
 use lore_storage::StoreResult;
-use lore_transport::ProtocolError;
 
 /// Close every storage handle currently registered with the library.
 ///
@@ -106,19 +114,10 @@ pub async fn close_all_handles() {
 /// and running the close sequence on each. Client-mode handles (no connection id recorded)
 /// are unaffected. Per-handle drains run in parallel.
 ///
-/// IPC buffer-bearing args policy: `lore_storage_put` and `lore_storage_put_resolved` carry a
-/// `LoreBytes` view into caller memory in their *args*, which has no natural cross-process
-/// representation. `LoreBytes::deserialize` always errors, so those args cannot be reconstructed
-/// on the server side of the IPC boundary. `lore_storage_put_file` and
-/// `lore_storage_put_file_resolved` name a path instead, so they carry across it unchanged and are
-/// the delegable way to write content a service holds on disk.
-///
-/// Two caveats worth knowing before relying on this. Nothing enforces it: every op goes through
-/// `dispatch_call` and is delegated whenever service mode is active, and the failure surfaces as
-/// a message that fails to read — dropping the connection — rather than as the `InvalidArguments`
-/// a caller would expect. And the read ops (`lore_storage_get`, `lore_storage_get_resolved`) are
-/// *not* in this family despite emitting `LoreBytes`: they carry it only in events, whose
-/// lifetime is the callback, so their args round-trip fine.
+/// Buffers across the IPC boundary: the `LoreBytes` a `lore_storage_put` or
+/// `lore_storage_put_resolved` item views crosses as its bytes, which the service reads in the
+/// message they arrived in. A get item's `data_out` names memory the service cannot write, so it
+/// does not cross, and a relayed get answers with `GET_DATA` events instead.
 ///
 /// Revision tree handles loaded against a drained storage handle are closed too, and this
 /// is the only path that closes one for its caller: elsewhere a tree outlives its parent by
@@ -139,6 +138,7 @@ pub async fn close_for_connection(connection_id: u64) {
 /// Exposed at `pub(crate)` so the unit tests can exercise the close logic on an explicit
 /// entry list rather than the process-global registry — running the test against the live
 /// registry would close handles owned by other concurrent tests.
+#[lore_macro::test_pub]
 pub(crate) async fn drain_in_parallel(entries: Vec<(u64, std::sync::Arc<store::StoreInternal>)>) {
     use tokio::task::JoinSet;
     let mut tasks: JoinSet<()> = JoinSet::new();
@@ -181,10 +181,8 @@ pub(crate) fn item_content_range(offset: u64, length: u64) -> Option<std::ops::R
 /// than four identical tuples, so a field cannot be read out of position and a new field lands in
 /// every op at once.
 pub(crate) struct PutItemOutcome {
-    /// Address the content is stored under, or `Address::default()` when nothing was stored.
+    /// Address the content is stored under.
     pub(crate) address: Address,
-    /// `LoreErrorCode::None` on success, else the failing error's code.
-    pub(crate) error_code: LoreErrorCode,
     /// Whether the local store holds the content.
     pub(crate) stored_local: bool,
     /// Whether the content reached the remote, or was already durable there. Named for the event
@@ -193,115 +191,90 @@ pub(crate) struct PutItemOutcome {
 }
 
 impl PutItemOutcome {
-    /// An item that never reached the store: no address, nothing stored anywhere.
-    pub(crate) fn failed(error_code: LoreErrorCode) -> Self {
-        Self {
-            address: Address::default(),
-            error_code,
-            stored_local: false,
-            stored_remote: false,
-        }
-    }
-
     /// The outcome of a completed write, whichever write function produced it — `write_content`,
     /// `write_from_file` and `write_resolved` all report a `StoreResult`.
     ///
     /// A remote leg that failed is not an error here: the write returns `Ok` as long as the local
     /// store took the content, and `stored_remote` is what tells the two apart.
-    pub(crate) fn from_write(result: Result<StoreResult, StorageError>) -> Self {
-        match result {
-            Ok(written) => Self {
-                address: written.address,
-                error_code: LoreErrorCode::None,
-                stored_local: written.stored_local,
-                stored_remote: written.stored_durable,
-            },
-            Err(err) => Self::failed(storage_error_to_code(&err)),
+    pub(crate) fn from_write(written: StoreResult) -> Self {
+        Self {
+            address: written.address,
+            stored_local: written.stored_local,
+            stored_remote: written.stored_durable,
         }
     }
-}
 
-/// Map a `StorageError` to the external `LoreErrorCode` surface used by per-item completion
-/// events. Shared by every op that goes through the higher-level storage pipeline so the
-/// translation stays consistent. `SlowDown` surfaces back-pressure; a rejected argument and an
-/// oversized write are both caller-fixable and reported as `InvalidArguments`; an address lookup
-/// miss maps to `AddressNotFound`; everything else is `Internal`.
-pub(crate) fn storage_error_to_code(err: &StorageError) -> LoreErrorCode {
-    if err.is_slow_down() {
-        LoreErrorCode::SlowDown
-    } else if err.is_invalid_arguments() || err.is_oversized() {
-        LoreErrorCode::InvalidArguments
-    } else if err.is_address_not_found() || err.is_payload_not_found() {
-        LoreErrorCode::AddressNotFound
-    } else {
-        LoreErrorCode::Internal
+    /// Emit the item's `PUT_ITEM_COMPLETE` and return the outcome that was sent. A failed item
+    /// reports no address and neither placement flag.
+    pub(crate) fn emit(id: u64, result: Result<Self, StorageError>) -> Result<(), StorageError> {
+        let placed = result.as_ref().ok();
+        LoreEvent::StoragePutItemComplete(LoreStoragePutItemCompleteEventData {
+            id,
+            address: placed.map_or_else(Address::default, |outcome| outcome.address),
+            error: item_detail(&result),
+            stored_local: u8::from(placed.is_some_and(|outcome| outcome.stored_local)),
+            stored_remote: u8::from(placed.is_some_and(|outcome| outcome.stored_remote)),
+        })
+        .send();
+        result.map(|_| ())
     }
 }
 
-/// Map a low-level `StoreError` to the external `LoreErrorCode`. Variants align with
-/// [`storage_error_to_code`]; `StoreError` is the trait-method error type and so does not carry
-/// the `NotConnected` / `Disconnected` cases.
-pub(crate) fn store_error_to_code(err: &StoreError) -> LoreErrorCode {
-    if err.is_slow_down() {
-        LoreErrorCode::SlowDown
-    } else if err.is_oversized() {
-        LoreErrorCode::InvalidArguments
-    } else if err.is_address_not_found() || err.is_payload_not_found() {
-        LoreErrorCode::AddressNotFound
-    } else {
-        LoreErrorCode::Internal
-    }
+/// An item rejected on its own arguments, before any store work. `reason` becomes the item event's
+/// error message.
+#[lore_macro::test_pub]
+pub(crate) fn invalid_item(reason: impl Into<String>) -> StorageError {
+    StorageError::from(lore_base::error::InvalidArguments {
+        reason: reason.into(),
+    })
 }
 
-/// Map a transport-layer `ProtocolError` to the external `LoreErrorCode`. Sites that
-/// previously reached for `protocol_error_to_storage` followed by `storage_error_to_code`
-/// just to fill out a per-item event can use this directly — the `StorageError` round-trip
-/// only mattered when callers needed the address-bearing `AddressNotFound` struct.
-/// `NotFound` and `NoRemote` both map to `AddressNotFound` because at this layer "the peer
-/// doesn't have it / the peer isn't reachable for this address" is the actionable signal
-/// callers want; transport-level back-pressure surfaces as `SlowDown`; everything else
-/// (disconnected, internal, not-authorized, etc.) is `Internal`.
-pub(crate) fn protocol_error_to_code(err: &ProtocolError) -> LoreErrorCode {
-    if err.is_slow_down() {
-        LoreErrorCode::SlowDown
-    } else if err.is_oversized() {
-        LoreErrorCode::InvalidArguments
-    } else if err.is_not_found() || err.is_no_remote() {
-        LoreErrorCode::AddressNotFound
-    } else {
-        LoreErrorCode::Internal
-    }
+/// The error for a range whose start lies beyond the content it names.
+pub(crate) fn offset_past_end(offset: u64, size_content: u64) -> StorageError {
+    invalid_item(format!(
+        "item offset {offset} starts past the {size_content} byte content"
+    ))
 }
 
-/// Pick the most actionable per-item code from `codes` to use as the call-level error
-/// summary. Severity ordering, most-actionable first:
-///   `InvalidArguments` > `Internal` > `SlowDown` > `AddressNotFound`
+/// The detail an item's terminal event carries: the empty default on success, and on failure the
+/// error's own FFI code, message and trace. The default detail allocates nothing, so only a
+/// failure costs anything.
+pub(crate) fn item_detail<T>(result: &Result<T, StorageError>) -> LoreErrorDetail {
+    result
+        .as_ref()
+        .err()
+        .map_or_else(LoreErrorDetail::default, LoreErrorDetail::from_error)
+}
+
+/// How actionable a failure is, highest first. A rejected argument is the caller's own bug and
+/// ranks above everything. An internal failure points at the store or the server. `SlowDown` asks
+/// for a retry. A lookup miss is the most expected failure, so it ranks last.
 ///
-/// The reasoning: `InvalidArguments` is a caller bug, the user wants to see it first. An
-/// `Internal` failure points to a server- or store-side issue. `SlowDown` is a hint to
-/// retry. `AddressNotFound` is the most expected, most graceful failure mode. Any
-/// `LoreErrorCode::None` entries are skipped — we summarise only the failures.
-///
-/// Returns `None` if every entry is `None` (i.e. nothing failed).
-pub(crate) fn aggregate_error_code(
-    codes: impl IntoIterator<Item = LoreErrorCode>,
-) -> Option<LoreErrorCode> {
-    fn severity(code: LoreErrorCode) -> u8 {
-        match code {
-            LoreErrorCode::InvalidArguments => 4,
-            LoreErrorCode::Internal => 3,
-            LoreErrorCode::SlowDown => 2,
-            LoreErrorCode::AddressNotFound => 1,
-            LoreErrorCode::None => 0,
-        }
+/// Every way a lookup can miss has to be named here. A remote miss arrives as `NotFound` or
+/// `NoRemote` rather than `AddressNotFound`, and leaving those to the internal fallthrough would
+/// let one absent key outrank, and so hide, a `SlowDown` raised by another item of the same batch.
+fn severity(err: &StorageError) -> u8 {
+    const CALLER_FIXABLE: u8 = 4;
+    const INTERNAL: u8 = 3;
+    const RETRYABLE: u8 = 2;
+    const MISS: u8 = 1;
+
+    if err.is_invalid_arguments() || err.is_oversized() {
+        CALLER_FIXABLE
+    } else if err.is_slow_down() {
+        RETRYABLE
+    } else if err.is_address_not_found()
+        || err.is_payload_not_found()
+        || err.is_not_found()
+        || err.is_no_remote()
+    {
+        MISS
+    } else {
+        INTERNAL
     }
-    codes
-        .into_iter()
-        .filter(|c| *c != LoreErrorCode::None)
-        .max_by_key(|c| severity(*c))
 }
 
-/// Run one batched op's items and reduce their per-item codes to the call-level result.
+/// Run one batched op's items and reduce their outcomes to the call-level result.
 ///
 /// A batch of several runs one task per item and awaits them all before returning; a batch of one
 /// runs on the calling task. Spawning a single item would hand it to a worker thread and wait to be
@@ -317,13 +290,13 @@ pub(crate) fn aggregate_error_code(
 /// otherwise cost an allocation on the path this exists to make cheap.
 ///
 /// `$future` is evaluated once per item and must produce a `Send + 'static` future resolving to
-/// that item's `LoreErrorCode`; per-item setup that borrows the op's locals — resolving a session
-/// out of a `SessionReuse`, cloning the store — belongs inside it, as it runs before the future is
-/// spawned. That setup must be infallible: a `?` or `return` part-way through the loop would drop
-/// the `JoinSet` and abort the items already in flight.
+/// that item's `Result<(), StorageError>`; per-item setup that borrows the op's locals — resolving
+/// a session out of a `SessionReuse`, cloning the store — belongs inside it, as it runs before the
+/// future is spawned. That setup must be infallible: a `?` or `return` part-way through the loop
+/// would drop the `JoinSet` and abort the items already in flight.
 ///
-/// Every spawned item is joined before returning, and a task that yields no code counts as
-/// `LoreErrorCode::Internal`, so no item's slot is lost.
+/// Every spawned item is joined before returning, and a task that yields no result counts as an
+/// internal failure, so no item's slot is lost.
 ///
 /// A macro rather than a function because `ObservedTask` records `Location::caller()` and the server
 /// labels its task metrics with it: expanding at the op's own line keeps one label per op, where a
@@ -334,206 +307,97 @@ macro_rules! fan_out_items {
         let total = items.len();
         if let [single] = items {
             let $item = single;
+            let mut outcomes = $crate::storage::ItemOutcomes::default();
             // `&$item` is a re-borrow only here, where the binding is already a reference; the
             // spawned arm needs that borrow to reach its owned clone.
             #[allow(clippy::needless_borrow)]
-            let code = $future.await;
-            $crate::storage::build_call_error(&[code], total, $op_name)
+            let result = $future.await;
+            outcomes.push(result);
+            outcomes.into_call_result(total, $op_name)
         } else {
-            let mut tasks: ::tokio::task::JoinSet<::lore_revision::event::LoreErrorCode> =
-                ::tokio::task::JoinSet::new();
+            let mut tasks: ::tokio::task::JoinSet<
+                ::std::result::Result<(), ::lore_storage::StorageError>,
+            > = ::tokio::task::JoinSet::new();
             for $item in items.iter().cloned() {
                 ::lore_base::lore_spawn!(tasks, $future);
             }
-            let codes = $crate::storage::drain_codes(tasks).await;
-            $crate::storage::build_call_error(&codes, total, $op_name)
+            $crate::storage::ItemOutcomes::drain(tasks)
+                .await
+                .into_call_result(total, $op_name)
         }
     }};
 }
 pub(crate) use fan_out_items;
 
-/// Drain a `JoinSet<LoreErrorCode>` into a `Vec<LoreErrorCode>`, mapping `JoinError` (task
-/// panic / cancellation) to `LoreErrorCode::Internal` so the per-item slot is never lost.
-/// The capacity hint comes from the `JoinSet`'s pending count at entry, before any task has
-/// joined, so it always matches the spawned-item total.
-pub(crate) async fn drain_codes(
-    mut tasks: tokio::task::JoinSet<LoreErrorCode>,
-) -> Vec<LoreErrorCode> {
-    let mut codes: Vec<LoreErrorCode> = Vec::with_capacity(tasks.len());
-    while let Some(result) = tasks.join_next().await {
-        codes.push(result.unwrap_or(LoreErrorCode::Internal));
-    }
-    codes
+/// Reduces the per-item outcomes to the call-level result as they arrive.
+///
+/// Only the dominant failure and the failure count are kept, not every item's result. A
+/// `StorageError` carries its own trace, so holding one per item would make the call's peak memory
+/// follow the item count.
+#[lore_macro::test_pub]
+#[derive(Default)]
+pub(crate) struct ItemOutcomes {
+    failed: usize,
+    dominant: Option<StorageError>,
 }
 
-/// Build the call-level `Result<(), E>` from a per-item code slice plus two error-builder
-/// closures. `op_name` lands in the `"{failed}/{total} {op_name} items failed"` reason
-/// string. The dispatch:
-/// - All entries `None` → `Ok(())`.
-/// - Aggregate severity `InvalidArguments` → `Err(E::from(InvalidArguments { reason }))`.
-/// - Anything else → `Err(E::internal(reason))`.
-pub(crate) fn build_call_error<E: From<InvalidArguments> + SupportsInternalError>(
-    codes: &[LoreErrorCode],
-    total: usize,
-    op_name: &str,
-) -> Result<(), E> {
-    let failed = codes.iter().filter(|c| **c != LoreErrorCode::None).count();
-    match aggregate_error_code(codes.iter().copied()) {
-        None => Ok(()),
-        Some(LoreErrorCode::InvalidArguments) => Err(E::from(InvalidArguments {
-            reason: format!("{failed}/{total} {op_name} items failed"),
-        })),
-        Some(_) => Err(E::internal(format!(
-            "{failed}/{total} {op_name} items failed"
-        ))),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use super::*;
-    use crate::storage::handle;
-    use crate::storage::store::StoreInternal;
-    use crate::storage::store::in_memory_for_tests;
-
-    /// `drain_in_parallel` is the worker `close_all_handles` and `close_for_connection`
-    /// invoke after they collect entries. Driving it directly with a hand-built entry list
-    /// avoids racing against other tests through the process-global registry. Each entry's
-    /// store gets marked invalid and a flush task spawns.
-    #[tokio::test]
-    async fn drain_in_parallel_marks_each_store_invalid() {
-        let s1 = in_memory_for_tests("drain-1").await;
-        let s2 = in_memory_for_tests("drain-2").await;
-        let w1 = Arc::downgrade(&s1);
-        let w2 = Arc::downgrade(&s2);
-
-        drain_in_parallel(vec![(1, s1), (2, s2)]).await;
-
-        // The flush task holds an Arc clone, so the strong count may still be > 0 after the
-        // drain returns — assert against the invalid flag instead.
-        for w in [w1, w2] {
-            let invalid = w
-                .upgrade()
-                .is_none_or(|s| s.invalid.load(std::sync::atomic::Ordering::Acquire));
-            assert!(invalid, "store should be marked invalid after drain");
+impl ItemOutcomes {
+    /// Fold one item's outcome in.
+    #[lore_macro::test_pub]
+    pub(crate) fn push(&mut self, result: Result<(), StorageError>) {
+        if let Err(err) = result {
+            self.failed += 1;
+            self.consider(err);
         }
     }
 
-    /// `handle::drain_for_connection` returns only the entries whose `connection_id` matches.
-    /// The full `close_for_connection` flow then funnels them through `drain_in_parallel`;
-    /// this test verifies the registry-side filter without sweeping the live registry's
-    /// other entries.
-    #[tokio::test]
-    async fn drain_for_connection_filter_only_returns_matching_entries() {
-        let conn_7_a = build_connection_store("conn-7-a", 7).await;
-        let conn_7_b = build_connection_store("conn-7-b", 7).await;
-        let conn_8 = build_connection_store("conn-8", 8).await;
-        let client = in_memory_for_tests("client").await;
-
-        let h_a = handle::register(conn_7_a);
-        let h_b = handle::register(conn_7_b);
-        let h_8 = handle::register(conn_8);
-        let h_client = handle::register(client);
-
-        let drained = handle::drain_for_connection(7);
-        let drained_ids: std::collections::HashSet<u64> =
-            drained.iter().map(|(id, _)| *id).collect();
-        assert!(drained_ids.contains(&h_a.handle_id));
-        assert!(drained_ids.contains(&h_b.handle_id));
-        assert!(!drained_ids.contains(&h_8.handle_id));
-        assert!(!drained_ids.contains(&h_client.handle_id));
-        assert!(handle::immutable_for_test(h_8).is_some());
-        assert!(handle::immutable_for_test(h_client).is_some());
-
-        for h in [h_8, h_client] {
-            handle::unregister(h);
+    /// Fold another reduction in, for an op whose items resolve down two paths. The result matches
+    /// pushing every item to one accumulator.
+    #[lore_macro::test_pub]
+    pub(crate) fn absorb(&mut self, other: Self) {
+        self.failed += other.failed;
+        if let Some(err) = other.dominant {
+            self.consider(err);
         }
     }
 
-    /// Teardown closes the revision tree handles on the connection's storage handles.
-    /// Handles on another connection, or on none, are left registered.
-    #[tokio::test]
-    async fn close_for_connection_closes_the_revision_handles_loaded_on_it() {
-        use lore_base::types::Hash;
-        use lore_base::types::Partition;
-        use lore_revision::event::LoreEvent;
-        use lore_revision::interface::LoreEventCallback;
-        use lore_revision::interface::LoreGlobalArgs;
+    /// Keep `err` as the call's failure when it outranks what is held, by [`severity`]. A later
+    /// failure of equal rank replaces the earlier one, so ties report the most recent.
+    fn consider(&mut self, err: StorageError) {
+        let outranks = self
+            .dominant
+            .as_ref()
+            .is_none_or(|held| severity(&err) >= severity(held));
+        if outranks {
+            self.dominant = Some(err);
+        }
+    }
 
-        use crate::revision_tree::handle as tree_handle;
-        use crate::revision_tree::handle::LoreRevisionTree;
-        use crate::revision_tree::load::LoreRevisionTreeLoadArgs;
-        use crate::revision_tree::load::load;
-
-        async fn load_tree(store: handle::LoreStore, repository: Partition) -> LoreRevisionTree {
-            let loaded: Arc<std::sync::Mutex<Option<u64>>> = Arc::new(std::sync::Mutex::new(None));
-            let sink = loaded.clone();
-            let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
-                if let LoreEvent::RevisionTreeLoaded(data) = event {
-                    *sink.lock().unwrap() = Some(data.handle_id);
-                }
+    /// Fold in every per-item task, turning a `JoinError` (task panic or cancellation) into an
+    /// internal failure so no item's slot is lost.
+    pub(crate) async fn drain(mut tasks: tokio::task::JoinSet<Result<(), StorageError>>) -> Self {
+        let mut outcomes = Self::default();
+        while let Some(joined) = tasks.join_next().await {
+            outcomes.push(joined.unwrap_or_else(|err| {
+                Err(StorageError::internal_with_context(
+                    err,
+                    "joining item task",
+                ))
             }));
-            let status = load(
-                LoreGlobalArgs::default(),
-                LoreRevisionTreeLoadArgs {
-                    store,
-                    repository,
-                    revision_hash: Hash::default(),
-                },
-                callback,
-            )
-            .await;
-            assert_eq!(status, 0, "loading the revision tree fixture must succeed");
-            LoreRevisionTree {
-                handle_id: loaded
-                    .lock()
-                    .unwrap()
-                    .expect("load must emit RevisionTreeLoaded"),
-            }
         }
-
-        const CONNECTION: u64 = 0x18A;
-
-        let dropped = handle::register(build_connection_store("teardown", CONNECTION).await);
-        let client = handle::register(in_memory_for_tests("teardown-client").await);
-        let on_dropped = load_tree(dropped, Partition::from([0x1Au8; 16])).await;
-        let on_client = load_tree(client, Partition::from([0x1Bu8; 16])).await;
-
-        close_for_connection(CONNECTION).await;
-
-        assert!(
-            handle::lookup(dropped).is_none(),
-            "the connection's storage handle must be closed",
-        );
-        assert!(
-            tree_handle::lookup(on_dropped).is_none(),
-            "the revision tree loaded on it must be closed with it",
-        );
-        assert!(
-            tree_handle::lookup(on_client).is_some(),
-            "a revision tree on a handle the connection did not own must survive",
-        );
-
-        tree_handle::unregister(on_client);
-        handle::unregister(client);
+        outcomes
     }
 
-    async fn build_connection_store(identity: &str, connection_id: u64) -> Arc<StoreInternal> {
-        let bare = in_memory_for_tests(identity).await;
-        let immutable = bare.immutable.clone();
-        let mutable = bare.mutable.clone();
-        Arc::new(
-            StoreInternal::new(
-                identity,
-                immutable,
-                mutable,
-                None,
-                crate::storage::store::BoundFlags::default(),
-                false,
-            )
-            .with_connection_id(connection_id),
-        )
+    /// The call-level result: the dominant failure, reported with its own code and message. How
+    /// many items failed belongs to no single error, so it lands on the trace as context.
+    #[lore_macro::test_pub]
+    pub(crate) fn into_call_result(self, total: usize, op_name: &str) -> Result<(), StorageError> {
+        let failed = self.failed;
+        match self.dominant {
+            None => Ok(()),
+            Some(dominant) => Err(dominant).forward_with::<StorageError, _>(|| {
+                format!("{failed}/{total} {op_name} items failed")
+            }),
+        }
     }
 }

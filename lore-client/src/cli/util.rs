@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use lore::branch;
 use lore::branch::LoreBranchInfoArgs;
+use lore::call_delegation::run_command;
 use lore::interface::Context;
 use lore::interface::LoreArray;
 use lore::interface::LoreEvent;
@@ -21,7 +21,6 @@ use lore::interface::LoreRevisionResolveEventData;
 use lore::interface::LoreRevisionResolveTarget;
 use lore::interface::LoreRevisionSyncProgressEventData;
 use lore::interface::LoreString;
-use lore::runtime;
 use parking_lot::Mutex;
 
 use crate::eprintln;
@@ -152,6 +151,15 @@ pub fn convert_to_lore_string_vec(paths: &[String]) -> Vec<LoreString> {
     paths.iter().map(LoreString::from).collect()
 }
 
+pub fn split_path_messages(values: &[String]) -> (Vec<LoreString>, Vec<LoreString>) {
+    values
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[path, message]| (LoreString::from(path), LoreString::from(message)))
+        .unzip()
+}
+
 pub fn convert_paths_and_targets(
     paths: &Option<Vec<String>>,
     targets: &Option<String>,
@@ -217,7 +225,7 @@ impl BranchNameResolver {
                 *name_cb.lock() = Some(data.name.to_string());
             }
         }));
-        runtime().block_on(branch::info(self.globals.clone(), args, callback));
+        run_command(self.globals.clone(), args.into(), callback);
         name.lock()
             .take()
             .filter(|name| !name.is_empty())
@@ -449,56 +457,5 @@ pub fn read_line_with_editing(buf: &mut String) -> std::io::Result<usize> {
     #[cfg(not(unix))]
     {
         std::io::stdin().read_line(buf)
-    }
-}
-
-#[cfg(test)]
-mod format_bytes_tests {
-    use super::format_bytes_to_string;
-
-    /// A count of bytes is exact, so a decimal on it is noise at best and
-    /// misleading at worst — "600.00 bytes" reads as a measurement that was
-    /// rounded when it was not.
-    #[test]
-    fn a_raw_byte_count_carries_no_decimals() {
-        assert_eq!(format_bytes_to_string(0), "0 bytes");
-        assert_eq!(format_bytes_to_string(1), "1 bytes");
-        assert_eq!(format_bytes_to_string(600), "600 bytes");
-        assert_eq!(format_bytes_to_string(1024), "1024 bytes");
-    }
-
-    #[test]
-    fn a_scaled_unit_carries_decimals_because_the_remainder_means_something() {
-        assert_eq!(format_bytes_to_string(1025), "1.00 KiB");
-        assert_eq!(format_bytes_to_string(1536), "1.50 KiB");
-        assert_eq!(format_bytes_to_string(3 * 1024 * 1024 / 2), "1.50 MiB");
-        assert_eq!(
-            format_bytes_to_string(3 * 1024 * 1024 * 1024 / 2),
-            "1.50 GiB"
-        );
-    }
-}
-
-#[cfg(test)]
-mod termination_signal_tests {
-    use std::time::Duration;
-
-    use super::TerminationSignals;
-
-    /// What registering ahead of the socket relies on: the handler is what holds
-    /// a signal, so one delivered between registering and waiting reaches the
-    /// wait rather than ending the process.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_signal_delivered_before_the_wait_still_ends_it() {
-        let mut signals = TerminationSignals::register().expect("the handlers must register");
-
-        // Safety: raises a signal in this process, which the handler registered
-        // above now holds rather than the default disposition that would end it.
-        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
-
-        tokio::time::timeout(Duration::from_secs(5), signals.recv())
-            .await
-            .expect("a signal delivered before the wait must still end it");
     }
 }

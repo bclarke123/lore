@@ -2,13 +2,22 @@
 # SPDX-License-Identifier: MIT
 import logging
 import os
+import time
 
 import pytest
-
 from error_types import BranchBehindLatest
+from lore_parsers import parse_jsonl, parse_status_json, parse_status_summary_json
+from test_utils import to_posix
+
 from lore import Lore, verify_signatures
 
 logger = logging.getLogger(__name__)
+
+# Top directories of generated files in `test_restore`, each holding 100 files in
+# ten subdirectories, one of each ten 500 KB. Ten made 1,000 files and 50 MB, a
+# large share of one of the slowest tests in the suite; three still restore many
+# directories and files in both directions.
+GENERATED_TOP_DIRS = 3
 
 
 @pytest.mark.smoke
@@ -124,7 +133,7 @@ def test_restore(new_lore_repo):
     output = repo.revision_info()
     restore_base_revision = output.signature
 
-    for i in range(10):
+    for i in range(GENERATED_TOP_DIRS):
         subpath = str(i)
         repo.make_dirs(subpath)
         for j in range(10):
@@ -151,3 +160,48 @@ def test_restore(new_lore_repo):
 
     repo.sync(restore_back_revision)
     repo.revision_restore("Restore revision with all generated files")
+
+
+@pytest.mark.smoke
+def test_restore_records_no_time_a_later_write_could_share(new_lore_repo):
+    """A file the restore reads whose time is not older than the filesystem clock the restore
+    read first has no time recorded: a write after the read may share it. The scan after the
+    restore reads the file instead of answering for it by that time.
+    """
+    repo: Lore = new_lore_repo()
+    name = "restored.bin"
+    with repo.open_file(name, "w+b") as output_file:
+        output_file.write(os.urandom(4096))
+    repo.stage(scan=True)
+    repo.commit("First content")
+    repo.push()
+    first = repo.revision_info().signature
+
+    # The same size, so only the recorded time or the content can tell the files apart.
+    with repo.open_file(name, "w+b") as output_file:
+        output_file.write(os.urandom(4096))
+    repo.stage(scan=True)
+    repo.commit("Second content")
+    repo.push()
+
+    repo.sync(first)
+    ahead = time.time() + 3600
+    os.utime(os.path.join(repo.path, name), (ahead, ahead))
+
+    restored = parse_jsonl(
+        repo.revision_restore("Restore the first content", json=True),
+        "revisionRestoreFile",
+    )
+    assert [to_posix(entry["path"]) for entry in restored] == [name], (
+        f"the restore must read {name} from the working tree, got {restored}"
+    )
+
+    output = repo.status(scan=True, json=True)
+    assert [
+        entry for entry in parse_status_json(output) if to_posix(entry["path"]) == name
+    ] == [], "the restored content is not a change"
+    summary = parse_status_summary_json(output)
+    assert summary is not None, "scan must emit a repositoryStatusSummary event"
+    assert (summary["hashChecks"], summary["mtimeMatches"]) == (1, 0), (
+        f"the restore recorded a time a later write could share, got {summary}"
+    )

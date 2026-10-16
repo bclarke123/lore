@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::branch;
@@ -21,7 +20,7 @@ use crate::state::State;
 
 /// Header information for a revision history listing.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionHistoryEventData {
     /// Repository identifier the history belongs to.
@@ -38,7 +37,7 @@ impl LoreRevisionHistoryEventData {
 
 /// A single entry in a revision history listing.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionHistoryEntryEventData {
     /// Revision hash signature.
@@ -214,7 +213,7 @@ async fn load_remote_latest(repository: Arc<RepositoryContext>, branch: BranchId
     }
 }
 
-pub async fn history(
+pub(crate) async fn history(
     repository: Arc<RepositoryContext>,
     options: HistoryOptions,
 ) -> Result<(), RevisionHistoryError> {
@@ -307,4 +306,12 @@ pub async fn history(
     }
 
     Ok(())
+}
+
+/// Boxed version of [`history`] for cross-crate use.
+pub fn history_boxed(
+    repository: Arc<RepositoryContext>,
+    options: HistoryOptions,
+) -> crate::BoxFuture<'static, Result<(), RevisionHistoryError>> {
+    Box::pin(history(repository, options))
 }

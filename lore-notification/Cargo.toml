@@ -19,3 +19,6 @@ lore-revision = { workspace = true }
 lore-transport = { workspace = true }
 lore-error-set = { workspace = true }
 lore-proto = { workspace = true }
+
+[lints]
+workspace = true

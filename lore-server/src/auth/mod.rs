@@ -8,6 +8,7 @@ pub mod jwt_interceptor;
 pub mod local_auth;
 pub mod local_jwk;
 pub mod minting;
+pub mod oidc;
 pub mod provider;
 pub mod refresh;
 pub mod resource_exchange;

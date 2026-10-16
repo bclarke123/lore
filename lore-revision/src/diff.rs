@@ -89,11 +89,15 @@ pub async fn diff_revision_paths(
                     )
                     .await
                 });
-            while let Some(change) = walk.next().await {
-                task_tx
-                    .send(Ok(change))
+            loop {
+                let Some(change) = walk.next().await else {
+                    break;
+                };
+                let permit = task_tx
+                    .reserve()
                     .await
                     .internal("revision diff receiver dropped")?;
+                permit.send(Ok(change));
             }
             walk.finish()
                 .await
@@ -135,7 +139,7 @@ pub async fn diff_filesystem_paths(
     paths: Option<Vec<RelativePath>>,
 ) -> Result<Vec<NodeChange>, DiffError> {
     let filesystem = repository.file_system();
-    with_operation(filesystem, false, async |operation| {
+    with_operation(filesystem, async |operation| {
         diff_filesystem_paths_in(operation, repository, state_from, state_current, paths).await
     })
     .await

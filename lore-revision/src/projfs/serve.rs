@@ -546,7 +546,7 @@ async unsafe fn get_directory_enumeration_async(
         base_nodes.resize(instance_context.layers.len(), None);
 
         // TODO(vri): UCS-19230 - Links: Handle link nodes in ProjFS directory enumeration and find
-        let relative_path = RelativePath::new_from_user_path(
+        let relative_path = RelativePath::new_from_mount_path(
             instance_context.layers[0].module.path.as_path(),
             file_path.as_str(),
         )
@@ -594,7 +594,7 @@ async unsafe fn get_directory_enumeration_async(
             if sep > 0 {
                 let (directory_path, search) = enum_instance.search.split_at(sep);
 
-                let relative_path = RelativePath::new_from_user_path(
+                let relative_path = RelativePath::new_from_mount_path(
                     instance_context.layers[0].module.path.as_path(),
                     directory_path,
                 )
@@ -836,7 +836,7 @@ async unsafe fn get_placeholder_info_async(
         let state = layer.state.clone();
 
         let relative_path =
-            RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
+            RelativePath::new_from_mount_path(repository.require_path()?, path.as_str())
                 .unwrap_or_default();
 
         let Ok(node_link) = state
@@ -927,7 +927,7 @@ unsafe extern "system" fn query_file_name(
     let path: &[u16] =
         unsafe { slice::from_raw_parts((*cbdata).FilePathName, wcslen((*cbdata).FilePathName)) };
     let path = String::from_utf16_lossy(path);
-    let relative_path = RelativePath::new_from_user_path(
+    let relative_path = RelativePath::new_from_mount_path(
         instance_context.layers[0].module.path.as_path(),
         path.as_str(),
     )
@@ -973,7 +973,7 @@ unsafe extern "system" fn get_file_data(
     let path: &[u16] =
         unsafe { slice::from_raw_parts((*cbdata).FilePathName, wcslen((*cbdata).FilePathName)) };
     let path = String::from_utf16_lossy(path);
-    let relative_path = RelativePath::new_from_user_path(
+    let relative_path = RelativePath::new_from_mount_path(
         instance_context.layers[0].module.path.as_path(),
         path.as_str(),
     )
@@ -1063,10 +1063,10 @@ async fn get_file_data_async(
                 },
                 // Safety: Ok as buffer is verified non-null and range is clamped above
                 unsafe { slice::from_raw_parts_mut(write_buffer.cast::<u8>(), to_read) },
-                immutable::ReadOptions::default()
-                    .with_decompress()
-                    .with_remote()
-                    .with_verify(),
+                immutable::ReadOptions {
+                    trust_remote: immutable::read_options_from_repository(&repository).trust_remote,
+                    ..immutable::ReadOptions::default()
+                },
             )
             .await
             {

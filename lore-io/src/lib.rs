@@ -29,14 +29,28 @@
 
 mod buffer;
 mod dir;
+#[cfg(not(feature = "test-util"))]
 mod driver;
+#[cfg(feature = "test-util")]
+pub mod driver;
+#[cfg(not(feature = "test-util"))]
 mod file;
-#[cfg(target_family = "windows")]
+#[cfg(feature = "test-util")]
+pub mod file;
+#[cfg(all(target_family = "windows", not(feature = "test-util")))]
 mod iocp;
+#[cfg(all(target_family = "windows", feature = "test-util"))]
+pub mod iocp;
 #[cfg(target_family = "windows")]
 mod overlapped;
+#[cfg(not(feature = "test-util"))]
 mod pool;
+#[cfg(feature = "test-util")]
+pub mod pool;
+#[cfg(not(feature = "test-util"))]
 mod psync;
+#[cfg(feature = "test-util")]
+pub mod psync;
 #[cfg(target_os = "linux")]
 mod uring;
 

@@ -28,22 +28,25 @@ mod storage_copy_on_write_tests {
     use lore_base::types::Partition;
     use lore_revision::environment::EnvironmentConfig;
     use lore_revision::event::LoreBytes;
-    use lore_revision::event::LoreErrorCode;
     use lore_revision::event::LoreEvent;
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreEventCallback;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
     use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use lore_server::authnz::repository_catalog::BaselineRepositoryCatalog;
     use lore_server::grpc::server::FeatureSettings;
     use lore_server::grpc::server::GrpcServerBuilder;
+    use lore_server::grpc::server::GrpcTimeouts;
     use lore_server::hooks::HookDispatcher;
+    use lore_server::settings::BaselineAccess;
     use lore_storage::ImmutableStore;
     use lore_storage::StoreError;
     use lore_storage::StoreGetData;
     use lore_storage::StoreMatch;
     use lore_storage::StoreMatchResult;
     use lore_storage::StoreObliterateStats;
+    use lore_storage::immutable_store::CopyBehavior;
     use lore_storage::immutable_store::query_one;
     use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
@@ -182,7 +185,7 @@ mod storage_copy_on_write_tests {
             source_address: Address,
             destination_partition: Partition,
             destination_context: Context,
-            durable: bool,
+            behavior: CopyBehavior,
         ) -> Result<(), StoreError> {
             self.copies.fetch_add(1, Ordering::SeqCst);
             self.copy_sources
@@ -201,7 +204,7 @@ mod storage_copy_on_write_tests {
                     source_address,
                     destination_partition,
                     destination_context,
-                    durable,
+                    behavior,
                 )
                 .await
         }
@@ -318,6 +321,11 @@ mod storage_copy_on_write_tests {
         // Background server task in a test; LORE_CONTEXT propagation is unnecessary here.
         #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
+            let repository_catalog = Arc::new(BaselineRepositoryCatalog::new(
+                BaselineAccess::Reachable,
+                served.clone(),
+                mutable.clone(),
+            ));
             let outcome = GrpcServerBuilder::new()
                 .with_environment(EnvironmentConfig::default())
                 .with_feature(FeatureSettings::default())
@@ -332,12 +340,19 @@ mod storage_copy_on_write_tests {
                 .with_http2_config(
                     None,
                     None,
-                    Duration::from_secs(30),
+                    GrpcTimeouts {
+                        request_handler: Duration::from_secs(30),
+                        authorization: Duration::from_secs(30),
+                    },
                     Default::default(),
                     Default::default(),
                     None,
                 )
-                .with_jwt_verifier(None, Arc::new(AllowAllRepositoryAuthorizer))
+                .with_jwt_verifier(
+                    None,
+                    Arc::new(AllowAllRepositoryAuthorizer),
+                    repository_catalog,
+                )
                 .unwrap()
                 .serve_with_listener(listener, signal)
                 .await;
@@ -414,11 +429,13 @@ mod storage_copy_on_write_tests {
         remote_write: u8,
         chunk: u64,
     ) -> Address {
-        let captured: Arc<Mutex<Vec<(Address, LoreErrorCode)>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured: Arc<Mutex<Vec<(Address, i32)>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = captured.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
             if let LoreEvent::StoragePutItemComplete(data) = event {
-                sink.lock().unwrap().push((data.address, data.error_code));
+                sink.lock()
+                    .unwrap()
+                    .push((data.address, data.error.error_code));
             }
         }));
         let status = lore::storage::put::put(
@@ -444,7 +461,7 @@ mod storage_copy_on_write_tests {
         assert_eq!(status, 0, "put must succeed");
         let events = captured.lock().unwrap().clone();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].1, LoreErrorCode::None);
+        assert_eq!(events[0].1, 0);
         events[0].0
     }
 

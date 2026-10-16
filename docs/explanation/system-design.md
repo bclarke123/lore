@@ -1,6 +1,6 @@
 # The Lore Version Control System
 
-> **Status:** Draft
+> **Status:** Accepted
 
 A reference document explaining the rationale, goals, and theoretical design of Lore. This is not a
 peer-reviewed paper; it is a public-facing standalone description of the system, intended to make
@@ -318,11 +318,12 @@ use, modification, embedding, or independent reimplementation.
 the remote, not directly.
 
 **Adversarial-server threat model.** Clients hash-validate every fragment they receive, so content
-tampering is detectable end-to-end regardless of who served the bytes. The trust clients place in
-the server is narrower - that it correctly reports the latest revision of a branch, the name-to-ID
-mappings, and the access decisions for the session - and that trust is bounded by the server's
-authentication and authorization model. Lore does not aim to defend against a server that is itself
-adversarial about its own pointers or permissions.
+tampering is detectable end-to-end regardless of who served the bytes; a command that declares its
+server trusted (`--trust-remote`) gives that up. The trust clients place in the server is
+narrower - that it correctly reports the latest revision of a branch, the name-to-ID mappings, and
+the access decisions for the session - and that trust is bounded by the server's authentication
+and authorization model. Lore does not aim to defend against a server that is itself adversarial
+about its own pointers or permissions.
 
 ### 4. Conceptual Model
 
@@ -1265,10 +1266,21 @@ user wants on disk. Paths outside the view are not materialized when a revision 
 switched, or restored; they exist in the repository's tree, but no bytes for them are written
 to the working directory.
 
-The view is local to a client. It is not part of the committed revision and does not travel
-with a clone. Two clients on the same revision can hold different views, materializing
-different subsets of the same tree. A change to the view triggers the storage subsystem to
-materialize (or de-materialize) paths to bring the instance into agreement.
+The view is defined locally by the user. It is a file of glob rules the user writes and points
+an instance at, supplied at clone time (`lore clone --view`) or left out for the whole tree.
+Nothing in the repository declares it and no deployment policy imposes one, so two clients on
+the same revision can hold different views and materialize different subsets of the same tree.
+It is not part of the committed revision and does not travel with a clone.
+
+A view is not fixed for the life of an instance either. The user can point an existing
+instance at a different view file at any later point (`lore sync --view <file>`), and the
+instance carries its working tree from the subset the old view materialized to the subset the
+new one does: paths entering the view are written from the store, paths leaving it are
+removed, and paths in both are left as they stand. This mints no revision and moves no branch;
+the revision the tree is materialized from has not moved, only which subset of it is on disk.
+Widening, narrowing, or re-shaping a view is therefore a local operation rather than a reason
+to re-clone. A change that would delete or overwrite a locally modified file is refused rather
+than carried out: the working tree is the only place that content exists.
 
 Views shape what the local cache is asked to hold, what the remote is asked to send, and what
 filesystem-level tools (search, indexing, build systems) see. They are useful well beyond the
@@ -1485,6 +1497,10 @@ work:
   without contacting the remote.
 - *A fragment cache.* Bytes for fragments that have been fetched at any point. Subsequent
   reads of those fragments do not hit the remote.
+- *File metadata blocks, after a clone prepared for offline work.* A clone that writes its
+  files, given `--offline` or `--cache`, holds every file metadata block of its revision, which
+  staging and committing write to. Any other clone fetches a block the first time a command
+  needs it, so offline work right after it, such as a commit, can need the remote.
 
 What the client does *not* hold is the canonical answer to "what is the current latest of
 this branch on the remote." That answer can be queried at sync time; between syncs, the
@@ -1817,10 +1833,10 @@ visible to anyone.
 
 Clients depend on this. Hash validation of fetched fragments is end-to-end and free (the
 content address proves the bytes), but graph-level validation is what the server has
-already done. This is the trust boundary in §3.2: clients hash-validate content, and trust
-the server to have validated graph structure. A misbehaving server could in principle
-present a malformed graph; the defense is that the server rejects malformed pushes, so
-clients fetching from a correctly-operating server never see one.
+already done. This is the trust boundary in §3.2: clients hash-validate content, unless a
+command declares its server trusted, and trust the server to have validated graph structure. A
+misbehaving server could in principle present a malformed graph; the defense is that the server
+rejects malformed pushes, so clients fetching from a correctly-operating server never see one.
 
 #### 16.4 What can go wrong and what each failure looks like
 

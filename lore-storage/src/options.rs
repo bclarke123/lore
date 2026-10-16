@@ -93,12 +93,17 @@ impl From<WriteOptions> for u32 {
 }
 
 /// Options controlling how a fragment is read from storage.
+///
+/// A payload the local store holds is read as stored. One fetched from a remote is checked against
+/// its address on receipt, unless the remote is trusted ([`trust_remote`](Self::trust_remote)).
 #[derive(Copy, Clone, Debug)]
 pub struct ReadOptions {
     /// Decompress data
     pub decompress: bool,
-    /// Verify data
-    pub verify: bool,
+    /// Treat the remote as a trusted source, as a client within its infrastructure may: a fetched
+    /// payload has only its sizes checked against its length, is decompressed only where
+    /// `decompress` asks, and is never hashed.
+    pub trust_remote: bool,
     /// Probe the local store before falling through to remote. Setting this to `false` makes
     /// reads bypass the local store entirely; combined with `remote: true` and a session, the
     /// reader always fetches from the peer. Used by handles bound to remote-only mode.
@@ -113,6 +118,10 @@ pub struct ReadOptions {
     pub sync_data: bool,
     /// Priority read hint for stream scheduling (metadata/tree blocks)
     pub priority: bool,
+    /// A local miss answers `AddressNotFound` at once: the load never waits on another task's
+    /// store or fetch of the address, and never reaches the remote itself. The local probe still
+    /// takes the store's own locks.
+    pub never_wait: bool,
     /// Refuse to read if the fragment's declared `size_content` exceeds this
     /// cap. `None` means "no cap" (existing behavior). Callers that know the
     /// maximum legitimate blob size for the data they are reading should set
@@ -125,13 +134,14 @@ impl Default for ReadOptions {
     fn default() -> Self {
         ReadOptions {
             decompress: true,
-            verify: true,
+            trust_remote: false,
             local: true,
             remote: true,
             cache: false,
             direct_write: false,
             sync_data: false,
             priority: false,
+            never_wait: false,
             max_content_size: None,
         }
     }
@@ -148,28 +158,14 @@ impl ReadOptions {
         self
     }
 
-    pub fn with_verify(mut self) -> Self {
-        self.verify = true;
-        self
-    }
-
-    pub fn no_verify(mut self) -> Self {
-        self.verify = false;
-        self
-    }
-
-    pub fn with_remote(mut self) -> Self {
-        self.remote = true;
+    /// See [`ReadOptions::trust_remote`].
+    pub fn trusting_remote(mut self) -> Self {
+        self.trust_remote = true;
         self
     }
 
     pub fn no_remote(mut self) -> Self {
         self.remote = false;
-        self
-    }
-
-    pub fn with_local(mut self) -> Self {
-        self.local = true;
         self
     }
 
@@ -188,28 +184,19 @@ impl ReadOptions {
         self
     }
 
-    pub fn no_cache(mut self) -> Self {
-        self.cache = false;
-        self
-    }
-
-    pub fn with_direct_write(mut self) -> Self {
-        self.direct_write = true;
-        self
-    }
-
     pub fn with_priority(mut self) -> Self {
         self.priority = true;
         self
     }
 
-    pub fn with_max_content_size(mut self, max: u64) -> Self {
-        self.max_content_size = Some(max);
+    /// See [`ReadOptions::never_wait`].
+    pub fn never_wait(mut self) -> Self {
+        self.never_wait = true;
         self
     }
 
-    pub fn no_max_content_size(mut self) -> Self {
-        self.max_content_size = None;
+    pub fn with_max_content_size(mut self, max: u64) -> Self {
+        self.max_content_size = Some(max);
         self
     }
 }

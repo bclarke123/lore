@@ -8,8 +8,6 @@ pub use rs_consul::ResponseMeta;
 pub use rs_consul::ServiceNode;
 
 pub mod client;
-#[cfg(test)]
-mod factory;
 pub mod service_peer_discovery;
 
 /// A wrapper around the Consul HTTP API, for easy of mocking
@@ -26,24 +24,4 @@ pub trait ConsulClient: std::fmt::Debug {
         request: GetServiceNodesRequest<'a>,
         query_opts: Option<QueryOptions>,
     ) -> Result<ResponseMeta<Vec<ServiceNode>>, ConsulError>;
-}
-
-#[cfg(test)]
-pub mod mocks {
-    use super::*;
-
-    mockall::mock! {
-
-        #[derive(Debug)]
-        pub Client { }
-
-        #[async_trait]
-        impl ConsulClient for Client {
-            async fn get_service_nodes<'a>(
-                &self,
-                request: GetServiceNodesRequest<'a>,
-                query_opts: Option<QueryOptions>,
-            ) -> Result<ResponseMeta<Vec<ServiceNode>>, ConsulError>;
-        }
-    }
 }

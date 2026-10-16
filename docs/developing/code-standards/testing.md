@@ -6,7 +6,7 @@ This document defines the standard patterns for testing across the Lore codebase
 
 | Type | Location | Framework | Purpose |
 | --- | --- | --- | --- |
-| **Unit tests** | Inline `#[cfg(test)]` modules | Rust/tokio | Module-level testing |
+| **Unit tests** | `tests/unit/` in each crate | Rust/tokio | Module-level testing |
 | **Integration tests** | `lore-revision/tests/` | Rust/tokio | Cross-module testing |
 | **Smoke tests** | `scripts/test/` | Python/pytest | CLI and server testing |
 | **Load tests** | Internal infrastructure | Internal harness | Performance testing |
@@ -30,7 +30,7 @@ Cheapest first. Cost tracks how much must be standing before the test can run.
 
 | Tier | Answers | Location | Needs |
 | --- | --- | --- | --- |
-| Unit | Is this logic correct across all its cases? | Inline `#[cfg(test)]` | Nothing |
+| Unit | Is this logic correct across all its cases? | `tests/unit/` | Nothing |
 | Smoke | Does a real user flow work across the binaries? | `scripts/test/`, `@pytest.mark.smoke` | `lore` and `loreserver` binaries built |
 
 Edge cases belong in unit tests. The smoke test covers the happy path only.
@@ -39,19 +39,118 @@ Edge cases belong in unit tests. The smoke test covers the happy path only.
 
 ## 2. Rust unit tests
 
-Inline in source modules with `#[cfg(test)]`:
+Unit tests live in the crate's `tests/unit/` directory, not in inline `#[cfg(test)]` modules. Cargo builds the directory as one test binary, which links the library like any other user of it:
+
+```text
+lore-telemetry/
+├── Cargo.toml              # [lib] test = false
+├── src/
+│   └── observe.rs
+└── tests/
+    └── unit/
+        ├── main.rs         # mod observe; mod user_agent_filter;
+        ├── observe.rs
+        └── user_agent_filter.rs
+```
 
 ```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
+// tests/unit/observe.rs
+use lore_telemetry::observe::ObserveResult;
 
-    #[test]
-    fn test_sync_example() {
-        // synchronous test
+#[tokio::test]
+async fn can_observe_success_no_callback() {
+    // test code
+}
+```
+
+An inline `#[cfg(test)]` module makes cargo compile the whole crate a second time, with `--test`. That compile produces an executable, which the build cache cannot store, so CI repeats it on every run. Tests in `tests/unit/` use the library build every other crate already shares, and the build cache serves it.
+
+Set `[lib] test = false` in the crate's `Cargo.toml` once no inline test is left. Without it cargo still compiles the crate a second time, as an empty test harness. The setting covers the whole crate, so move all of a crate's inline modules together. Crates that still carry inline modules move them when next worked on.
+
+### One binary, unless a test needs its own process
+
+All tests in `tests/unit/` share one process, as the tests of an inline module do. A test that needs a process of its own goes in a separate `tests/<name>.rs` file, which cargo builds as its own binary: one that changes process-wide state other tests would observe, or that exercises process-level behavior such as the library's shutdown. Keep these few. Every file directly in `tests/` is another binary to compile and link, and none of that is cached.
+
+### Test helpers
+
+Put helpers that only the crate's own tests use in `tests/unit/` as well, as modules beside the tests: mocks, factories, fixtures. Their dependencies go in `[dev-dependencies]`. A `mockall::mock!` of a public trait works there as it does inside the crate.
+
+Helpers that other crates' tests use are the exception. Another crate cannot import a module from `tests/`, so these live in the library behind the crate's `test-util` feature, as `lore_base::test_util::TempDir` does (see [Scratch space on disk](#scratch-space-on-disk)).
+
+So is a test double that library code has to name itself, such as the type behind a variant of a closed enum. It lives in the library behind `test-util` as well, as `lore_revision::fs::filesystem_provider::test_util::TestOperation` does, and the rest of the fixture stays in `tests/unit/`.
+
+### When a test needs something private
+
+Look for the public way first: a trait method, a constructor, a re-export. A test that needs private access often checks an implementation detail.
+
+When a test does need an item that is not public, make it public for tests only, behind the crate's `test-util` feature, and enable the feature from the crate's own dev-dependencies:
+
+```toml
+[dependencies]
+lore-macro = { workspace = true }
+
+[features]
+test-util = []
+
+[dev-dependencies]
+lore-foo = { workspace = true, features = ["test-util"] }
+```
+
+Mark the item with `#[lore_macro::test_pub]`. Built with `test-util`, the item is `pub`, and so are a struct's fields. Built without it, the item is exactly as written. It applies to functions and methods, structs, enums, constants, `static` items, type aliases, and traits. Put it first among the item's attributes, above any `#[derive]`:
+
+```rust
+// lore-storage/src/local/immutable_store/info.rs
+#[lore_macro::test_pub]
+const INFO_MAGIC: u32 = u32::from_le_bytes(*b"IS_I");
+
+#[lore_macro::test_pub]
+#[repr(C)]
+#[derive(Debug, IntoBytes, FromBytes, Immutable)]
+pub struct ImmutableStoreInfo {
+    magic: u32,
+    version: u32,
+    pub next_group_index_to_migrate_oodle: i32,
+}
+```
+
+When a test needs read access or a wrapper rather than a wider item, add one gated `test_util` child module beside the private items instead. A child module sees its parent's private items, and an inherent `impl` may live anywhere in the crate, so accessors, constructors, and wrappers all fit in it and the production code stays as it is:
+
+```rust
+// lore-credential/src/token_store.rs
+#[cfg(feature = "test-util")]
+pub mod test_util {
+    use super::IdentityToken;
+    use super::TokenStoreError;
+
+    impl IdentityToken {
+        pub fn user_id(&self) -> &str {
+            &self.user_id
+        }
+    }
+
+    pub fn seal_token(key: &[u8], user_token: &str) -> Result<String, TokenStoreError> {
+        super::seal_token(key, user_token)
     }
 }
 ```
+
+To make a private module public, switch its declaration. The attribute cannot do this, because it does not apply to a module declared in its own file. A module that already has a `cfg` keeps it in both declarations:
+
+```rust
+#[cfg(not(feature = "test-util"))]
+mod internals;
+#[cfg(feature = "test-util")]
+pub mod internals;
+
+#[cfg(all(feature = "oodle", not(feature = "test-util")))]
+mod oodle_migration;
+#[cfg(all(feature = "oodle", feature = "test-util"))]
+pub mod oodle_migration;
+```
+
+`cfg(test)` is set only when cargo compiles the crate itself as a test. The tests in `tests/unit/` link the library as built normally, so a `#[cfg(test)]` item or a `#[cfg_attr(test, ...)]` in library code is not there for them. When moving inline tests out, change each one to `feature = "test-util"`.
+
+Used this way the feature adds access and nothing else: wider visibility, accessors, constructors, and wrappers over code that already exists. Helper code stays in `tests/unit/` and its dependencies in `[dev-dependencies]`. Release builds never see it: cargo applies a dev-dependency's features only to builds that include the dev-dependencies. Do not make an item `pub` unconditionally for a test. It becomes API other crates can reach, and the compiler stops reporting it once it falls out of use.
 
 ---
 
@@ -233,7 +332,7 @@ def test_commit(new_lore_repo):
 
 ### Running with uv
 
-Tests require Python 3.13+. Use `uv` to manage dependencies and run tests:
+Tests require Python 3.13 or 3.14. Use `uv` to manage dependencies and run tests:
 
 ```bash
 # Install dependencies
@@ -262,6 +361,59 @@ uv run pytest scripts/test/ --disable-local-server --lore-remote-url=lore://host
 | `--disable-local-server` | `false` | Use external server |
 | `--disable-auto-server` | `false` | Don't auto start the server |
 | `--keep-test-data` | `false` | Leave repositories, stores and server roots on disk |
+| `--swfs` | `false` | Run the tests that mount through SWFS |
+
+### Running the SWFS tests
+
+`test_swfs.py` skips its mounting tests unless `--swfs` says to run them,
+because two of their preconditions are arranged outside the harness and neither
+is visible from it:
+
+1. A client built with the `swfs` feature, which links the SWFS library named by
+   `SWFS_LIB_DIR`: `cargo build --release -p lore-client --features swfs`. The
+   binary reports no feature list, so nothing can ask it whether it has one.
+2. The `epicvfs` filesystem driver loaded. It installs from `EpicVFS.exe` and is
+   demand-start, and the SWFS library starts it through the service control
+   manager, which takes an elevated session — `sc query epicvfs` reporting
+   `STOPPED` means the next mount will try and fail.
+
+Without the driver a mount does not fail, it hangs: the SWFS library parks the
+service process, so the client relaying to it blocks until the per-test timeout
+kills the worker. That is what `--swfs` defaulting off avoids.
+
+### Running every test through one service
+
+`LORE_TEST_SHARED_SERVICE=1` starts one service from the build under test before
+the run and stops it when the run ends. Every command of every test then runs in
+that service, except in the tests that manage a service of their own through
+`lore_service_runner`, which keep theirs, and in the tests marked
+`runs_in_process(reason)`, whose commands stay in their own process. No
+executable is named for the relayed commands, so a service that stops partway
+fails the tests that follow instead of being replaced.
+
+```bash
+LORE_TEST_SHARED_SERVICE=1 uv run pytest scripts/test/ -m smoke -n 4
+```
+
+The service listens on a socket named for the run, with a global directory of
+its own, so several runs proceed side by side. A run ended by Ctrl+C, SIGTERM or
+SIGHUP stops it as a finished run does. On Linux the kernel stops it when the run
+is killed outright, as it does every service and server a test or an xdist
+worker starts when that process ends. The server the workers share outlives the
+worker that launched it, which can finish first: the run's cleanups stop it, and
+on Linux so does the run's main process ending.
+
+`LORE_TEST_SERVICE_SOCKET` names the socket of a service started some other way,
+which the run then uses in place of starting one:
+
+```bash
+LORE_SERVICE_SOCKET=lore_service-smoke LORE_GLOBAL_PATH=$(mktemp -d) \
+    target/release/lore service run &
+LORE_TEST_SERVICE_SOCKET=lore_service-smoke uv run pytest scripts/test/ -m smoke -n 4
+```
+
+Each call carries the test's `LORE_GLOBAL_PATH` and `LORE_AUTH_PATH`, which the
+service reads in place of its own, so the tests stay isolated from each other.
 
 ### Per-test timeout
 
@@ -308,3 +460,4 @@ Lore has a load-testing suite that exercises concurrent clone, commit, sync, loc
 7. **Mark tests** with `@pytest.mark.smoke` for smoke test runs.
 8. **Use `offline=True`** for operations that don't need the server.
 9. **Feature-gate integration tests** that require external dependencies.
+10. **Put Rust unit tests in `tests/unit/`**, with `[lib] test = false`. Give a test its own `tests/*.rs` binary only when it needs its own process, and reach private items only through the `test-util` feature, usually with `#[lore_macro::test_pub]`.

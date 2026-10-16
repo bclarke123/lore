@@ -15,6 +15,7 @@ use crate::println;
 use crate::util::format_bytes_to_string;
 
 /// `value` as a percentage of `total`, or zero where there is no total.
+#[lore_macro::test_pub]
 fn percent(value: u64, total: u64) -> f64 {
     if total == 0 {
         0.0
@@ -25,6 +26,7 @@ fn percent(value: u64, total: u64) -> f64 {
 
 /// Payload bytes the operation prepared for storage, across data fragments and
 /// fragment lists.
+#[lore_macro::test_pub]
 fn prepared_payload(fragments: &LoreFragmentStatsData) -> u64 {
     fragments.data_payload_bytes + fragments.fragmentlist_payload_bytes
 }
@@ -215,32 +217,4 @@ pub fn print_push_totals(fragments: &LoreBranchPushStatsEventData) {
     print_count_line("Already stored", fragments.deduplicated, total);
     print_count_line("Copy", fragments.copied, total);
     print_count_line("Put", fragments.put, total);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_zero_total_yields_a_zero_share_rather_than_a_panic() {
-        assert_eq!(percent(0, 0), 0.0);
-        assert_eq!(percent(5, 0), 0.0);
-    }
-
-    #[test]
-    fn a_share_is_a_percentage_of_its_total() {
-        assert_eq!(percent(1, 4), 25.0);
-        assert_eq!(percent(4, 4), 100.0);
-    }
-
-    #[test]
-    fn prepared_payload_covers_both_kinds_of_output() {
-        let fragments = LoreFragmentStatsData {
-            data_payload_bytes: 900,
-            fragmentlist_payload_bytes: 100,
-            ..Default::default()
-        };
-
-        assert_eq!(prepared_payload(&fragments), 1000);
-    }
 }

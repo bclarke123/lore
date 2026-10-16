@@ -22,7 +22,7 @@
 //!
 //! Per-item behaviour:
 //! - `partition == Partition::default()`, a zero `key`, or `data.len > 0 && data.ptr == NULL`:
-//!   rejects with `error_code = INVALID_ARGUMENTS`; other items run independently.
+//!   rejects with `InvalidArguments`; other items run independently.
 //! - `data.len == 0`: **removes** the mapping, by setting the key to the zero hash the mutable
 //!   store reads as a tombstone. `get_resolved` then reports `ADDRESS_NOT_FOUND`, and the
 //!   terminal event carries the zero address. With `remote_write = 0` this evicts only the
@@ -34,29 +34,21 @@
 //! resolves to, ready to hand to `get`, and `stored_local` / `stored_remote` report where it
 //! landed. `stored_remote` gates the remote mapping — a failed upload still leaves a good local
 //! write, so the publish is skipped rather than name content the server does not hold. A caller
-//! needing the key visible remotely checks that field, not `error_code`.
+//! needing the key visible remotely checks that field, not the error detail.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
-use lore_base::error::InvalidArguments;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
-use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
-use lore_revision::event::EventError;
 use lore_revision::event::LoreBytes;
-use lore_revision::event::LoreErrorCode;
-use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
-use lore_revision::interface::LoreError;
-use lore_revision::store::event::LoreStoragePutItemCompleteEventData;
+use lore_storage::StorageError;
 use lore_storage::options::WriteOptions;
 use lore_storage::write::write_resolved;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -64,11 +56,12 @@ use crate::interface::LoreGlobalArgs;
 use crate::storage::PutItemOutcome;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
+use crate::storage::invalid_item;
 use crate::storage::store::StoreInternal;
 
 /// One put-resolved item — the buffer to store and the mutable key to publish it under.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, Deserialize, Serialize, ValidateText)]
+#[derive(Copy, Clone, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode)]
 pub struct LoreStoragePutResolvedItem {
     /// Caller-chosen id echoed back in `PUT_ITEM_COMPLETE`
     pub id: u64,
@@ -106,7 +99,7 @@ impl core::fmt::Debug for LoreStoragePutResolvedItem {
 
 /// Arguments for `lore_storage_put_resolved`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(put_resolved_local)]
 pub struct LoreStoragePutResolvedArgs {
     /// Open storage handle
@@ -114,24 +107,6 @@ pub struct LoreStoragePutResolvedArgs {
     /// Buffers to store and publish; each runs independently and emits its own
     /// `PUT_ITEM_COMPLETE`
     pub items: LoreArray<LoreStoragePutResolvedItem>,
-}
-
-#[error_set]
-enum PutResolvedError {
-    InvalidArguments,
-}
-
-impl EventError for PutResolvedError {
-    fn translated(&self) -> LoreError {
-        match self {
-            PutResolvedError::InvalidArguments(_) => LoreError::InvalidArguments,
-            PutResolvedError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Store one or more buffers and publish a mutable key naming each.
@@ -160,7 +135,7 @@ async fn put_resolved_local(
             let items = args.items.as_slice();
 
             if items.is_empty() {
-                return Ok::<(), PutResolvedError>(());
+                return Ok::<(), StorageError>(());
             }
 
             let effective = store.effective_flags(per_call)?;
@@ -185,34 +160,27 @@ async fn put_resolved_item(
     store: Arc<StoreInternal>,
     item: &LoreStoragePutResolvedItem,
     session: Option<Arc<lore_transport::StorageSession>>,
-) -> LoreErrorCode {
-    let outcome = store_and_publish(store, item, session).await;
-    LoreEvent::StoragePutItemComplete(LoreStoragePutItemCompleteEventData {
-        id: item.id,
-        address: outcome.address,
-        error_code: outcome.error_code,
-        stored_local: u8::from(outcome.stored_local),
-        stored_remote: u8::from(outcome.stored_remote),
-    })
-    .send();
-    outcome.error_code
+) -> Result<(), StorageError> {
+    PutItemOutcome::emit(item.id, store_and_publish(store, item, session).await)
 }
 
 async fn store_and_publish(
     store: Arc<StoreInternal>,
     item: &LoreStoragePutResolvedItem,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
-) -> PutItemOutcome {
+) -> Result<PutItemOutcome, StorageError> {
     if item.partition == Partition::default() {
-        return PutItemOutcome::failed(LoreErrorCode::InvalidArguments);
+        return Err(invalid_item("item names the default partition"));
     }
 
     if item.key == Hash::default() {
-        return PutItemOutcome::failed(LoreErrorCode::InvalidArguments);
+        return Err(invalid_item("item names the zero key"));
     }
 
     if item.data.len > 0 && item.data.ptr.is_null() {
-        return PutItemOutcome::failed(LoreErrorCode::InvalidArguments);
+        return Err(invalid_item(
+            "item declares a non-empty buffer behind a null pointer",
+        ));
     }
 
     let bytes = if item.data.len == 0 {
@@ -237,18 +205,17 @@ async fn store_and_publish(
         write_options = write_options.with_local_cache_priority();
     }
 
-    PutItemOutcome::from_write(
-        write_resolved(
-            store.immutable.clone(),
-            store.mutable.clone(),
-            item.partition,
-            item.key,
-            item.context,
-            bytes,
-            write_options,
-            remote_session,
-            lore_revision::immutable::counted_write_context(),
-        )
-        .await,
+    write_resolved(
+        store.immutable.clone(),
+        store.mutable.clone(),
+        item.partition,
+        item.key,
+        item.context,
+        bytes,
+        write_options,
+        remote_session,
+        lore_revision::immutable::counted_write_context(),
     )
+    .await
+    .map(PutItemOutcome::from_write)
 }

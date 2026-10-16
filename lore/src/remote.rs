@@ -31,6 +31,7 @@ pub const LORE_SERVICE_SOCKET_VAR: &str = "LORE_SERVICE_SOCKET";
 /// The socket's directory is picked for being private to the user; a value
 /// carrying a path could put the socket somewhere with weaker permissions, or
 /// somewhere another user can point a process at.
+#[lore_macro::test_pub]
 fn is_single_file_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
@@ -47,6 +48,7 @@ fn is_single_file_name(name: &str) -> bool {
 /// A named value that is not a single file name is refused in favour of the
 /// default rather than honoured, so a value that would move the socket elsewhere
 /// cannot do so quietly.
+#[lore_macro::test_pub]
 fn socket_name_from(named: Option<OsString>) -> String {
     let Some(named) = named else {
         return LORE_SERVICE_SOCKET_NAME.to_string();
@@ -80,74 +82,4 @@ pub fn service_socket_name() -> &'static str {
     SOCKET_NAME
         .get_or_init(|| socket_name_from(std::env::var_os(LORE_SERVICE_SOCKET_VAR)))
         .as_str()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_named_socket_is_used() {
-        assert_eq!(
-            socket_name_from(Some(OsString::from("lore_service-test-abc123"))),
-            "lore_service-test-abc123"
-        );
-        // Surrounding space is not part of a file name.
-        assert_eq!(socket_name_from(Some(OsString::from("  named  "))), "named");
-    }
-
-    #[test]
-    fn no_named_socket_uses_the_default() {
-        assert_eq!(socket_name_from(None), LORE_SERVICE_SOCKET_NAME);
-        assert_eq!(
-            socket_name_from(Some(OsString::new())),
-            LORE_SERVICE_SOCKET_NAME
-        );
-        assert_eq!(
-            socket_name_from(Some(OsString::from("   "))),
-            LORE_SERVICE_SOCKET_NAME
-        );
-    }
-
-    /// Refused in favour of the default rather than honoured: a value carrying a
-    /// path could put the socket somewhere with weaker permissions.
-    #[test]
-    fn a_named_socket_that_is_a_path_is_refused() {
-        for named in ["../escape", "sub/lore_service", "/tmp/lore_service", ".."] {
-            assert_eq!(
-                socket_name_from(Some(OsString::from(named))),
-                LORE_SERVICE_SOCKET_NAME,
-                "{named} must not be honoured"
-            );
-        }
-    }
-
-    #[test]
-    fn a_single_file_name_is_allowed() {
-        for name in ["lore_service", "lore_service-1", "lore.service", "a"] {
-            assert!(is_single_file_name(name), "{name} names one file");
-        }
-    }
-
-    /// A value carrying a path would move the socket out of the directory
-    /// chosen for being private to the user.
-    #[test]
-    fn anything_carrying_a_path_is_refused() {
-        for name in [
-            "",
-            ".",
-            "..",
-            "../lore_service",
-            "sub/lore_service",
-            "/tmp/lore_service",
-            "..\\lore_service",
-            "C:\\lore_service",
-            "lore\0service",
-        ] {
-            assert!(
-                !is_single_file_name(name),
-                "{name:?} does not name a single file"
-            );
-        }
-    }
 }

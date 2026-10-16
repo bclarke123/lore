@@ -6,7 +6,10 @@ mod cli;
 mod lore;
 mod operations;
 mod parallel;
+#[cfg(not(feature = "test-util"))]
 mod probability;
+#[cfg(feature = "test-util")]
+pub mod probability;
 mod tracing;
 
 pub use chaos_main::chaos_main;

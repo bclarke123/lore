@@ -139,7 +139,6 @@ impl LocalAuth {
         let provider = Self::build_provider(provider_settings)?;
         let minter = TokenMinter::from_settings(token_settings)?;
         let verifier = JwtVerifier {
-            identity_claim: crate::auth::jwt::DEFAULT_IDENTITY_CLAIM.to_string(),
             jwk_service: Arc::new(LocalJwkService::new(&minter)),
             // Explicit issuer/audience settings override the minting values,
             // matching the external-JWKS configuration surface.
@@ -151,6 +150,9 @@ impl LocalAuth {
                 .jwt_audience
                 .clone()
                 .or_else(|| Some(token_settings.audience.clone())),
+            // Unset by default: tokens minted before the `at+jwt` header
+            // carry `JWT` and must keep verifying until they expire.
+            jwt_typ: auth.jwt_typ.clone(),
         };
 
         info!(
@@ -172,6 +174,52 @@ impl LocalAuth {
             verifier,
             clients: Self::resolve_clients(&auth.clients)?,
         }))
+    }
+
+    /// The OIDC provider the environment service advertises when this
+    /// server is its own issuer: built from the local settings rather than
+    /// a fetched discovery document, which at startup would ask this server
+    /// before it listens. `None` without `[server.auth.oidc]`, or when the
+    /// minted issuer is not an HTTP(S) URL (the OAuth routes are off then).
+    ///
+    /// As for an external provider, OIDC is preferred when configured so or
+    /// when no `auth_url` offers the gRPC path. Stock clients cannot yet
+    /// exchange an OIDC token for repository access, so keep `preferred`
+    /// off while `auth_url` serves them.
+    pub fn advertised_oidc(
+        &self,
+        auth: &AuthSettings,
+        auth_url: Option<&str>,
+    ) -> Option<lore_transport::Oidc> {
+        let oidc = auth.oidc.as_ref()?;
+        let issuer = self.minter.issuer().trim_end_matches('/').to_string();
+        if !url::Url::parse(&issuer).is_ok_and(|url| matches!(url.scheme(), "http" | "https")) {
+            warn!(
+                issuer,
+                "[server.auth.oidc] is set but auth.token.issuer is not an HTTP(S) URL; \
+                 not advertising an OIDC provider"
+            );
+            return None;
+        }
+        info!(
+            issuer,
+            "Advertising this server as the OIDC provider to clients"
+        );
+        let non_empty = |value: &Option<String>| value.clone().filter(|value| !value.is_empty());
+        let resource_template = non_empty(&oidc.resource_template);
+        let scope_template = non_empty(&oidc.scope_template);
+        let is_tier_2 = resource_template.is_some() || scope_template.is_some();
+        let token_exchange_issuer = is_tier_2
+            .then(|| non_empty(&oidc.token_exchange_issuer).unwrap_or_else(|| issuer.clone()));
+        Some(lore_transport::Oidc {
+            issuer,
+            client_id: oidc.client_id.clone(),
+            scopes: oidc.scopes.clone(),
+            preferred: oidc.preferred || auth_url.is_none(),
+            resource_template,
+            scope_template,
+            token_exchange_issuer,
+        })
     }
 
     fn resolve_clients(
@@ -325,7 +373,7 @@ impl LocalAuth {
                     match refresh.issue(&identity).await {
                         Ok(token) => minted.refresh_token = Some(token),
                         Err(error) => {
-                            warn!(%error, "Failed to issue refresh token; continuing without")
+                            warn!(%error, "Failed to issue refresh token; continuing without");
                         }
                     }
                 }
@@ -359,367 +407,4 @@ pub enum CompleteLoginError {
     Provider(#[from] AuthProviderError),
     #[error(transparent)]
     Minting(#[from] MintingError),
-}
-
-#[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
-    use crate::auth::minting::TokenMintingSettings;
-    use crate::auth::provider::static_provider::StaticUserSettings;
-
-    pub(crate) fn test_auth_settings(dir: &std::path::Path) -> AuthSettings {
-        AuthSettings {
-            jwk: None,
-            jwt_audience: None,
-            jwt_issuer: None,
-            token: Some(TokenMintingSettings {
-                signing_key_path: Some(dir.join("key.pem").to_string_lossy().to_string()),
-                generate_signing_key: true,
-                issuer: "https://lore.example.com".to_string(),
-                audience: vec!["lore.example.com".to_string()],
-                user_token_ttl_seconds: 3600,
-                authz_token_ttl_seconds: 900,
-                refresh_token_ttl_seconds: 3600,
-                env: "test".to_string(),
-            }),
-            provider: Some(AuthProviderSettings {
-                mode: "static".to_string(),
-                callback_base_url: "http://localhost:8080".to_string(),
-                static_provider: Some(StaticProviderSettings {
-                    allow_insecure_dev_login: true,
-                    users: vec![StaticUserSettings {
-                        user: "alice".to_string(),
-                        secret: "s3cret".to_string(),
-                        name: Some("Alice".to_string()),
-                        email: Some("alice@example.com".to_string()),
-                    }],
-                }),
-                oidc: None,
-            }),
-            server_admins: Vec::new(),
-            clients: Vec::new(),
-            permission_claim: None,
-            resource_claim: None,
-            resource_id_template: AuthSettings::default_resource_id_template(),
-            resource_id_claim: AuthSettings::default_resource_id_claim(),
-            resource_wildcard: AuthSettings::default_resource_wildcard(),
-            identity_claim: AuthSettings::default_identity_claim(),
-            baseline_access: crate::settings::BaselineAccess::default(),
-        }
-    }
-
-    fn callback(pairs: &[(&str, &str)]) -> CallbackParams {
-        CallbackParams {
-            params: pairs
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn absent_settings_disable_local_auth() {
-        assert!(LocalAuth::from_settings(None).expect("none").is_none());
-        let bare = AuthSettings {
-            jwk: None,
-            jwt_audience: None,
-            jwt_issuer: None,
-            token: None,
-            provider: None,
-            server_admins: Vec::new(),
-            clients: Vec::new(),
-            permission_claim: None,
-            resource_claim: None,
-            resource_id_template: AuthSettings::default_resource_id_template(),
-            resource_id_claim: AuthSettings::default_resource_id_claim(),
-            resource_wildcard: AuthSettings::default_resource_wildcard(),
-            identity_claim: AuthSettings::default_identity_claim(),
-            baseline_access: crate::settings::BaselineAccess::default(),
-        };
-        assert!(
-            LocalAuth::from_settings(Some(&bare))
-                .expect("bare")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn partial_settings_are_rejected() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let full = test_auth_settings(dir.path());
-
-        let mut no_token = full.clone();
-        no_token.token = None;
-        assert!(matches!(
-            LocalAuth::from_settings(Some(&no_token)),
-            Err(LocalAuthError::MissingTokenSettings)
-        ));
-
-        let mut no_provider = full.clone();
-        no_provider.provider = None;
-        assert!(matches!(
-            LocalAuth::from_settings(Some(&no_provider)),
-            Err(LocalAuthError::MissingProviderSettings)
-        ));
-
-        let mut both_verifiers = full.clone();
-        both_verifiers.jwk = Some(crate::auth::jwk::JWKServiceSettings {
-            endpoint: Some("https://idp.example.com/jwks".to_string()),
-        });
-        assert!(matches!(
-            LocalAuth::from_settings(Some(&both_verifiers)),
-            Err(LocalAuthError::AmbiguousVerifier)
-        ));
-
-        let mut bad_mode = full.clone();
-        bad_mode.provider.as_mut().expect("provider").mode = "carrier-pigeon".to_string();
-        assert!(matches!(
-            LocalAuth::from_settings(Some(&bad_mode)),
-            Err(LocalAuthError::UnknownProvider(_))
-        ));
-
-        let mut no_static = full.clone();
-        no_static
-            .provider
-            .as_mut()
-            .expect("provider")
-            .static_provider = None;
-        assert!(matches!(
-            LocalAuth::from_settings(Some(&no_static)),
-            Err(LocalAuthError::MissingStaticSettings)
-        ));
-
-        let mut google_without_oidc = full;
-        google_without_oidc
-            .provider
-            .as_mut()
-            .expect("provider")
-            .mode = "google".to_string();
-        assert!(matches!(
-            LocalAuth::from_settings(Some(&google_without_oidc)),
-            Err(LocalAuthError::MissingOidcSettings(_))
-        ));
-    }
-
-    #[test]
-    fn google_mode_builds_with_oidc_settings() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let secret_path = dir.path().join("client-secret");
-        std::fs::write(&secret_path, "secret").expect("write");
-
-        let mut settings = test_auth_settings(dir.path());
-        let provider = settings.provider.as_mut().expect("provider");
-        provider.mode = "google".to_string();
-        provider.static_provider = None;
-        provider.oidc = Some(crate::auth::provider::google::OidcProviderSettings {
-            client_id: "client-id".to_string(),
-            client_secret_path: secret_path.to_string_lossy().to_string(),
-            discovery_url: None,
-            extra_scopes: vec![],
-            hosted_domain: None,
-            trusted_external_audiences: vec![],
-            region: None,
-            user_pool_id: None,
-        });
-
-        let auth = LocalAuth::from_settings(Some(&settings))
-            .expect("build")
-            .expect("enabled");
-        assert_eq!(auth.provider.name(), "google");
-    }
-
-    fn client(
-        id: &str,
-        secret: Option<&str>,
-        secret_path: Option<&str>,
-    ) -> ClientCredentialSettings {
-        ClientCredentialSettings {
-            client_id: id.to_string(),
-            secret_path: secret_path.map(str::to_string),
-            secret: secret.map(str::to_string),
-            name: Some("CI".to_string()),
-        }
-    }
-
-    #[test]
-    fn client_credentials_verify_and_validation() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut settings = test_auth_settings(dir.path());
-        let secret_file = dir.path().join("ci-secret");
-        std::fs::write(&secret_file, "from-file\n").expect("write");
-        settings.clients = vec![
-            client("ci-inline", Some("s3cret"), None),
-            client("ci-file", None, Some(&secret_file.to_string_lossy())),
-        ];
-        let auth = LocalAuth::from_settings(Some(&settings))
-            .expect("build")
-            .expect("enabled");
-
-        let identity = auth.verify_client("ci-inline", "s3cret").expect("verify");
-        assert_eq!(identity.user_id(), "client:ci-inline");
-        assert_eq!(identity.idp, CLIENT_IDP);
-        // File secrets are trimmed of the trailing newline.
-        assert!(auth.verify_client("ci-file", "from-file").is_some());
-
-        assert!(auth.verify_client("ci-inline", "wrong").is_none());
-        assert!(auth.verify_client("unknown", "s3cret").is_none());
-
-        // Validation failures.
-        let reject = |clients: Vec<ClientCredentialSettings>| {
-            let mut bad = test_auth_settings(dir.path());
-            bad.clients = clients;
-            assert!(matches!(
-                LocalAuth::from_settings(Some(&bad)),
-                Err(LocalAuthError::InvalidClientCredential(_))
-            ));
-        };
-        reject(vec![client("ci", None, None)]);
-        reject(vec![client(
-            "ci",
-            Some("both"),
-            Some(&secret_file.to_string_lossy()),
-        )]);
-        reject(vec![client("", Some("s3cret"), None)]);
-        reject(vec![client("ci", Some(""), None)]);
-        reject(vec![
-            client("ci", Some("a"), None),
-            client("ci", Some("b"), None),
-        ]);
-
-        // Clients without token minting is a startup error, not a no-op.
-        let mut clients_only = test_auth_settings(dir.path());
-        clients_only.token = None;
-        clients_only.provider = None;
-        clients_only.clients = vec![client("ci", Some("s3cret"), None)];
-        assert!(matches!(
-            LocalAuth::from_settings(Some(&clients_only)),
-            Err(LocalAuthError::ClientsRequireTokenSettings)
-        ));
-    }
-
-    #[tokio::test]
-    async fn end_to_end_login_flow() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let auth = LocalAuth::from_settings(Some(&test_auth_settings(dir.path())))
-            .expect("build")
-            .expect("enabled");
-
-        // StartAuthSession
-        let session = auth.sessions.create("client-1").expect("create");
-        let login_url = auth.provider.begin_login(&session).await.expect("begin");
-        assert!(login_url.query().unwrap_or_default().contains("state="));
-
-        // Browser callback
-        auth.complete_login(callback(&[
-            ("state", &session.csrf_state),
-            ("user", "alice"),
-            ("secret", "s3cret"),
-        ]))
-        .await
-        .expect("complete");
-
-        // GetAuthSession poll
-        let minted = auth
-            .sessions
-            .take_if_ready(&session.session_code, "client-1")
-            .expect("poll")
-            .expect("ready");
-        assert_eq!(minted.user_id, "static:alice");
-
-        // The minted token verifies against the bundled verifier.
-        let claims = auth
-            .verifier
-            .verify_token(&minted.token)
-            .await
-            .expect("verify");
-        assert_eq!(claims.user_id, "static:alice");
-    }
-
-    #[tokio::test]
-    async fn denied_login_is_reported_to_poller() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let auth = LocalAuth::from_settings(Some(&test_auth_settings(dir.path())))
-            .expect("build")
-            .expect("enabled");
-        let session = auth.sessions.create("client-1").expect("create");
-
-        let err = auth
-            .complete_login(callback(&[
-                ("state", &session.csrf_state),
-                ("user", "alice"),
-                ("secret", "wrong"),
-            ]))
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            CompleteLoginError::Provider(AuthProviderError::Denied(_))
-        ));
-
-        assert!(matches!(
-            auth.sessions
-                .take_if_ready(&session.session_code, "client-1"),
-            Err(SessionError::LoginFailed(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn missing_credentials_leave_session_pending() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let auth = LocalAuth::from_settings(Some(&test_auth_settings(dir.path())))
-            .expect("build")
-            .expect("enabled");
-        let session = auth.sessions.create("client-1").expect("create");
-
-        // A form load / incomplete submission must not burn the session.
-        let err = auth
-            .complete_login(callback(&[("state", &session.csrf_state)]))
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            CompleteLoginError::Provider(AuthProviderError::Invalid(_))
-        ));
-        assert_eq!(
-            auth.sessions
-                .take_if_ready(&session.session_code, "client-1")
-                .expect("still pending"),
-            None
-        );
-
-        // Retry with credentials succeeds.
-        auth.complete_login(callback(&[
-            ("state", &session.csrf_state),
-            ("user", "alice"),
-            ("secret", "s3cret"),
-        ]))
-        .await
-        .expect("retry");
-    }
-
-    #[tokio::test]
-    async fn unknown_state_is_rejected() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let auth = LocalAuth::from_settings(Some(&test_auth_settings(dir.path())))
-            .expect("build")
-            .expect("enabled");
-        let err = auth
-            .complete_login(callback(&[
-                ("state", "bogus"),
-                ("user", "a"),
-                ("secret", "b"),
-            ]))
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            CompleteLoginError::Session(SessionError::NotFound)
-        ));
-
-        let err = auth
-            .complete_login(callback(&[("user", "a"), ("secret", "b")]))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, CompleteLoginError::BadRequest(_)));
-    }
 }

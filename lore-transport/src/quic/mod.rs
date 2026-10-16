@@ -1,9 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+pub mod chunking;
 pub mod client;
 pub mod command_header;
 pub mod net_runtime;
+#[cfg(not(feature = "test-util"))]
 mod response_reader;
+#[cfg(feature = "test-util")]
+pub mod response_reader;
 pub mod storage_service;
 
 use std::sync::Arc;
@@ -15,6 +19,7 @@ use lore_credential::domain_from_url_str_or_url;
 use lore_error_set::prelude::*;
 use thiserror::Error;
 
+use crate::auth::AuthEndpoint;
 use crate::connection::Connection;
 use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
@@ -91,7 +96,7 @@ pub struct UnknownCommand(pub QuicOpCode);
 pub async fn storage(
     connection: Weak<Connection>,
     remote_url: &str,
-    auth_url: &str,
+    auth_endpoint: &AuthEndpoint,
     identity: &str,
     partition: Partition,
     credentials: &Arc<SuppliedCredentials>,
@@ -103,7 +108,7 @@ pub async fn storage(
         connection,
         remote_url,
         remote_domain,
-        auth_url,
+        auth_endpoint,
         identity,
         partition,
         credentials,

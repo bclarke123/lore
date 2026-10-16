@@ -1,36 +1,28 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use lore::error_set::prelude::*;
-use lore::interface::LoreEvent;
 use lore::interface::LoreGlobalArgs;
-use lore::lore_spawn;
+use lore::interface::LoreLogLevel;
 use lore::lore_spawn_blocking;
-use lore::remote::connection::ConnectionError;
-use lore::remote::connection::ConnectionErrorWithId;
 use lore::remote::connection::ConnectionId;
-use lore::remote::message::MessageToClient;
-use lore::remote::message::MessageToServer;
-use lore::remote::message::SerializationType;
-use lore::remote::message::V1Header;
-use lore::remote::message::blocking_read_v1_message;
-use lore::remote::message::write_v1_message;
+use lore::remote::connection::serve_connection;
 use lore::remote::network::UdsListener;
 use lore::remote::network::UdsStream;
 use lore::remote::network::uds_supported;
 use lore::remote::service_process::ServiceStopRequest;
 use lore::remote::service_process::register_service_process;
 use lore::remote::service_process::service_executable;
+use lore::remote::service_process::wait_until_a_service_is_listening;
+use lore::remote::service_socket_name;
 use lore::service::initialization::initialize_service;
 use lore::service::service_main::ServiceMainError;
-use tokio::sync::mpsc;
+use lore::service::state::ServiceStateImpl;
 
-use crate::eprintln;
 use crate::println;
 use crate::util::TerminationSignals;
 
@@ -49,6 +41,9 @@ const STOP_REPLY_DRAIN: Duration = Duration::from_millis(500);
 /// Printed once the socket is bound, so that whoever started the service can
 /// tell when it began accepting connections.
 const LISTENING_MESSAGE: &str = "Lore service listening";
+
+/// Reported by a service that exits because another one has claimed the socket.
+const CLAIM_REFUSED_MESSAGE: &str = "Another Lore service has claimed the socket";
 
 /// Where the service parks its working directory. It inherits one from whoever
 /// started it, which is unrelated to the directories its callers run in, and
@@ -72,10 +67,14 @@ fn detached_working_directory() -> std::path::PathBuf {
 pub async fn service_main(
     globals: LoreGlobalArgs,
     listening_signal: Option<tokio::sync::oneshot::Sender<()>>,
+    service_state: Arc<ServiceStateImpl>,
 ) -> Result<(), ServiceMainError> {
     if !uds_supported() {
         return Err(ServiceMainError::internal("IPC not supported on this OS"));
     }
+
+    // Initialize uptime tracking early so all errors can be captured.
+    service_state.initialize();
 
     // Ahead of the socket, because a signal ends the process outright until a
     // handler is in place: registering after binding leaves a window in which a
@@ -85,25 +84,41 @@ pub async fn service_main(
     let termination = match TerminationSignals::register() {
         Ok(signals) => Some(signals),
         Err(error) => {
-            eprintln!("Failed to listen for termination signals: {error}");
+            service_state.push_log(
+                LoreLogLevel::Error,
+                format!("Failed to listen for termination signals: {error}"),
+            );
             None
         }
     };
 
     let detached = detached_working_directory();
     if let Err(error) = std::env::set_current_dir(&detached) {
-        eprintln!(
-            "Failed to set working directory to {}: {error}",
-            detached.display()
+        service_state.push_log(
+            LoreLogLevel::Error,
+            format!(
+                "Failed to set working directory to {}: {error}",
+                detached.display()
+            ),
         );
     }
 
-    initialize_service(globals)
+    // Claimed ahead of initializing, which mounts every instance: a process that would lose the
+    // socket must find out before it mounts anything, since its mounts die with it.
+    let Some(claim) = UdsListener::claim(service_socket_name())
+        .forward::<ServiceMainError>("Failed to claim the service socket")?
+    else {
+        return Err(refuse_claimed_socket(termination).await);
+    };
+
+    // Brings up the mount manager and routes its events into the service state.
+    initialize_service(globals, Arc::clone(&service_state))
         .await
         .forward::<ServiceMainError>("Failed initializing service")?;
 
-    let listener: UdsListener =
-        UdsListener::new().forward::<ServiceMainError>("Failed to start listener socket")?;
+    let listener: UdsListener = claim
+        .listen()
+        .forward::<ServiceMainError>("Failed to start listener socket")?;
     println!("{LISTENING_MESSAGE}");
     report_build_that_is_not_the_configured_one().await;
 
@@ -122,6 +137,7 @@ pub async fn service_main(
 
     // Parks a blocking thread for the service's lifetime; pinned to core because
     // it would occupy net's single blocking thread outright.
+    let accept_state = Arc::clone(&service_state);
     let accept_task = lore_spawn_blocking!(move || {
         let mut connection_id = 0;
         loop {
@@ -132,17 +148,18 @@ pub async fn service_main(
                     }
                     let new_connection_id = connection_id;
                     connection_id += 1;
-                    lore_spawn!(async move {
-                        IpcConnection::new(ConnectionId(new_connection_id), stream)
-                            .handle_connection()
-                            .await;
-                    });
+                    serve_connection(
+                        accept_state.clone(),
+                        ConnectionId(new_connection_id),
+                        stream,
+                    );
                 }
                 Err(err) => {
                     if accept_shutting_down.load(Ordering::SeqCst) {
                         break;
                     }
-                    eprintln!("Failed when accepting: {err}");
+                    accept_state
+                        .push_log(LoreLogLevel::Error, format!("Failed when accepting: {err}"));
                 }
             }
         }
@@ -152,17 +169,59 @@ pub async fn service_main(
 
     println!("Shutting down Lore service");
     shutting_down.store(true, Ordering::SeqCst);
-    if let Err(error) = UdsStream::connect() {
-        eprintln!("Failed to wake the accept loop: {error}");
+    if let Err(error) = UdsStream::connect(service_socket_name()) {
+        service_state.push_log(
+            LoreLogLevel::Error,
+            format!("Failed to wake the accept loop: {error}"),
+        );
     }
     if tokio::time::timeout(SHUTDOWN_TIMEOUT, accept_task)
         .await
         .is_err()
     {
-        eprintln!("Timed out waiting for the accept loop to stop");
+        service_state.push_log(
+            LoreLogLevel::Error,
+            "Timed out waiting for the accept loop to stop".to_string(),
+        );
     }
 
     Ok(())
+}
+
+/// Waits for the service holding the claim to answer, then reports the refusal. The command that
+/// started this process gives it a short grace once it exits, which a winner still mounting its
+/// instances can outlast, so exiting at once would fail that command. A termination signal ends
+/// the wait.
+async fn refuse_claimed_socket(termination: Option<TerminationSignals>) -> ServiceMainError {
+    let outcome = match unless_terminated(termination, wait_until_a_service_is_listening()).await {
+        None => ", and stopped waiting for it on a signal",
+        Some(Ok(true)) => "",
+        Some(Ok(false)) => ", and it did not answer in time",
+        Some(Err(error)) => {
+            return ServiceMainError::internal_with_context(
+                error,
+                "waiting for the service holding the socket claim to answer",
+            );
+        }
+    };
+    ServiceMainError::internal(format!(
+        "{CLAIM_REFUSED_MESSAGE} {}{outcome}",
+        service_socket_name()
+    ))
+}
+
+/// Awaits `future`, or ends the wait with `None` when `termination` receives a signal first.
+async fn unless_terminated<T>(
+    termination: Option<TerminationSignals>,
+    future: impl Future<Output = T>,
+) -> Option<T> {
+    match termination {
+        Some(mut termination) => tokio::select! {
+            output = future => Some(output),
+            () = termination.recv() => None,
+        },
+        None => Some(future.await),
+    }
 }
 
 /// Reports serving from a build other than the one that would be started
@@ -202,15 +261,9 @@ async fn report_build_that_is_not_the_configured_one() {
 /// graceful path from a signal, and the IPC request becomes the only way to stop
 /// serving rather than a reason to stop.
 async fn wait_for_stop(stop_request: &ServiceStopRequest, termination: Option<TerminationSignals>) {
-    let stopped_by_signal = if let Some(mut termination) = termination {
-        tokio::select! {
-            () = termination.recv() => true,
-            () = stop_request.requested() => false,
-        }
-    } else {
-        stop_request.requested().await;
-        false
-    };
+    let stopped_by_signal = unless_terminated(termination, stop_request.requested())
+        .await
+        .is_none();
 
     // A signal carries no reply, so nothing has to drain before shutdown.
     if stopped_by_signal {
@@ -220,100 +273,4 @@ async fn wait_for_stop(stop_request: &ServiceStopRequest, termination: Option<Te
     // The caller that asked for the stop is waiting for its reply on a
     // connection this process owns, so the reply drains before the teardown.
     tokio::time::sleep(STOP_REPLY_DRAIN).await;
-}
-
-#[allow(dead_code)]
-struct IpcConnection {
-    id: ConnectionId,
-    connection: UdsStream,
-}
-
-impl IpcConnection {
-    fn new(id: ConnectionId, connection: UdsStream) -> Self {
-        Self { id, connection }
-    }
-
-    async fn send_message(
-        mut stream: UdsStream,
-        message: MessageToClient,
-        serialization_type: SerializationType,
-    ) -> Result<(), ConnectionError> {
-        let message_bytes = write_v1_message(message, serialization_type)
-            .forward::<ConnectionError>("writing message")?;
-        lore_spawn_blocking!(move || stream.writer().write_all(message_bytes.as_slice()))
-            .await
-            .internal("failed writing")?
-            .internal("io")?;
-        Ok(())
-    }
-
-    async fn handle_connection(self) {
-        let id = self.id;
-        if let Err(error) = self.handle_connection_impl().await {
-            eprintln!(
-                "Error in connection: {}",
-                ConnectionErrorWithId::new(error, id)
-            );
-        }
-    }
-
-    async fn handle_connection_impl(self) -> Result<(), ConnectionError> {
-        let mut connection = self.connection.try_clone().internal("cloning connection")?;
-        // Parks a core blocking thread until the peer sends or hangs up, so live
-        // connections consume core's blocking pool one thread apiece.
-        let message: Option<(V1Header, MessageToServer)> =
-            lore_spawn_blocking!(move || blocking_read_v1_message(connection.reader()))
-                .await
-                .internal("failed reading")?
-                .forward::<ConnectionError>("reading message")?;
-
-        let Some((header, command)) = message else {
-            return Ok(());
-        };
-
-        //TODO(UCS-16094): Determine if this should be unbounded or bounded
-        // Create a channel so the callback task can send messages to this network thread, so they
-        // can be forwarded to the client.
-        let (to_client_sender, mut to_client_receiver) =
-            mpsc::unbounded_channel::<(MessageToClient, SerializationType)>();
-
-        lore_spawn!(async move {
-            let sender = to_client_sender.clone();
-
-            // Note: this callback is intentionally NOT wrapped with .with_defaults().
-            // It is the server-side event forwarder that must pass every LoreEvent
-            // (including Error and Log) to the remote client so the client's own
-            // wrapped callback can handle them. Wrapping here would swallow those
-            // events on the server side and they would never reach the remote.
-            let cli_result = command
-                .invoke(Some(Box::new(move |event: &LoreEvent| {
-                    if let Err(error) = to_client_sender.send((
-                        MessageToClient::Event(event.clone()),
-                        header.serialization_type,
-                    )) {
-                        eprintln!("Failed to send Event message to connection task: {error}");
-                    }
-                })))
-                .await;
-
-            if let Err(error) = sender.send((
-                MessageToClient::ApiResult(cli_result),
-                header.serialization_type,
-            )) {
-                eprintln!("Failed to send ApiResult message to connection task: {error}");
-            }
-        });
-
-        while let Some((message, serialization_type)) = to_client_receiver.recv().await {
-            let stream = self.connection.try_clone().internal("cloning connection")?;
-            if let Err(error) = Self::send_message(stream, message, serialization_type).await {
-                eprintln!(
-                    "Failed to send message to client: {}",
-                    ConnectionErrorWithId::new(error, self.id)
-                );
-            }
-        }
-
-        Ok(())
-    }
 }

@@ -58,6 +58,7 @@ impl GetMetadata {
     }
 }
 
+#[lore_macro::test_pub]
 fn serialize_response(data: StoreGetData) -> Vec<Bytes> {
     let match_made: u8 = data.match_made.into();
     vec![
@@ -68,6 +69,11 @@ fn serialize_response(data: StoreGetData) -> Vec<Bytes> {
 }
 
 pub fn parse_response(mut bytes: Bytes) -> Result<StoreGetData, ReplicationStoreClientError> {
+    if bytes.len() < super::get::RESPONSE_HEADER_SIZE {
+        return Err(ReplicationStoreClientError::ResponseError(
+            "get_metadata response shorter than its header",
+        ));
+    }
     let fragment: Fragment = bytes.split_to(size_of::<Fragment>()).into();
     let match_made: StoreMatch = bytes[0].try_into().map_err(|error| {
         warn!(?error, "failed to parse match_made");
@@ -82,6 +88,7 @@ pub fn parse_response(mut bytes: Bytes) -> Result<StoreGetData, ReplicationStore
         match_made,
         partition,
         payload: None,
+        content: None,
     })
 }
 
@@ -138,96 +145,5 @@ impl RequestHandler for GetMetadataHandler {
             .await?;
 
         Ok(serialize_response(result))
-    }
-}
-
-#[cfg(test)]
-pub mod tests {
-    use lore_base::types::Context;
-    use lore_revision::fragment;
-    use rand::random;
-    use uuid::Uuid;
-
-    use super::*;
-    use crate::quic::tests::collapse_bytes;
-    use crate::quic::tests::collapse_bytes_without_header;
-
-    mod request {
-        use lore_base::types::Address;
-
-        use super::*;
-        use crate::protocol::replication_store::header::ReplicationHeader;
-
-        #[test]
-        fn parsing_works() {
-            let repository = random::<Context>();
-            let (_, address, _) = fragment::generate_random();
-
-            let input = GetMetadata {
-                header: ReplicationHeader {
-                    correlation_id: Uuid::new_v4(),
-                    repository,
-                },
-                address,
-            };
-            let input_bytes = collapse_bytes_without_header(&input.clone().to_quic_chunks());
-            let output = GetMetadata::parse(input_bytes).expect("parse should work");
-
-            assert_eq!(input, output);
-        }
-
-        #[test]
-        fn parsing_fails_if_truncated() {
-            let repository = random::<Context>();
-
-            let input = GetMetadata {
-                header: ReplicationHeader {
-                    correlation_id: Uuid::new_v4(),
-                    repository,
-                },
-                address: Address::default(),
-            };
-            let mut input_bytes = collapse_bytes_without_header(&input.to_quic_chunks());
-            input_bytes.truncate(input_bytes.len() - 1);
-            let output = GetMetadata::parse(input_bytes).expect_err("parse should fail");
-
-            assert!(matches!(output, MessageParseError::InvalidFieldLength));
-        }
-    }
-
-    mod response {
-        use super::*;
-
-        #[test]
-        fn serialize_response_has_three_chunks() {
-            let (fragment, _, _) = fragment::generate_random();
-            let data = StoreGetData {
-                fragment,
-                match_made: StoreMatch::MatchFull,
-                partition: random::<lore_base::types::Partition>(),
-                payload: None,
-            };
-            // if this assertion fails, then new servers sending
-            // this response to old clients will be silently wrong
-            // and could end up parsing incorrect payloads.
-            assert_eq!(serialize_response(data).len(), 3);
-        }
-
-        #[test]
-        fn response_roundtrips() {
-            let (fragment, _, _) = fragment::generate_random();
-            let original = StoreGetData {
-                fragment,
-                match_made: StoreMatch::MatchFull,
-                partition: random::<lore_base::types::Partition>(),
-                payload: None,
-            };
-            let bytes = serialize_response(original.clone());
-            let reparsed = parse_response(collapse_bytes(&bytes)).expect("parse should work");
-            assert_eq!(reparsed.fragment, original.fragment);
-            assert_eq!(reparsed.match_made, original.match_made);
-            assert_eq!(reparsed.partition, original.partition);
-            assert_eq!(reparsed.payload, None);
-        }
     }
 }

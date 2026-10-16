@@ -44,16 +44,3 @@ impl Debug for CorrelationId {
         write!(f, "{self}")
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::correlation::CorrelationId;
-
-    #[test]
-    fn test_default_correlation_id() {
-        let correlation_id = CorrelationId::default();
-
-        uuid::Uuid::try_parse(&correlation_id.0)
-            .expect("Inner correlation id should be a valid UUID");
-    }
-}

@@ -101,10 +101,13 @@ pub async fn dump_node(
     }
     node.walk_step(node_id, expected_parent, cycle)?;
     {
-        let node_name = state
-            .node_name_ref(repository.clone(), node_id)
+        let Some(node_name) = state
+            .node_name_ref_or_skip(repository.clone(), node_id)
             .await
-            .forward::<StateError>("Failed to get node name")?;
+            .forward::<StateError>("Failed to get node name")?
+        else {
+            return Ok(node.sibling());
+        };
         subpath.push(node_name);
 
         let type_data = if node.is_directory() {

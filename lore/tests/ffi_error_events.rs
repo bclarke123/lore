@@ -18,7 +18,9 @@ mod tests {
 
     use lore::interface::LoreString;
     use lore::repository::LoreRepositoryCreateArgs;
+    use lore::repository::LoreRepositoryDeleteArgs;
     use lore::repository::LoreRepositoryStatusArgs;
+    use lore_base::error::NoRemote;
     use lore_base::error::RepositoryNotFound;
     use lore_base::log::LoreLogLevel;
     use lore_error_set::FfiError;
@@ -301,6 +303,40 @@ mod tests {
         assert_eq!(captured.error_code, 0);
         assert!(captured.message.is_empty());
         assert!(captured.trace.is_empty());
+    }
+
+    // The delete entry point resolves a bare name against the repository's
+    // remote, so in a repository created without one it reports `NoRemote`
+    // through the return value and `Complete` without reaching a server.
+    #[serial]
+    #[test]
+    fn delete_entry_point_reports_a_missing_remote() {
+        let tempdir = TempDir::new("lore-ffi-delete-test-");
+        let no_callback = LoreEventCallbackConfig {
+            user_context: 0,
+            func: None,
+        };
+        let created = lore::interface::lore_repository_create(
+            &globals_for(tempdir.path()),
+            &create_args(&random_name()),
+            no_callback,
+        );
+        assert_eq!(created, 0, "the repository must be created");
+
+        let (sink, config, _done_rx) = make_sink();
+        let status = lore::interface::lore_repository_delete(
+            &globals_for(tempdir.path()),
+            &LoreRepositoryDeleteArgs {
+                repository_url: random_name().as_str().into(),
+            },
+            config,
+        );
+
+        let captured = sink.captured.lock().unwrap();
+        assert_eq!(captured.complete_count, 1, "exactly one Complete event");
+        assert_eq!(status, NoRemote.ffi_code());
+        assert_eq!(captured.status, NoRemote.ffi_code());
+        assert_eq!(captured.error_code, NoRemote.ffi_code());
     }
 
     // The asynchronous entry point returns `void`; the failure code arrives

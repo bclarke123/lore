@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from lore_parsers import parse_status_json
+from lore_parsers import parse_jsonl, parse_status_json
 
 if TYPE_CHECKING:
     from lore import Lore
@@ -52,13 +52,30 @@ def working_tree_files(repo: "Lore", root: str = "") -> list[str]:
 
 
 def unstaged_entries(repo: "Lore") -> list[dict]:
-    """The entries `status --unstaged` reports that are not also staged.
+    """The entries `status --unstaged` reports that are not also staged, sorted by path.
 
     The command reports both, so the staged ones have to be filtered out to be
-    left with what is only on the file system.
+    left with what is only on the file system. Its JSON output is the event
+    stream, in the order the scan reports entries, so they are sorted here.
     """
-    return [
-        entry
-        for entry in parse_status_json(repo.status(json=True, unstaged=True))
-        if not entry.get("flagStaged", False)
-    ]
+    return sorted(
+        (
+            entry
+            for entry in parse_status_json(repo.status(json=True, unstaged=True))
+            if not entry.get("flagStaged", False)
+        ),
+        key=lambda entry: entry["path"],
+    )
+
+
+def status_by_path(repo: "Lore", **kwargs) -> dict[str, dict]:
+    """The `status` entries keyed by path."""
+    return {
+        e.get("path"): e for e in parse_status_json(repo.status(json=True, **kwargs))
+    }
+
+
+def revision_metadata_keys(repo: "Lore") -> set[str]:
+    """The keys of the current revision's metadata."""
+    events = parse_jsonl(repo.revision_metadata_get(json=True), "metadata")
+    return {event["key"] for event in events}

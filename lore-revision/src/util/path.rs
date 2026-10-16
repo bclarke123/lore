@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use std::borrow::Cow;
 use std::fmt::Display;
+use std::hash::Hash;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -10,6 +11,7 @@ use std::sync::Arc;
 use lore_error_set::prelude::*;
 
 use crate::errors::InvalidPath;
+use crate::repository::is_reserved_node_name;
 
 #[error_set]
 pub enum PathError {
@@ -64,24 +66,36 @@ pub fn make_absolute_from(
 /// Returns `true` when `candidate` resolves to a location inside
 /// `repository_path`, `false` only when it is confidently outside.
 ///
-/// Wraps the canonical [`RelativePath::new_from_user_path`] check used at ~30
-/// call sites for input-path validation. Internal errors (e.g. failed
-/// `current_dir` resolution) are treated as "inside" — callers use this to
-/// pick between read- and write-dispatching, so over-classifying as inside
-/// keeps the safe (write) default.
+/// Asks the geometry alone, so a path through the dot directory is inside even though
+/// [`RelativePath::new_from_user_path`] refuses it: callers use this to pick between read- and
+/// write-dispatching, and over-classifying as inside keeps the safe (write) default. Internal
+/// errors (e.g. failed `current_dir` resolution) are treated as "inside" for the same reason.
 pub fn is_path_inside_repository(repository_path: &Path, candidate: &str) -> bool {
     !matches!(
-        RelativePath::new_from_user_path(repository_path, candidate),
+        RelativePathBuf::relative_to_root(repository_path, candidate),
         Err(PathError::InvalidPath(_)),
     )
 }
 
+/// Where the working tree holds `candidate`, and `None` where it holds it nowhere: outside the
+/// root, or through a dot directory at any depth, which holds a repository's own state rather
+/// than content the tree tracks.
+///
+/// The dot directory is matched in any ASCII case, as it is on a filesystem that folds case. A
+/// path that cannot be resolved is held nowhere either. A caller dispatching on this reaches such
+/// a path directly, which asks nothing of the repository.
+pub fn repository_relative_path(repository_path: &Path, candidate: &str) -> Option<RelativePath> {
+    RelativePath::new_from_user_path(repository_path, candidate).ok()
+}
+
 /// Number of path components in a repository-relative path.
+#[lore_macro::test_pub]
 pub(crate) fn path_depth(path: &str) -> usize {
     path.matches('/').count() + 1
 }
 
 /// Number of leading components `left` and `right` share.
+#[lore_macro::test_pub]
 pub(crate) fn shared_component_depth(left: &str, right: &str) -> usize {
     left.split('/')
         .zip(right.split('/'))
@@ -96,6 +110,7 @@ pub(crate) fn shared_component_depth(left: &str, right: &str) -> usize {
 /// once per comparison, and leaves a sorted set grouped into depth levels.
 ///
 /// The fields are private so the depth is always the one the path has.
+#[lore_macro::test_pub]
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct DepthPath {
     depth: usize,
@@ -103,6 +118,7 @@ pub(crate) struct DepthPath {
 }
 
 impl DepthPath {
+    #[lore_macro::test_pub]
     pub(crate) fn new(path: String) -> Self {
         Self {
             depth: path_depth(&path),
@@ -110,10 +126,12 @@ impl DepthPath {
         }
     }
 
+    #[lore_macro::test_pub]
     pub(crate) fn depth(&self) -> usize {
         self.depth
     }
 
+    #[lore_macro::test_pub]
     pub(crate) fn path(&self) -> &str {
         &self.path
     }
@@ -335,6 +353,7 @@ fn absolute_clean(path: &Path) -> Result<String, PathError> {
 /// Anything else takes [`str::to_lowercase`], the fold node names are hashed
 /// over. Folding character by character instead would disagree with it wherever
 /// the mapping depends on where in a word the character falls.
+#[lore_macro::test_pub]
 fn push_lowercase(out: &mut String, name: &str) {
     let restore = out.len();
 
@@ -593,6 +612,18 @@ impl RelativePath {
         user_path: &str,
     ) -> Result<RelativePath, PathError> {
         RelativePathBuf::new_from_user_path(repository_path, user_path).map(|p| p.freeze())
+    }
+
+    /// [`Self::new_from_user_path`] by geometry alone, for a path a mounted filesystem hands in.
+    ///
+    /// A mount asks the tree whether it holds the path, and the resolver answers a path through
+    /// the repository's own directory with no node, as it always has. A refusal here would reach
+    /// callbacks that have no answer for one and fall back to the root instead.
+    pub fn new_from_mount_path(
+        repository_path: &Path,
+        mount_path: &str,
+    ) -> Result<RelativePath, PathError> {
+        RelativePathBuf::relative_to_root(repository_path, mount_path).map(|p| p.freeze())
     }
 
     pub fn to_absolute_path(&self, repository_path: impl AsRef<Path>) -> PathBuf {
@@ -1120,7 +1151,24 @@ impl RelativePathBuf {
 
     /// Construct from a user-provided path relative to a repository path.
     /// Makes the user path absolute if needed, then computes the relative portion.
+    ///
+    /// A path through the repository's own directory, in any ASCII case and at any depth, is an
+    /// invalid path: no node carries that name, so the tree holds nothing there, and a lookup by
+    /// it would otherwise reach a node a revision holds under that name.
     pub fn new_from_user_path(
+        repository_path: &Path,
+        user_path: &str,
+    ) -> Result<RelativePathBuf, PathError> {
+        let path = Self::relative_to_root(repository_path, user_path)?;
+        if path.path.split('/').any(is_reserved_node_name) {
+            return Err(InvalidPath { path: path.path }.into());
+        }
+        Ok(path)
+    }
+
+    /// The portion of `user_path` below `repository_path`, by geometry alone: what
+    /// [`Self::new_from_user_path`] answers before asking whether the tree can hold the path.
+    fn relative_to_root(
         repository_path: &Path,
         user_path: &str,
     ) -> Result<RelativePathBuf, PathError> {
@@ -1152,25 +1200,35 @@ impl RelativePathBuf {
 
     /// Append a path component, adding separator if needed.
     /// Updates `path_lower` to maintain lowercase invariant.
+    ///
+    /// Reserves the separator where it adds one and the name's length in each string.
     pub fn push(&mut self, name: impl AsRef<str>) -> &mut Self {
         let name = name.as_ref();
         if name.is_empty() {
             return self;
         }
 
-        self.path.reserve(1 + name.len());
-        if !self.path.is_empty() && !self.path.ends_with('/') {
+        let separator = !self.path.is_empty() && !self.path.ends_with('/');
+        self.path.reserve(usize::from(separator) + name.len());
+        if separator {
             self.path.push('/');
         }
         self.path.push_str(name);
 
-        self.path_lower.reserve(1 + name.len());
-        if !self.path_lower.is_empty() && !self.path_lower.ends_with('/') {
+        self.path_lower.reserve(usize::from(separator) + name.len());
+        if separator {
             self.path_lower.push('/');
         }
         push_lowercase(&mut self.path_lower, name);
 
         self
+    }
+
+    /// Room for `additional` more bytes in each of the two strings, so a push that short does not
+    /// grow them.
+    pub fn reserve(&mut self, additional: usize) {
+        self.path.reserve(additional);
+        self.path_lower.reserve(additional);
     }
 
     /// Reset both `path` and `path_lower` to empty.
@@ -1351,335 +1409,5 @@ impl Display for RelativePathBuf {
 impl AsRef<str> for RelativePathBuf {
     fn as_ref(&self) -> &str {
         self.path.as_str()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_path_below_an_ancestor_is_the_names_between_them() {
-        let path = RelativePath::new_from_clean_parts("thr/sub/file.txt", "");
-        assert_eq!(
-            path.below(&RelativePath::new_from_clean_parts("thr", "")),
-            Some("sub/file.txt")
-        );
-        assert_eq!(path.below(&RelativePath::new()), Some("thr/sub/file.txt"));
-        assert_eq!(path.below(&path), Some(""));
-    }
-
-    /// A name the ancestor merely shares a prefix with is not below it, so the answer is nothing
-    /// rather than a suffix of the wrong name.
-    #[test]
-    fn a_path_below_a_partial_name_match_is_nothing() {
-        let path = RelativePath::new_from_clean_parts("third/file.txt", "");
-        assert_eq!(
-            path.below(&RelativePath::new_from_clean_parts("thr", "")),
-            None
-        );
-        assert_eq!(
-            path.below(&RelativePath::new_from_clean_parts(
-                "third/file.txt/deeper",
-                ""
-            )),
-            None
-        );
-    }
-
-    #[test]
-    fn a_pushed_component_carries_into_the_lowercase_form() {
-        let mut path = RelativePathBuf::new();
-        path.push("Assets");
-        path.push("MESHES");
-        assert_eq!(path.as_str(), "Assets/MESHES");
-        assert_eq!(path.as_lowercase_str(), "assets/meshes");
-    }
-
-    /// The lowercase form takes an ASCII path character for character and
-    /// anything else through the general mapping, which can be more characters
-    /// than it replaces. The capacity both are built with is a reserve, so the
-    /// wider one grows rather than being cut short.
-    #[test]
-    fn a_component_beyond_ascii_lowercases_through_the_general_mapping() {
-        let mut path = RelativePathBuf::with_capacity("ÅNGSTRÖM".len());
-        path.push("ÅNGSTRÖM");
-        assert_eq!(path.as_str(), "ÅNGSTRÖM");
-        assert_eq!(path.as_lowercase_str(), "ångström");
-
-        let mut path = RelativePathBuf::with_capacity("İ".len());
-        path.push("İ");
-        assert_eq!(path.as_str(), "İ");
-        assert_eq!(
-            path.as_lowercase_str(),
-            "i\u{307}",
-            "one character became two"
-        );
-    }
-
-    /// Every route into the lowercase form takes a suffix beyond ASCII through
-    /// the general mapping, not `push` alone. Each reserves what the suffix takes
-    /// in the path, which the two characters `İ` folds to outgrow.
-    #[test]
-    fn every_append_route_lowercases_beyond_ascii() {
-        let base = RelativePath::new_from_clean_parts("Assets", "");
-
-        let appended = base.append_into_buf("_İ");
-        assert_eq!(appended.as_str(), "Assets_İ");
-        assert_eq!(appended.as_lowercase_str(), "assets_i\u{307}");
-
-        let pushed = base.push_into_buf("MESH_İ");
-        assert_eq!(pushed.as_str(), "Assets/MESH_İ");
-        assert_eq!(pushed.as_lowercase_str(), "assets/mesh_i\u{307}");
-
-        let mut buf = base.into_buf();
-        buf.append("_İ");
-        assert_eq!(buf.as_str(), "Assets_İ");
-        assert_eq!(buf.as_lowercase_str(), "assets_i\u{307}");
-    }
-
-    /// The fold has to be the one node names are hashed over, or a name matches
-    /// on its digest and not on its path. A character-wise fold parts from it
-    /// where the mapping depends on where in a word the character falls, which
-    /// for a final capital sigma it does.
-    #[test]
-    fn the_lowercase_form_takes_the_fold_node_names_are_hashed_over() {
-        for name in [
-            "",
-            "Assets",
-            "ROCK.MESH",
-            "Stra\u{00df}e",
-            "\u{0130}stanbul",
-            "\u{00c5}NGSTR\u{00d6}M",
-            "\u{039f}\u{0394}\u{039f}\u{03a3}",
-            "\u{03a3}\u{03bf}\u{03c6}\u{03bf}\u{03c2}",
-            "\u{4f60}\u{597d}",
-        ] {
-            let mut folded = String::new();
-            push_lowercase(&mut folded, name);
-            assert_eq!(folded, name.to_lowercase(), "{name:?} folds apart from it");
-        }
-    }
-
-    /// The ASCII fold is written before the name is known to be ASCII, so a
-    /// component that only reaches beyond it at the end has to have that
-    /// speculative write taken back off what came before it.
-    #[test]
-    fn a_component_turning_non_ascii_at_its_end_keeps_what_it_was_appended_to() {
-        let mut path = RelativePathBuf::new();
-        path.push("Assets");
-        path.push("MESH_Å");
-        assert_eq!(path.as_str(), "Assets/MESH_Å");
-        assert_eq!(path.as_lowercase_str(), "assets/mesh_å");
-    }
-
-    /// An initial path is trimmed and brought onto `/`, and only one that is not
-    /// already there is rewritten to establish it.
-    #[test]
-    fn an_initial_path_holds_the_canonical_separator() {
-        let expect = |name: &str| {
-            RelativePathBuf::new_from_initial_path(name)
-                .expect("the path is relative")
-                .as_str()
-                .to_owned()
-        };
-
-        assert_eq!(expect("Assets/Meshes"), "Assets/Meshes");
-        assert_eq!(expect("/Assets/Meshes/"), "Assets/Meshes");
-        assert_eq!(expect("./Assets"), "Assets");
-        assert_eq!(expect("Assets\\Meshes"), "Assets/Meshes");
-        assert_eq!(expect("Assets//Meshes"), "Assets/Meshes");
-        assert_eq!(
-            expect("Assets///Meshes"),
-            "Assets/Meshes",
-            "a run of separators collapses however long it is"
-        );
-        assert_eq!(
-            expect("Assets\\\\Meshes"),
-            "Assets/Meshes",
-            "a separator that doubles once rewritten collapses with it"
-        );
-        assert!(expect(".").is_empty());
-        assert!(expect("").is_empty());
-    }
-
-    /// `from_str` folds a whole path rather than a component, and the lowercase
-    /// form it ends up with is what bounds the view of it.
-    #[test]
-    fn from_str_carries_a_lowercase_form_of_its_own_length() {
-        let path = RelativePath::from_str("FÖLDER/İ").expect("the conversion is infallible");
-        assert_eq!(path.as_str(), "FÖLDER/İ");
-        assert_eq!(
-            path.as_lowercase_str(),
-            "földer/i\u{307}",
-            "a fold that widens is not cut short by the length of the path"
-        );
-    }
-
-    #[test]
-    fn pop_root_repeat_leaves_a_view_of_what_is_below_them() {
-        let mut path = RelativePath::new_from_clean_parts("Assets/Meshes/Rock.mesh", "");
-        path.pop_root_repeat(2);
-        assert_eq!(path.as_str(), "Rock.mesh");
-        assert_eq!(
-            path.as_lowercase_str(),
-            "rock.mesh",
-            "the lowercase form advances with it"
-        );
-
-        path.pop_root_repeat(5);
-        assert!(path.is_empty(), "advancing past the end stops at it");
-    }
-
-    #[test]
-    fn shared_component_depth_counts_whole_components() {
-        assert_eq!(shared_component_depth("a/b/c", "a/b/d"), 2);
-        assert_eq!(shared_component_depth("a/b/c", "a/x/c"), 1);
-        assert_eq!(shared_component_depth("a/b/c", "x/b/c"), 0);
-        assert_eq!(shared_component_depth("a/b/c", "a/b/c"), 3);
-        // A shared string prefix that stops inside a component shares neither it
-        // nor anything below it.
-        assert_eq!(shared_component_depth("a/b/x", "a/bc/y"), 1);
-        assert_eq!(shared_component_depth("ab/x", "a/x"), 0);
-        // A path that runs out is shared as far as it goes.
-        assert_eq!(shared_component_depth("a/b", "a/b/c"), 2);
-        assert_eq!(shared_component_depth("", "a"), 0);
-        assert_eq!(shared_component_depth("a", "a"), 1);
-    }
-
-    /// The steps a path takes to reach canonical form, each of which leaves a
-    /// path already there as it is.
-    #[test]
-    fn clean_brings_a_path_onto_the_canonical_form() {
-        assert_eq!("abc/def", clean("abc/def".to_owned()));
-        assert_eq!("abc/def", clean(r"\\?\abc\def".to_owned()));
-        assert_eq!("abc/def", clean(r"\\.\abc\def".to_owned()));
-        assert_eq!("abc/def", clean("abc//def".to_owned()));
-        assert_eq!("abc/def", clean("abc////def".to_owned()));
-        assert_eq!("abc/def", clean("abc/./def".to_owned()));
-        assert_eq!(
-            "abc/def",
-            clean("abc/././def".to_owned()),
-            "a `.` left adjacent to the next by removing one is removed with it"
-        );
-        assert_eq!("abc/def", clean("./abc/def".to_owned()));
-        assert_eq!("abc/def", clean("././abc/def".to_owned()));
-        assert_eq!("abc/def", clean("abc/def/.".to_owned()));
-        assert_eq!("", clean(String::new()));
-    }
-
-    /// Only a component that is `..` entire is a step up. A name that merely
-    /// begins with two periods, or is made of them, is a name.
-    #[test]
-    fn clean_steps_up_for_a_parent_and_not_for_a_name() {
-        assert_eq!("abc/.../def", clean("abc/.../def".to_owned()));
-        assert_eq!("abc/..name/def", clean("abc/..name/def".to_owned()));
-        assert_eq!("abc/name../def", clean("abc/name../def".to_owned()));
-        assert_eq!("abc/def", clean("abc/ghi/../def".to_owned()));
-    }
-
-    #[test]
-    fn test_clean_path_with_leading_parent() {
-        assert_eq!("../../def", clean("../../abc/../def".to_owned()));
-    }
-
-    #[test]
-    fn test_clean_path_with_double_parent() {
-        assert_eq!("abc/jkl", clean("abc/def/ghi/../../jkl".to_owned()));
-    }
-
-    #[test]
-    fn test_clean_path_with_parent_after_period() {
-        assert_eq!("abc/ghi", clean("abc/def/./../ghi".to_owned()));
-    }
-
-    #[test]
-    #[cfg(target_os = "windows")]
-    fn test_clean_path_with_parent_after_drive() {
-        assert_eq!("C:/abc", clean("C:\\..\\abc".to_owned()));
-        assert_eq!("C:/abc", clean("C:/../abc".to_owned()));
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    mod is_path_inside_repository {
-        use std::path::Path;
-
-        use super::super::is_path_inside_repository;
-
-        #[test]
-        fn child_at_root() {
-            assert!(is_path_inside_repository(Path::new("/a/b"), "/a/b/x.txt"));
-        }
-
-        #[test]
-        fn nested_child() {
-            assert!(is_path_inside_repository(
-                Path::new("/a/b"),
-                "/a/b/c/d/x.txt",
-            ));
-        }
-
-        #[test]
-        fn sibling_directory_is_outside() {
-            assert!(!is_path_inside_repository(Path::new("/a/b"), "/a/c/x.txt",));
-        }
-
-        #[test]
-        fn repo_equals_candidate() {
-            assert!(is_path_inside_repository(Path::new("/a/b"), "/a/b"));
-        }
-
-        #[test]
-        fn traversal_escaping_is_outside() {
-            // /a/b/../../tmp/x.txt cleans to /tmp/x.txt, which is outside /a/b.
-            assert!(!is_path_inside_repository(
-                Path::new("/a/b"),
-                "/a/b/../../tmp/x.txt",
-            ));
-        }
-
-        #[test]
-        fn traversal_returning_is_inside() {
-            // /a/b/sub/../x.txt cleans to /a/b/x.txt.
-            assert!(is_path_inside_repository(
-                Path::new("/a/b"),
-                "/a/b/sub/../x.txt",
-            ));
-        }
-
-        #[test]
-        fn empty_candidate_is_inside() {
-            // new_from_user_path treats "" / "." as the repo root itself.
-            assert!(is_path_inside_repository(Path::new("/a/b"), ""));
-            assert!(is_path_inside_repository(Path::new("/a/b"), "."));
-        }
-
-        #[test]
-        fn case_insensitive() {
-            // new_from_user_path lowercases both sides before comparing.
-            assert!(is_path_inside_repository(Path::new("/A/B"), "/a/b/x.txt",));
-        }
-    }
-
-    /// The lowercase view has to narrow with the one it mirrors, or a filter would fold a
-    /// parent against a name the path no longer holds.
-    #[test]
-    fn a_parent_path_narrows_both_views() {
-        let nested = RelativePath::new_from_initial_path("A/B/C").unwrap();
-        let parent = nested.parent_path();
-        assert_eq!(parent.as_str(), "A/B");
-        assert_eq!(parent.as_lowercase_str(), "a/b");
-
-        let single = RelativePath::new_from_initial_path("D").unwrap();
-        let single_parent = single.parent_path();
-        assert!(single_parent.is_empty());
-        assert_eq!(single_parent.as_lowercase_str(), "");
-
-        let empty = RelativePath::new();
-        assert!(empty.parent_path().is_empty());
-
-        let grandparent = nested.parent_path().parent_path();
-        assert_eq!(grandparent.as_str(), "A");
-        assert_eq!(grandparent.as_lowercase_str(), "a");
     }
 }

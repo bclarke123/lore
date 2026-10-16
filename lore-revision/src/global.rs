@@ -7,6 +7,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use lore_base::directories::project_directory;
+use lore_base::env::GLOBAL_PATH_VAR;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
@@ -27,10 +28,8 @@ fn make_path_if_nonexistent(path: &PathBuf) -> Result<(), GlobalConfigError> {
     Ok(())
 }
 
-const LORE_GLOBAL_PATH_VAR: &str = "LORE_GLOBAL_PATH";
-
 pub fn get_global_config_dir() -> Result<PathBuf, GlobalConfigError> {
-    let path = if let Ok(override_dir) = std::env::var(LORE_GLOBAL_PATH_VAR) {
+    let path = if let Some(override_dir) = lore_base::env::var(GLOBAL_PATH_VAR) {
         PathBuf::from(override_dir).join("config")
     } else {
         project_directory()
@@ -43,7 +42,7 @@ pub fn get_global_config_dir() -> Result<PathBuf, GlobalConfigError> {
 }
 
 pub fn get_global_data_dir() -> Result<PathBuf, GlobalConfigError> {
-    let path = if let Ok(override_dir) = std::env::var(LORE_GLOBAL_PATH_VAR) {
+    let path = if let Some(override_dir) = lore_base::env::var(GLOBAL_PATH_VAR) {
         PathBuf::from(override_dir).join("data")
     } else {
         project_directory()
@@ -83,6 +82,7 @@ pub struct ServiceConfig {
     pub use_automatically: Option<bool>,
 }
 
+#[lore_macro::test_pub]
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 #[serde(default)]
 pub struct GlobalConfig {
@@ -148,20 +148,6 @@ impl GlobalConfig {
     pub fn use_service_automatically(&self) -> bool {
         self.service.use_automatically.unwrap_or(false)
     }
-
-    /// Synchronous twin of [`load`](SaveableConfig::load), for a caller that
-    /// reads the config before the runtime is doing anything else — deciding
-    /// how to size that runtime, for one.
-    ///
-    /// [`modify_on_load`](SaveableConfig::modify_on_load) is async and so does
-    /// not run here, which leaves the shared store URLs as they were written.
-    /// Only `[service]` is read this early, so this is inherent to
-    /// `GlobalConfig` rather than a method on the trait, where it would be an
-    /// invitation to read a field it had quietly not normalized.
-    pub fn load_blocking() -> Result<Self, GlobalConfigError> {
-        util::config::load_blocking(&Self::file_location()?)
-            .forward::<GlobalConfigError>("Loading global config")
-    }
 }
 
 impl SaveableConfig for GlobalConfig {
@@ -171,7 +157,7 @@ impl SaveableConfig for GlobalConfig {
         get_global_config_dir().map(|path| path.join(CONFIG))
     }
 
-    async fn modify_on_load(mut self) -> Result<Self, Self::ErrorType> {
+    fn modify_on_load(mut self) -> Result<Self, Self::ErrorType> {
         let old = std::mem::take(&mut self.default_shared_stores);
         for (key, value) in old {
             let normalized = normalize_remote_url(&key).to_owned();
@@ -180,46 +166,5 @@ impl SaveableConfig for GlobalConfig {
                 .or_insert(value);
         }
         Ok(self)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Every field written and read back through TOML, so that a field added
-    /// to the config is known to survive being saved and loaded rather than
-    /// only being readable from a file someone wrote by hand.
-    #[test]
-    fn a_fully_populated_config_survives_a_round_trip() {
-        let mut config = GlobalConfig {
-            use_shared_store_automatically: Some(true),
-            ..GlobalConfig::default()
-        };
-        config
-            .set_default_path_for_remote_url("lore://example", "/srv/shared")
-            .expect("the shared store path must be settable");
-        config.service.executable = Some("/opt/lore/1.9/bin/lore".to_string());
-
-        let written = toml::to_string(&config).expect("the config must be writable as TOML");
-        let read: GlobalConfig = toml::from_str(&written).expect("and readable back");
-
-        assert_eq!(read.service_executable(), Some("/opt/lore/1.9/bin/lore"));
-        assert!(read.use_shared_store_automatically());
-        assert_eq!(read.all_default_shared_stores().count(), 1);
-    }
-
-    #[test]
-    fn no_executable_is_named_by_default() {
-        assert_eq!(GlobalConfig::default().service_executable(), None);
-    }
-
-    /// Blanking the field is how a pin is removed, so it reads as unset rather
-    /// than as an executable with no name.
-    #[test]
-    fn an_empty_executable_reads_as_unset() {
-        let config: GlobalConfig =
-            toml::from_str("[service]\nexecutable = \"\"\n").expect("readable");
-        assert_eq!(config.service_executable(), None);
     }
 }

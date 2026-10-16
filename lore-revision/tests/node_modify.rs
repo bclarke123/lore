@@ -72,7 +72,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable_store).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let original_file_id = file_id();
                 let node_id = state
@@ -132,7 +132,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable_store).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let node_id = state
                     .node_add(
@@ -180,7 +180,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable_store).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let directory = state
                     .node_add(
@@ -246,7 +246,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable_store).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let node_id = state
                     .node_add(
@@ -302,7 +302,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable_store).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 for (node_id, label) in [(ROOT_NODE, "root"), (INVALID_NODE, "invalid sentinel")] {
                     let refused = state

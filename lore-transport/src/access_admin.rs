@@ -33,6 +33,7 @@ pub enum AccessRepositoryRef {
 pub type GrantRecord = (String, String);
 
 impl AccessRepositoryRef {
+    #[lore_macro::test_pub]
     fn into_proto(self) -> RepositoryRef {
         let reference = match self {
             AccessRepositoryRef::Id(id) => Ref::Id(id.data().to_vec().into()),
@@ -47,6 +48,7 @@ impl AccessRepositoryRef {
 
 /// Map a Lore remote URL to the gRPC channel URL, mirroring the data-plane
 /// convention (`grpc://` → HTTP, `grpcs://`/`https://` → TLS).
+#[lore_macro::test_pub]
 fn channel_url(remote_url: &str) -> Result<String, ProtocolError> {
     let parsed =
         Url::parse(remote_url).internal_with(|| format!("remote {remote_url} is invalid"))?;
@@ -159,44 +161,4 @@ pub async fn list(
         .into_iter()
         .map(|grant| (grant.principal, grant.role))
         .collect())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn channel_url_follows_scheme_convention() {
-        assert_eq!(
-            channel_url("grpc://localhost:5000").expect("url"),
-            "http://localhost:5000"
-        );
-        assert_eq!(
-            channel_url("grpcs://lore.example.com").expect("url"),
-            "https://lore.example.com:443"
-        );
-        assert_eq!(
-            channel_url("https://lore.example.com:8443").expect("url"),
-            "https://lore.example.com:8443"
-        );
-        assert_eq!(
-            channel_url("urc://lore.example.com").expect("url"),
-            "http://lore.example.com:41337"
-        );
-        assert!(channel_url("not a url").is_err());
-    }
-
-    #[test]
-    fn repository_refs_map_to_proto() {
-        let global = AccessRepositoryRef::Global.into_proto();
-        match global.r#ref.expect("ref") {
-            Ref::Id(bytes) => assert!(bytes.iter().all(|b| *b == 0)),
-            Ref::Name(_) => panic!("expected id"),
-        }
-        let named = AccessRepositoryRef::Name("project1".to_string()).into_proto();
-        match named.r#ref.expect("ref") {
-            Ref::Name(name) => assert_eq!(name, "project1"),
-            Ref::Id(_) => panic!("expected name"),
-        }
-    }
 }

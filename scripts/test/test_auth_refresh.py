@@ -257,6 +257,7 @@ def test_cli_refreshes_expired_token_on_push(
     import time as time_mod
 
     from lore import Lore
+    from lore import lore_test_env
 
     grpc_port = cli_refresh_server["grpc"].split(":")[1]
     remote = f"grpc://localhost:{grpc_port}/"
@@ -267,7 +268,7 @@ def test_cli_refreshes_expired_token_on_push(
         lore_executable_path=lore_executable_path,
         path=str(tmp_path_factory.mktemp("cli-refresh-src") / "refreshrepo"),
         name="refreshrepo",
-        global_dir=str(auth_dir),
+        base_env=lore_test_env(str(auth_dir)),
         environment_vars={"LORE_AUTH_STORE": "fallback"},
         remote_url=remote,
     )

@@ -1194,11 +1194,11 @@ dependencies = [
 
 [[package]]
 name = "diffy"
-version = "0.4.2"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b545b8c50194bdd008283985ab0b31dba153cfd5b3066a92770634fbc0d7d291"
+checksum = "3e3dc2f773b6aaa63b1a7684b8589f670a8a0146a510b74d23a401c882364b49"
 dependencies = [
- "nu-ansi-term",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -1568,6 +1568,9 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "heck"
@@ -2081,7 +2084,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "lore-aws"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2134,7 +2137,7 @@ dependencies = [
 
 [[package]]
 name = "lore-base"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "anyhow",
  "backtrace",
@@ -2162,7 +2165,7 @@ dependencies = [
 
 [[package]]
 name = "lore-credential"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "base64 0.22.1",
  "jsonwebtoken",
@@ -2197,7 +2200,7 @@ dependencies = [
 
 [[package]]
 name = "lore-io"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "bytes",
  "io-uring",
@@ -2208,7 +2211,7 @@ dependencies = [
 
 [[package]]
 name = "lore-macro"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2229,7 +2232,7 @@ dependencies = [
 
 [[package]]
 name = "lore-revision"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2289,7 +2292,7 @@ dependencies = [
 
 [[package]]
 name = "lore-storage"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "async-trait",
  "bitflags",
@@ -2325,7 +2328,7 @@ dependencies = [
 
 [[package]]
 name = "lore-telemetry"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "axum",
  "http 1.4.0",
@@ -2347,7 +2350,7 @@ dependencies = [
 
 [[package]]
 name = "lore-transport"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2917,7 +2920,7 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.13"
+version = "0.11.15"
 dependencies = [
  "bytes",
  "fastbloom",

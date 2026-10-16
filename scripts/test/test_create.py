@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 import logging
 import os
+import subprocess
+from pathlib import Path
 
 import pytest
 from lore import Lore
@@ -10,6 +12,7 @@ from error_types import (
     ImproperArgumentsError,
     UninitializedRepositoryError,
 )
+from service_util import LORE_SERVICE_ENVIRONMENT, SERVICE_UNAVAILABLE
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +129,84 @@ class TestCreate:
 
         # delete repo by ID
         new_repo.repository_delete(new_repo.get_id())
+
+    def test_delete_relays_to_the_service(
+        self, new_lore_repo, stops_background_services, global_dir_name
+    ):
+        """A delete in service mode is carried out by the service, not where it
+        was called. Shown without a real service by naming an executable that
+        cannot be spawned, and controlled against the same delete run locally.
+        """
+        repo: Lore = new_lore_repo()
+        listed = f"{repo.name} ({repo.get_id()})"
+
+        routed = subprocess.run(
+            [
+                repo.lore_executable_path,
+                "--repository",
+                repo.path,
+                "repository",
+                "delete",
+                repo.remote_path,
+            ],
+            capture_output=True,
+            text=True,
+            env=repo.sandboxed_env(
+                **LORE_SERVICE_ENVIRONMENT,
+                LORE_SERVICE_EXECUTABLE=str(
+                    Path(global_dir_name) / "no-such-lore-binary"
+                ),
+            ),
+            cwd=repo.path,
+            check=False,
+        )
+        assert routed.returncode == SERVICE_UNAVAILABLE, (
+            f"expected the service-unavailable code {SERVICE_UNAVAILABLE}, got "
+            f"{routed.returncode}: {routed.stdout}{routed.stderr}"
+        )
+        assert listed in repo.repository_list().splitlines(), (
+            "a delete that reached no service must leave the repository"
+        )
+
+        repo.repository_delete()
+        assert listed not in repo.repository_list().splitlines(), (
+            "the same delete run locally must delete the repository"
+        )
+
+    def test_delete_through_the_c_api_on_the_service(
+        self, new_lore_repo, background_lore_service, lore_library_path
+    ):
+        """`lore_repository_delete` relays to a running service, which deletes
+        the repository."""
+        repo: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+        listed = f"{repo.name} ({repo.get_id()})"
+
+        assert repo.repository_delete_capi(lore_library_path) == 0
+        assert listed not in repo.repository_list().splitlines(), (
+            "the service must have deleted the repository"
+        )
+
+    def test_delete_by_name_resolves_a_relative_repository_against_the_caller(
+        self, new_lore_repo, lore_service_runner, tmp_path
+    ):
+        """A bare name is resolved against the remote of the repository at
+        `--repository`. The service runs in a directory unrelated to the
+        caller's, so it must resolve a relative path where the caller ran."""
+        service_directory = tmp_path / "service_elsewhere"
+        service_directory.mkdir()
+        lore_service_runner.start(str(service_directory))
+
+        repo: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+        listed = f"{repo.name} ({repo.get_id()})"
+
+        repo.run(
+            ["repository", "delete", repo.name],
+            path=os.path.basename(repo.path),
+            cwd=os.path.dirname(repo.path),
+        )
+        assert listed not in repo.repository_list().splitlines(), (
+            "the service must have deleted the repository"
+        )
 
     def test_recreate_by_id(self, new_lore_repo):
         """

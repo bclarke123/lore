@@ -49,6 +49,28 @@ impl MutableStoreOp {
     }
 }
 
+/// Key types written only through a dedicated request that validates the write:
+/// `RepositoryMetadataSet` and `BranchMetadataSet` for metadata, and revision
+/// requests such as `BranchPush` for a branch's latest pointer. The generic mutable store write paths, store
+/// and compare-and-swap, must not become a way to write them directly and
+/// bypass that validation.
+const DISALLOWED_KEY_TYPES: &[KeyType] = &[
+    KeyType::RepositoryMetadata,
+    KeyType::BranchMetadata,
+    KeyType::BranchLatestPointer,
+];
+
+/// Refuses a generic mutable store write to a key type that has its own
+/// dedicated write API.
+pub fn check_generic_write_key_type(key_type: KeyType) -> Result<(), MessageHandleError> {
+    if DISALLOWED_KEY_TYPES.contains(&key_type) {
+        return Err(MessageHandleError::InvalidArgument(format!(
+            "key_type {key_type:?} must be written through its dedicated API, not the generic mutable store"
+        )));
+    }
+    Ok(())
+}
+
 pub async fn handle_mutable_store(
     key: Hash,
     value: Hash,
@@ -58,6 +80,8 @@ pub async fn handle_mutable_store(
     user_id: String,
     mutable_store: Arc<dyn MutableStore>,
 ) -> Result<LoreResponse, MessageHandleError> {
+    check_generic_write_key_type(key_type)?;
+
     let execution = setup_execution(module_path!(), correlation_id, user_id);
 
     debug!(
@@ -112,174 +136,5 @@ pub struct MutableStoreResponse {}
 impl Response for MutableStoreResponse {
     fn data(&self) -> Vec<Bytes> {
         vec![]
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use lore_base::runtime::LORE_CONTEXT;
-    use lore_base::types::KeyType;
-    use rand::random;
-    use zerocopy::IntoBytes;
-
-    use super::*;
-    use crate::store::test_store_create;
-
-    #[test]
-    fn test_parse() {
-        let key = Hash::hash_buffer(b"test-key");
-        let value = Hash::hash_buffer(b"test-value");
-        let mut bytes = bytes::BytesMut::with_capacity(2 * size_of::<Hash>() + 1);
-        bytes.extend_from_slice(key.as_bytes());
-        bytes.extend_from_slice(value.as_bytes());
-        bytes.extend_from_slice(&[KeyType::BranchId as u8]);
-        let result = MutableStoreOp::parse(bytes.freeze()).unwrap();
-        assert_eq!(result.key, key);
-        assert_eq!(result.value, value);
-        assert_eq!(result.key_type, KeyType::BranchId);
-    }
-
-    #[test]
-    fn test_parse_invalid_length() {
-        let bytes = Bytes::from_static(&[0u8; 16]);
-        assert_eq!(
-            MutableStoreOp::parse(bytes),
-            Err(MessageParseError::InvalidFieldLength)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_handle_store_and_load() {
-        let repository = random::<RepositoryId>();
-        let key = Hash::hash_buffer(b"test-key");
-        let value = Hash::hash_buffer(b"test-value");
-
-        let context = Arc::new(AttributeMap::default());
-        context.insert(repository);
-
-        let (_immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        let message = MutableStoreOp {
-            key,
-            value,
-            key_type: KeyType::Untyped,
-        };
-        LORE_CONTEXT
-            .scope(execution, async move {
-                let result = message
-                    .handle_mutable(context, mutable_store.clone())
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    result,
-                    LoreResponse::MutableStore(MutableStoreResponse::default())
-                );
-
-                // Verify the value was stored
-                let loaded = mutable_store
-                    .load(repository, key, KeyType::Untyped)
-                    .await
-                    .unwrap();
-                assert_eq!(loaded, value);
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn test_handle_store_overwrite() {
-        let repository = random::<RepositoryId>();
-        let key = Hash::hash_buffer(b"overwrite-key");
-        let first_value = Hash::hash_buffer(b"first");
-        let second_value = Hash::hash_buffer(b"second");
-
-        let context = Arc::new(AttributeMap::default());
-        context.insert(repository);
-
-        let (_immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        LORE_CONTEXT
-            .scope(execution, async move {
-                let msg1 = MutableStoreOp {
-                    key,
-                    value: first_value,
-                    key_type: KeyType::Untyped,
-                };
-                msg1.handle_mutable(context.clone(), mutable_store.clone())
-                    .await
-                    .unwrap();
-
-                let msg2 = MutableStoreOp {
-                    key,
-                    value: second_value,
-                    key_type: KeyType::Untyped,
-                };
-                msg2.handle_mutable(context, mutable_store.clone())
-                    .await
-                    .unwrap();
-
-                let loaded = mutable_store
-                    .load(repository, key, KeyType::Untyped)
-                    .await
-                    .unwrap();
-                assert_eq!(loaded, second_value);
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn test_handle_store_independent_keys() {
-        let repository = random::<RepositoryId>();
-        let key_a = Hash::hash_buffer(b"key-a");
-        let key_b = Hash::hash_buffer(b"key-b");
-        let value_a = Hash::hash_buffer(b"value-a");
-        let value_b = Hash::hash_buffer(b"value-b");
-
-        let context = Arc::new(AttributeMap::default());
-        context.insert(repository);
-
-        let (_immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        LORE_CONTEXT
-            .scope(execution, async move {
-                let msg_a = MutableStoreOp {
-                    key: key_a,
-                    value: value_a,
-                    key_type: KeyType::Untyped,
-                };
-                msg_a
-                    .handle_mutable(context.clone(), mutable_store.clone())
-                    .await
-                    .unwrap();
-
-                let msg_b = MutableStoreOp {
-                    key: key_b,
-                    value: value_b,
-                    key_type: KeyType::Untyped,
-                };
-                msg_b
-                    .handle_mutable(context, mutable_store.clone())
-                    .await
-                    .unwrap();
-
-                assert_eq!(
-                    mutable_store
-                        .clone()
-                        .load(repository, key_a, KeyType::Untyped)
-                        .await
-                        .unwrap(),
-                    value_a
-                );
-                assert_eq!(
-                    mutable_store
-                        .load(repository, key_b, KeyType::Untyped)
-                        .await
-                        .unwrap(),
-                    value_b
-                );
-            })
-            .await;
     }
 }

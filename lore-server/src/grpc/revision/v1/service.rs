@@ -287,20 +287,3 @@ impl RevisionService for LoreRevisionV1Service {
         .await
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use lore_proto::lore::revision::v1::revision_service_server::RevisionServiceServer;
-
-    use super::*;
-
-    /// Compile-time check that `LoreRevisionV1Service` fully implements
-    /// the generated `RevisionService` trait — wrapping it in
-    /// `RevisionServiceServer` requires the trait bound to hold.
-    #[allow(dead_code)]
-    fn assert_implements_trait(
-        service: LoreRevisionV1Service,
-    ) -> RevisionServiceServer<LoreRevisionV1Service> {
-        RevisionServiceServer::new(service)
-    }
-}

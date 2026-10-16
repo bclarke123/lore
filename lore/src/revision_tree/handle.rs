@@ -35,8 +35,6 @@ use lore_revision::repository::RepositoryContextCreationArgs;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::state::State;
 use lore_transport::ProtocolError;
-use serde::Deserialize;
-use serde::Serialize;
 use tokio::sync::Notify;
 
 use crate::storage::store::StoreInternal;
@@ -46,7 +44,7 @@ use crate::storage::store::StoreInternal;
 /// Treat this as an opaque value; never cast it directly to or from raw
 /// pointers.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, bitcode::Encode, bitcode::Decode)]
 pub struct LoreRevisionTree {
     /// Registry key; `0` is the reserved invalid/unregistered sentinel (zero-init = null handle)
     pub handle_id: u64,
@@ -66,6 +64,7 @@ lore_base::carries_no_text!(LoreRevisionTree);
 /// `parent_storage_handle_id` is the registry key of the parent storage
 /// handle at load time and is the matching key used by the IPC dispatcher
 /// to cascade closes on connection teardown.
+#[lore_macro::test_pub]
 pub(crate) struct RevisionTreeInternal {
     /// Shared store reference cloned from the parent storage handle.
     pub(crate) store_internal: Arc<StoreInternal>,
@@ -115,6 +114,7 @@ pub(crate) struct RevisionTreeInternal {
 ///
 /// Keep it alive for as long as the state is in use: dropping it and holding on to the
 /// `Arc<State>` leaves a verb mutating a tree a commit believes it has to itself.
+#[lore_macro::test_pub]
 pub(crate) struct SharedAccess<'handle>(tokio::sync::RwLockReadGuard<'handle, Arc<State>>);
 
 impl SharedAccess<'_> {
@@ -133,6 +133,7 @@ impl SharedAccess<'_> {
 ///
 /// Keep it alive for as long as the state is in use: dropping it and holding on to the
 /// `Arc<State>` leaves a commit rewriting a tree other calls can reach.
+#[lore_macro::test_pub]
 pub(crate) struct ExclusiveAccess<'handle>(tokio::sync::RwLockWriteGuard<'handle, Arc<State>>);
 
 impl ExclusiveAccess<'_> {
@@ -154,6 +155,7 @@ impl RevisionTreeInternal {
     /// Build a handle's internals around a freshly loaded tree. A constructor rather
     /// than a struct literal because [`Self::state`] is private, which is what keeps
     /// every reader on the two access methods.
+    #[lore_macro::test_pub]
     pub(crate) fn new(
         store_internal: Arc<StoreInternal>,
         parent_storage_handle_id: u64,
@@ -175,11 +177,13 @@ impl RevisionTreeInternal {
     }
 
     /// Claim the handle's tree for a call that can share it — see [`SharedAccess`].
+    #[lore_macro::test_pub]
     pub(crate) async fn access_shared(&self) -> SharedAccess<'_> {
         SharedAccess(self.state.read().await)
     }
 
     /// Claim the handle's tree for a call that cannot — see [`ExclusiveAccess`].
+    #[lore_macro::test_pub]
     pub(crate) async fn access_exclusive(&self) -> ExclusiveAccess<'_> {
         ExclusiveAccess(self.state.write().await)
     }
@@ -189,8 +193,8 @@ impl RevisionTreeInternal {
     /// Deliberately non-blocking and non-async: it stays callable from a synchronous
     /// helper inside an async test, and a fixture that has in fact raced a verb fails
     /// here instead of quietly waiting for it.
-    #[cfg(test)]
-    pub(crate) fn state_for_tests(&self) -> Arc<State> {
+    #[cfg(feature = "test-util")]
+    pub fn state_for_tests(&self) -> Arc<State> {
         self.state
             .try_read()
             .expect("a fixture must not race a verb for the handle's tree")
@@ -221,6 +225,7 @@ impl RevisionTreeInternal {
     }
 }
 
+#[lore_macro::test_pub]
 pub(crate) static REGISTRY: LazyLock<DashMap<u64, Arc<RevisionTreeInternal>>> =
     LazyLock::new(DashMap::new);
 pub(crate) static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -231,6 +236,7 @@ pub(crate) static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// The returned `handle_id` is guaranteed non-zero so it never collides
 /// with [`LoreRevisionTree::INVALID`] — the counter skips the sentinel on
 /// wrap.
+#[lore_macro::test_pub]
 pub(crate) fn register(internal: Arc<RevisionTreeInternal>) -> LoreRevisionTree {
     let handle_id = loop {
         let id = NEXT_ID.fetch_add(1, Ordering::AcqRel);
@@ -244,6 +250,7 @@ pub(crate) fn register(internal: Arc<RevisionTreeInternal>) -> LoreRevisionTree 
 
 /// Look up the revision tree behind a handle. Returns `None` for unknown
 /// or already-unregistered handles.
+#[lore_macro::test_pub]
 pub(crate) fn lookup(handle: LoreRevisionTree) -> Option<Arc<RevisionTreeInternal>> {
     if handle.handle_id == LoreRevisionTree::INVALID.handle_id {
         return None;
@@ -276,6 +283,7 @@ pub(crate) fn drain_all() -> Vec<(u64, Arc<RevisionTreeInternal>)> {
 /// Drain every registry entry loaded against the storage handle `storage_handle_id`, for
 /// the connection-teardown cascade: a tree outlives its parent by design, so a connection
 /// that drops without closing it would hold the store for the life of the process.
+#[lore_macro::test_pub]
 pub(crate) fn drain_for_storage_handle(
     storage_handle_id: u64,
 ) -> Vec<(u64, Arc<RevisionTreeInternal>)> {
@@ -293,6 +301,7 @@ pub(crate) fn drain_for_storage_handle(
 
 /// Remove the handle's entry from the registry, returning the `Arc` the
 /// entry held (for the caller to drive close).
+#[lore_macro::test_pub]
 pub(crate) fn unregister(handle: LoreRevisionTree) -> Option<Arc<RevisionTreeInternal>> {
     if handle.handle_id == LoreRevisionTree::INVALID.handle_id {
         return None;
@@ -312,6 +321,7 @@ pub(crate) fn unregister(handle: LoreRevisionTree) -> Option<Arc<RevisionTreeInt
 /// remote state on success; a connection failure propagates as `Failed`.
 /// Absent a remote endpoint the context resolves directly to the `Offline`
 /// terminal state.
+#[lore_macro::test_pub]
 pub(crate) async fn synth_repository_context(
     store: &StoreInternal,
     repository: Partition,
@@ -331,7 +341,8 @@ pub(crate) async fn synth_repository_context(
             filter: Arc::new(Filter::default()),
             filesystem_provider: None,
         })
-        .with_write_token(RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER)),
+        .with_write_token(RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER))
+        .holding_its_sessions(),
     )
 }
 
@@ -349,6 +360,7 @@ pub(crate) const IN_MEMORY_MARKER: InMemoryMarker = InMemoryMarker;
 /// increment with the matching decrement and, when the count reaches
 /// zero, wakes any [`RevisionTreeInternal::mark_invalid_and_await`]
 /// waiter.
+#[lore_macro::test_pub]
 pub(crate) struct RevisionTreeGuard {
     internal: Arc<RevisionTreeInternal>,
 }
@@ -356,6 +368,7 @@ pub(crate) struct RevisionTreeGuard {
 impl RevisionTreeGuard {
     /// Enter an op on the revision tree behind `handle`. Returns `None`
     /// when the handle is unknown or the tree has been marked invalid.
+    #[lore_macro::test_pub]
     pub(crate) fn enter(handle: LoreRevisionTree) -> Option<Self> {
         let internal = lookup(handle)?;
         internal.in_flight.fetch_add(1, Ordering::AcqRel);
@@ -371,6 +384,7 @@ impl RevisionTreeGuard {
     /// spawned work completes before this guard drops; cloning the Arc
     /// only extends the tree's teardown past the guard, not the op's
     /// in-flight counter.
+    #[lore_macro::test_pub]
     pub(crate) fn internal_clone(&self) -> Arc<RevisionTreeInternal> {
         self.internal.clone()
     }
@@ -385,103 +399,5 @@ impl RevisionTreeGuard {
 impl Drop for RevisionTreeGuard {
     fn drop(&mut self) {
         Self::release(&self.internal);
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod test_support {
-    //! Test-only fixture builder for [`RevisionTreeInternal`]. The
-    //! production constructor lives with the load verb; this fixture
-    //! lets the registry / guard unit tests run against a minimally-
-    //! populated value without depending on `load`.
-    //!
-    //! The fixture builds a real `Arc<StoreInternal>` via the storage
-    //! crate's `in_memory_for_tests` helper and a real `Arc<State>` /
-    //! `Arc<RepositoryContext>` via the `lore-revision` in-memory test
-    //! plumbing, so the registry tests run against the same type shape
-    //! the production load verb produces.
-    use std::sync::Arc;
-
-    use lore_base::types::Partition;
-    use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryContextCreationArgs;
-    use lore_revision::repository::create_client_memory_stores;
-    use lore_revision::state::State;
-    use lore_transport::ProtocolError;
-
-    use super::RevisionTreeInternal;
-    use crate::storage::store::StoreInternal;
-    use crate::storage::store::in_memory_for_tests;
-
-    /// Build a `RevisionTreeInternal` for tests. Uses in-memory stores so
-    /// no filesystem touch happens and no cleanup is required.
-    pub(crate) async fn new_for_testing() -> Arc<RevisionTreeInternal> {
-        new_for_testing_on_storage_handle(0).await
-    }
-
-    /// The same fixture, claiming to have been loaded against a given storage
-    /// handle — what the connection-teardown close cascade matches on.
-    pub(crate) async fn new_for_testing_on_storage_handle(
-        parent_storage_handle_id: u64,
-    ) -> Arc<RevisionTreeInternal> {
-        let store_internal: Arc<StoreInternal> = in_memory_for_tests("revision-tree-test").await;
-        let (immutable, mutable) = create_client_memory_stores()
-            .await
-            .expect("create_client_memory_stores");
-        let repository = Partition::default();
-        let repository_context = Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
-            paths: None,
-            immutable_store: immutable,
-            mutable_store: mutable,
-            id: repository,
-            instance_id: Default::default(),
-            remote: Err(ProtocolError::from(lore_base::error::NoRemote)),
-            filter: Arc::default(),
-            filesystem_provider: None,
-        }));
-        let state = Arc::new(State::new());
-        Arc::new(RevisionTreeInternal::new(
-            store_internal,
-            parent_storage_handle_id,
-            repository,
-            repository_context,
-            state,
-        ))
-    }
-}
-
-#[cfg(test)]
-mod synth_repository_context_tests {
-    use lore_base::types::Hash;
-    use lore_base::types::Partition;
-    use lore_revision::repository::RemoteStatus;
-    use lore_revision::state::State;
-
-    use super::synth_repository_context;
-    use crate::storage::store::in_memory_for_tests;
-
-    #[tokio::test]
-    async fn synth_repository_context_round_trips_empty_state_via_zero_hash_deserialize() {
-        let store = in_memory_for_tests("synth-context-test").await;
-        let partition = Partition::from([0x77u8; 16]);
-
-        let repo_context = synth_repository_context(&store, partition).await;
-
-        State::deserialize(repo_context.clone(), Hash::default())
-            .await
-            .expect("zero hash must deserialize to an empty state");
-
-        assert!(
-            repo_context.paths.is_none(),
-            "synthesized context must have no working-tree path"
-        );
-        assert_eq!(
-            repo_context.id, partition,
-            "synthesized context must carry the supplied partition"
-        );
-        assert!(
-            matches!(repo_context.remote_status().await, RemoteStatus::Offline),
-            "in-memory store has no remote, so the context must be Offline"
-        );
     }
 }

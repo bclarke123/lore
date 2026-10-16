@@ -3,9 +3,11 @@
 import logging
 import os
 import shutil
+import time
 from pathlib import Path
 
 import pytest
+from error_types import LoreException
 from lore_parsers import parse_jsonl, parse_status_json, parse_status_summary_json
 
 from lore import Lore
@@ -192,9 +194,47 @@ def test_reclone_over_existing_files_records_their_modified_times(new_lore_repo)
     clone: Lore = repo.clone()
 
     # Drop the repository metadata and keep the working files, so the re-clone finds every
-    # file present and identical.
+    # file present and identical. Their times are older than the clock the re-clone reads.
     shutil.rmtree(clone.dot_path(), ignore_errors=True)
+    older = time.time() - 3600
+    for index in range(file_count):
+        os.utime(os.path.join(clone.path, f"retained{index}.bin"), (older, older))
 
+    assert reclone_retained_scan(repo, clone, file_count) == (0, file_count), (
+        "the retained files must be answered by their recorded times"
+    )
+
+
+@pytest.mark.smoke
+def test_reclone_over_files_stamped_ahead_records_no_time(new_lore_repo):
+    """A clone that retains files whose times are not older than the filesystem clock it read
+    before reading them records none of them: a write after the read may share those times.
+    The scan after reads every file."""
+    repo: Lore = new_lore_repo()
+
+    file_count = 4
+    for index in range(file_count):
+        with repo.open_file(f"retained{index}.bin", "w+b") as f:
+            f.write(os.urandom(4096))
+    repo.stage(scan=True)
+    repo.commit("Base")
+    repo.push()
+
+    clone: Lore = repo.clone()
+    shutil.rmtree(clone.dot_path(), ignore_errors=True)
+    ahead = time.time() + 3600
+    for index in range(file_count):
+        os.utime(os.path.join(clone.path, f"retained{index}.bin"), (ahead, ahead))
+
+    assert reclone_retained_scan(repo, clone, file_count) == (file_count, 0), (
+        "the re-clone recorded times a later write could share"
+    )
+
+
+def reclone_retained_scan(repo: Lore, clone: Lore, file_count: int) -> tuple[int, int]:
+    """Clones `repo` again into `clone`'s directory, whose metadata the caller removed, checks
+    that every file was retained, and answers the hash checks and recorded-time matches of one
+    scan after. One scan only: a second would record whatever the first measured."""
     output = repo.run(["repository", "clone", repo.remote_path, clone.path], json=True)
     clone_end = parse_jsonl(output, "repositoryCloneEnd")
     assert clone_end, "clone must emit a repositoryCloneEnd event"
@@ -206,16 +246,54 @@ def test_reclone_over_existing_files_records_their_modified_times(new_lore_repo)
         f"no existing file should have been rewritten, got {count}"
     )
 
-    # One scan only: a second would record whatever the first measured, and so would report
-    # nothing left to measure even if the retain path had recorded nothing.
     scan = clone.status(scan=True, json=True, offline=True)
     assert not parse_status_json(scan), (
         "a re-clone over identical files leaves nothing changed"
     )
-
     summary = parse_status_summary_json(scan)
     assert summary is not None, "scan must emit a repositoryStatusSummary event"
-    assert summary["hashChecks"] == 0, (
-        f"the retained files must be answered by their recorded times, got {summary}"
+    return summary["hashChecks"], summary["mtimeMatches"]
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("flag", ["offline", "cache"])
+def test_clone_keeps_file_metadata_blocks_for_offline_commit(new_lore_repo, flag):
+    """A clone given `--offline` or `--cache` keeps every file metadata block of the cloned
+    revision, so a commit, which writes file history into them, works offline after it. A first
+    revision records no file history and has no block, so the clone is of the second."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"tracked.txt": "base\n"})
+    repo.write_commit_push("Second", {"tracked.txt": "second\n"})
+
+    clone: Lore = repo.clone(**{flag: True})
+
+    clone.write_commit_push("Change", {"tracked.txt": "changed\n"}, offline=True)
+
+
+@pytest.mark.smoke
+def test_failed_clone_sends_no_clone_end_event(new_lore_repo, scratch_dir):
+    """A clone that fails to write a file fails the command and sends no repositoryCloneEnd
+    event. That event, and the "Clone complete" line the CLI prints for it, are only for a clone
+    that succeeded."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push(
+        "Initial commit",
+        {"blocker/inside.txt": "inside\n", "file.txt": "content\n"},
     )
-    assert summary["mtimeMatches"] == file_count, summary
+
+    # The clone target holds a file where the revision has the directory `blocker`, so the
+    # clone cannot write blocker/inside.txt.
+    target = scratch_dir("blocked-clone", create=True)
+    (target / "blocker").write_text("not a directory\n")
+
+    with pytest.raises(LoreException) as failure:
+        repo.run(["repository", "clone", repo.remote_path, str(target)], json=True)
+    output = str(failure.value)
+
+    # The command reports the failure on its complete event ...
+    complete = parse_jsonl(output, "complete")
+    assert complete and complete[-1]["status"] != 0, f"the clone should fail: {output}"
+    # ... and never reports the clone as finished.
+    assert not parse_jsonl(output, "repositoryCloneEnd"), (
+        f"a clone that failed sent a repositoryCloneEnd event: {output}"
+    )

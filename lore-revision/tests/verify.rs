@@ -112,7 +112,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let dir = add(
                     &state,
@@ -152,7 +152,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 add(
                     &state,
@@ -192,7 +192,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let dir = add(
                     &state,
@@ -236,7 +236,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let going = add(
                     &state,
@@ -278,7 +278,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let node_id = add(
                     &state,
@@ -313,6 +313,59 @@ mod tests {
             .expect("Task failed");
     }
 
+    /// A staged node carrying a name no node may carry is refused, however it got there: the
+    /// name table it sits in can predate the rule.
+    #[tokio::test]
+    async fn verify_state_for_commit_rejects_a_staged_reserved_name() {
+        let (_immutable, mutable, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let tempdir = generate_tempdir();
+                let repository = test_repository(tempdir.path(), mutable).await;
+                let state = State::new();
+
+                let node_id = add(
+                    &state,
+                    repository.clone(),
+                    ROOT_NODE,
+                    directory("xurc"),
+                    "xurc",
+                )
+                .await;
+
+                let block_index = NodeBlock::index(node_id);
+                let block = state
+                    .block_with_nametable(repository.clone(), block_index)
+                    .await
+                    .expect("the block must read back");
+                {
+                    let mut writer = block.write();
+                    let node = writer.node(Node::index(node_id));
+                    let (offset, length) = (node.name_offset, node.name_length);
+                    node.name_hash = hash_string(".urc");
+                    let (offset, length) = writer
+                        .node_name_store_unchecked(".urc", offset, length)
+                        .expect("the unchecked store must accept the name");
+                    let node = writer.node(Node::index(node_id));
+                    node.name_offset = offset;
+                    node.name_length = length;
+                    writer.mark_dirty();
+                }
+                state.block_modified(block, block_index);
+
+                let error = verify_state_for_commit(repository, state)
+                    .await
+                    .expect_err("a staged node with a reserved name must be rejected");
+                assert!(
+                    error.to_string().contains("reserved node name"),
+                    "Expected a reserved-name rejection, got {error}"
+                );
+            }))
+            .await
+            .expect("Task failed");
+    }
+
     /// The collision the walk exists to catch: two concurrent calls raced one name,
     /// the loser's node is already in the loaded revision, and the winner's is staged
     /// beside it. Only one of the pair is staged, so comparing staged names to each
@@ -325,7 +378,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let settled = add(
                     &state,
@@ -369,7 +422,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let dir = add(
                     &state,
@@ -408,7 +461,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let settled_dir = add(
                     &state,

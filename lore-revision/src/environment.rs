@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use lore_storage::CompressionMode;
 use lore_transport::Endpoint;
+use lore_transport::Oidc;
 use serde::Deserialize;
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -9,6 +10,9 @@ use serde::Deserialize;
 pub struct EnvironmentConfig {
     pub endpoint: Option<Endpoint>,
     pub config: Option<Config>,
+    /// The OIDC provider info.
+    #[serde(skip)]
+    pub oidc: Option<Oidc>,
 }
 
 impl EnvironmentConfig {

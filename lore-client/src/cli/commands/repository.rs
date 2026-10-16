@@ -9,6 +9,7 @@ use chrono::DateTime;
 use clap::Args;
 use clap::Subcommand;
 use clap::ValueEnum;
+use lore::call_delegation::run_command;
 use lore::interface::LoreArray;
 use lore::interface::LoreEvent;
 use lore::interface::LoreFileAction;
@@ -30,10 +31,8 @@ use lore::interface::LoreRepositoryVerifyFragmentArgs;
 use lore::interface::LoreRepositoryVerifyStateArgs;
 use lore::interface::LoreSharedStoreMode;
 use lore::interface::LoreString;
-use lore::repository;
 use lore::repository::LoreRepositoryDeleteArgs;
 use lore::repository::LoreVfsType;
-use lore::runtime;
 use parking_lot::Mutex;
 
 use crate::cli::EventCallbackExt;
@@ -363,6 +362,12 @@ pub enum RepositoryCommands {
     Create(RepositoryCreateArgs),
 
     /// Clone a remote repository into the given path
+    ///
+    /// A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the
+    /// clone for working offline instead. With it, as with `--cache`, a clone that writes its files
+    /// caches every file metadata block of the cloned revision, which staging and committing write
+    /// to, so both work without the remote, and fails if it cannot. A bare clone writes no files
+    /// and reads them from the remote when a command needs them.
     Clone(RepositoryCloneArgs),
 
     /// Delete a repository
@@ -405,7 +410,9 @@ pub struct RepositoryInstanceArgs {
 pub enum RepositoryInstanceCommands {
     /// List all registered instances for this repository
     List,
-    /// Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now hold a different instance
+    /// Remove stale instance entries: paths that no longer exist, paths that hold no revision, and
+    /// paths that now hold a different instance. An SWFS instance is kept while its `.lore` remains
+    /// in the global data directory, even when it is not mounted.
     Prune,
 }
 
@@ -638,7 +645,13 @@ pub fn handle_repository_status(globals: LoreGlobalArgs, args: &RepositoryStatus
     let repo_root = std::path::absolute(globals.repository_path())
         .unwrap_or_else(|_| std::path::PathBuf::from(globals.repository_path()));
 
-    let result = runtime().block_on(repository::status(globals, args, callback)) as u8;
+    let result = run_command(globals, args.into(), callback) as u8;
+
+    for files in [&staged, &unmerged, &unstaged] {
+        files
+            .lock()
+            .sort_unstable_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
+    }
 
     // CLI process, so this is the user's terminal directory.
     #[allow(clippy::disallowed_methods)]
@@ -871,7 +884,7 @@ pub fn handle_repository_info(globals: LoreGlobalArgs, args: &RepositoryInfoArgs
             .with_defaults(),
     ));
 
-    return runtime().block_on(repository::info(globals, args, callback)) as u8;
+    return run_command(globals, args.into(), callback) as u8;
 }
 
 pub fn handle_repository_list(globals: LoreGlobalArgs, args: &RepositoryListArgs) -> u8 {
@@ -893,7 +906,7 @@ pub fn handle_repository_list(globals: LoreGlobalArgs, args: &RepositoryListArgs
             .with_defaults(),
     ));
 
-    return runtime().block_on(repository::list(globals, list_args, callback)) as u8;
+    return run_command(globals, list_args.into(), callback) as u8;
 }
 
 pub fn handle_repository_create(globals: LoreGlobalArgs, args: &RepositoryCreateArgs) -> u8 {
@@ -933,7 +946,7 @@ pub fn handle_repository_create(globals: LoreGlobalArgs, args: &RepositoryCreate
             .with_defaults(),
     ));
 
-    return runtime().block_on(repository::create(globals, args, callback)) as u8;
+    return run_command(globals, args.into(), callback) as u8;
 }
 
 pub fn handle_repository_delete(globals: LoreGlobalArgs, args: &RepositoryDeleteArgs) -> u8 {
@@ -970,7 +983,7 @@ pub fn handle_repository_delete(globals: LoreGlobalArgs, args: &RepositoryDelete
             .with_defaults(),
     ));
 
-    return runtime().block_on(repository::delete(globals, args, callback)) as u8;
+    return run_command(globals, args.into(), callback) as u8;
 }
 
 fn format_clone_retain_replace(retain: u64, replace: u64) -> String {
@@ -1099,7 +1112,7 @@ pub fn handle_repository_clone(globals: LoreGlobalArgs, args: &RepositoryCloneAr
             .with_defaults(),
     ));
 
-    return runtime().block_on(repository::clone(globals, clone_args, callback)) as u8;
+    return run_command(globals, clone_args.into(), callback) as u8;
 }
 
 pub fn handle_repository_verify(globals: LoreGlobalArgs, args: &RepositoryVerifyArgs) -> u8 {
@@ -1158,7 +1171,7 @@ pub fn handle_repository_verify_state(
             .with_defaults(),
     ));
 
-    runtime().block_on(repository::verify_state(globals, verify_args, callback)) as u8
+    run_command(globals, verify_args.into(), callback) as u8
 }
 
 pub fn handle_repository_verify_fragment(
@@ -1322,7 +1335,7 @@ pub fn handle_repository_verify_fragment(
             .with_defaults(),
     ));
 
-    runtime().block_on(repository::verify_fragment(globals, verify_args, callback)) as u8
+    run_command(globals, verify_args.into(), callback) as u8
 }
 
 pub fn handle_repository_dump(
@@ -1397,7 +1410,7 @@ pub fn handle_repository_dump(
             .with_defaults(),
     ));
 
-    return runtime().block_on(repository::dump(globals, dump_args, callback)) as u8;
+    return run_command(globals, dump_args.into(), callback) as u8;
 }
 
 pub fn handle_repository_gc(globals: LoreGlobalArgs) -> u8 {
@@ -1459,7 +1472,7 @@ pub fn handle_repository_gc(globals: LoreGlobalArgs) -> u8 {
             .with_defaults(),
     ));
 
-    return runtime().block_on(repository::gc(globals, args, callback)) as u8;
+    return run_command(globals, args.into(), callback) as u8;
 }
 
 pub fn handle_repository_store(globals: LoreGlobalArgs, args: &RepositoryStoreArgs) -> u8 {
@@ -1556,9 +1569,7 @@ pub fn handle_repository_store_immutable_query(
             .with_defaults(),
     ));
 
-    runtime().block_on(repository::store_immutable_query(
-        globals, query_args, callback,
-    )) as u8
+    run_command(globals, query_args.into(), callback) as u8
 }
 
 pub fn handle_repository_metadata_get(
@@ -1583,7 +1594,7 @@ pub fn handle_repository_metadata_get(
             .with_defaults(),
     ));
 
-    runtime().block_on(repository::metadata_get(globals, get_args, callback)) as u8
+    run_command(globals, get_args.into(), callback) as u8
 }
 
 pub fn handle_repository_metadata_set(
@@ -1637,7 +1648,7 @@ pub fn handle_repository_metadata_set(
             .with_defaults(),
     ));
 
-    runtime().block_on(repository::metadata_set(globals, set_args, callback)) as u8
+    run_command(globals, set_args.into(), callback) as u8
 }
 
 pub fn handle_repository_metadata_clear(
@@ -1665,7 +1676,7 @@ pub fn handle_repository_metadata_clear(
             .with_defaults(),
     ));
 
-    runtime().block_on(repository::metadata_clear(globals, clear_args, callback)) as u8
+    run_command(globals, clear_args.into(), callback) as u8
 }
 
 pub fn handle_repository_metadata_commands(
@@ -1748,7 +1759,7 @@ fn handle_repository_instance_list(globals: LoreGlobalArgs) -> u8 {
             .with_defaults(),
     ));
 
-    return runtime().block_on(lore::repository::instance_list(globals, args, callback)) as u8;
+    return run_command(globals, args.into(), callback) as u8;
 }
 
 fn handle_repository_instance_prune(globals: LoreGlobalArgs) -> u8 {
@@ -1783,7 +1794,7 @@ fn handle_repository_instance_prune(globals: LoreGlobalArgs) -> u8 {
             .with_defaults(),
     ));
 
-    return runtime().block_on(lore::repository::instance_prune(globals, args, callback)) as u8;
+    return run_command(globals, args.into(), callback) as u8;
 }
 
 fn handle_repository_config_get(globals: LoreGlobalArgs, key: &str) -> u8 {
@@ -1805,7 +1816,7 @@ fn handle_repository_config_get(globals: LoreGlobalArgs, key: &str) -> u8 {
             .with_defaults(),
     ));
 
-    return runtime().block_on(lore::repository::config_get(globals, args, callback)) as u8;
+    return run_command(globals, args.into(), callback) as u8;
 }
 
 fn handle_repository_update_path(globals: LoreGlobalArgs) -> u8 {
@@ -1822,7 +1833,5 @@ fn handle_repository_update_path(globals: LoreGlobalArgs) -> u8 {
             .with_defaults(),
     ));
 
-    return runtime().block_on(lore::repository::repository_update_path(
-        globals, args, callback,
-    )) as u8;
+    return run_command(globals, args.into(), callback) as u8;
 }

@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use super::TypedBytes;
@@ -30,7 +29,7 @@ use crate::util::serde::u8_as_bool;
 
 /// Summary information about a single revision.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionInfoEventData {
     /// Repository identifier the revision belongs to.
@@ -57,7 +56,7 @@ impl LoreRevisionInfoEventData {
 
 /// Per-file change information between a revision and its parent.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionInfoDeltaEventData {
     /// Path of the file relative to the repository root.
@@ -170,7 +169,7 @@ pub struct InfoOptions {
 /// A revision naming metadata that cannot be read is reported without the branch, date and
 /// message that blob carries, and warned about, rather than leaving those fields silently
 /// empty.
-pub async fn info(
+pub(crate) async fn info(
     repository: Arc<RepositoryContext>,
     options: InfoOptions,
 ) -> Result<(), InfoError> {
@@ -332,4 +331,12 @@ pub async fn info(
     }
 
     Ok(())
+}
+
+/// Boxed version of [`info`] for cross-crate use.
+pub fn info_boxed(
+    repository: Arc<RepositoryContext>,
+    options: InfoOptions,
+) -> crate::BoxFuture<'static, Result<(), InfoError>> {
+    Box::pin(info(repository, options))
 }

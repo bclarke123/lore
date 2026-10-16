@@ -1,16 +1,22 @@
 # Lore CLI command reference
 
-The `lore` command-line client drives every local and remote Lore operation: creating and cloning repositories, staging and committing revisions, branching, merging, and syncing with a Lore Server. This page catalogs every `lore` command and subcommand, with its arguments and flags.
+The `lore` command-line client drives every local and remote Lore operation: creating and cloning repositories, staging
+and committing revisions, branching, merging, and syncing with a Lore Server. This page catalogs every `lore` command
+and subcommand, with its arguments and flags.
 
-This page documents the command surface only. For a guided first run, see the [Quickstart](../tutorials/quickstart.md); to install the client, see [Install the Lore CLI](../how-to/install-lore-cli.md).
+This page documents the command surface only. For a guided first run, see the [Quickstart](../tutorials/quickstart.md);
+to install the client, see [Install the Lore CLI](../how-to/install-lore-cli.md).
 
-This page is generated from `lore --markdown-help` (CLI `0.9.1-nightly+1031`). Everything below the marker is generated — change the CLI, not this section. To regenerate in place (preserving this header), run from the repository root:
+This page is generated from `lore --markdown-help` (CLI `0.10.1-nightly+1281`). Everything below the marker is
+generated — change the CLI, not this section. To regenerate in place (preserving this header), run from the repository
+root:
 
 ```bash
 printf '%s\n' "$( { sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-commands.md; lore --markdown-help | tail -n +4; } )" > docs/reference/.cli.tmp && mv docs/reference/.cli.tmp docs/reference/lore-cli-commands.md
 ```
 
-`clap-markdown` ends its output with a blank line, which the quoted expansion strips. A subcommand carrying no help text renders as a trailing separator, which the whitespace hook rejects — write the help text rather than trimming the line.
+`clap-markdown` ends its output with a blank line, which the quoted expansion strips. A subcommand carrying no help text
+renders as a trailing separator, which the whitespace hook rejects — write the help text rather than trimming the line.
 
 <!-- BEGIN generated: lore --markdown-help -->
 
@@ -164,6 +170,7 @@ printf '%s\n' "$( { sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-comma
 * [`lore service run`↴](#lore-service-run)
 * [`lore service start`↴](#lore-service-start)
 * [`lore service stop`↴](#lore-service-stop)
+* [`lore service status`↴](#lore-service-status)
 * [`lore service set-executable`↴](#lore-service-set-executable)
 * [`lore service set-use-automatically`↴](#lore-service-set-use-automatically)
 * [`lore notification`↴](#lore-notification)
@@ -193,7 +200,8 @@ printf '%s\n' "$( { sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-comma
 * `status` — Show current repository status
 * `clone` — Clone a remote repository into the given path
 * `stage` — Stage changes for commit
-* `dirty` — Mark files as dirty so they show up in `lore status` and get picked up by `lore stage` (no content is read or staged)
+* `dirty` — Mark files as dirty so they show up in `lore status` and get picked up by `lore stage` (no content is read
+  or staged)
 * `unstage` — Unstage changes to a file or directory
 * `reset` — Reset changes to a file or directory
 * `diff` — Show differences between two revisions of a file
@@ -219,24 +227,27 @@ printf '%s\n' "$( { sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-comma
 * `--remote` — Use remote data
 * `--local` — Use local data
 * `--identity <IDENTITY>` — Use given identity
-* `--identity-token <token>` — Use given authentication token instead of one from the secure store. Acts as the identity the token was issued to
+* `--identity-token <token>` — Use given authentication token instead of one from the secure store. Acts as the identity
+  the token was issued to
 * `--access-token <token>` — Use given authorization token instead of exchanging one with the authentication service
-* `--max-connections <MAX_CONNECTIONS>` — Set maximum number of parallel connections
+* `--max-connections <MAX_CONNECTIONS>` — Set the number of parallel storage connections (default 1, at most 10)
 * `--file-count-limit <count>` — Set maximum number of parallel files opened
 * `--file-size-limit <size>` — Set maximum total size in bytes of parallel files opened
 * `--compress-limit <count>` — Set maximum number of parallel compress operations
 * `--search-limit <SEARCH_LIMIT>` — Set maximum number of revisions to search when matching or finding revisions
 * `--search-nearest` — Set to search for nearest match when matching revisions
-* `--no-gc` — Prevent automatic incremental garbage collection for this command; it otherwise runs in the background on writes. `lore repository gc` always runs a full pass regardless
+* `--no-gc` — Prevent automatic incremental garbage collection for this command; it otherwise runs in the background on
+  writes. `lore repository gc` always runs a full pass regardless
 * `--sync-data` — Force sync data to storage media during flush
 * `--cache` — Cache fragment payloads fetched from remote in the local store
+* `--trust-remote` — Trust the remote as part of this machine's infrastructure: data fetched from it is not hash
+  verified. For machines where performance comes first, such as a build server streaming from a server in its own
+  backend
 * `--non-interactive` — Disable interactive prompts (e.g., per-link commit messages)
 * `--stats <level>` — Report what the operation cost: `--stats` for totals, `--stats=2` to add per-fragment detail
 
   Default value: `0`
 * `--event-interval <milliseconds>` — How often to emit progress events, in milliseconds
-
-
 
 ## `lore repository`
 
@@ -261,13 +272,13 @@ Repository commands
 * `config` — Read a configuration value
 * `update-path` — Update the stored path for this instance
 
-
-
 ## `lore repository status`
 
 Show current repository status.
 
-Reports the staged revision (if any) and the files currently marked dirty. No filesystem walk runs by default — pass `--scan` to walk the filesystem and refresh dirty flags. See `lore status --help` (top-level alias) for the full workflow.
+Reports the staged revision (if any) and the files currently marked dirty. No filesystem walk runs by default — pass
+`--scan` to walk the filesystem and refresh dirty flags. See `lore status --help` (top-level alias) for the full
+workflow.
 
 **Usage:** `lore repository status [OPTIONS] [PATH]...`
 
@@ -279,18 +290,23 @@ Reports the staged revision (if any) and the files currently marked dirty. No fi
 
 * `--scan` — Walk the filesystem under the given paths and reconcile every file against the current revision.
 
-   Detected modifications, adds, and deletes are marked dirty; stale dirty flags are cleared. The refreshed flags are persisted in the staged state so subsequent `lore stage` and `lore status` calls see an accurate picture without rescanning.
+  Detected modifications, adds, and deletes are marked dirty; stale dirty flags are cleared. The refreshed flags are
+  persisted in the staged state so subsequent `lore stage` and `lore status` calls see an accurate picture without
+  rescanning.
 
-   Without `--scan`, status reports only what is currently tracked: the staged revision (if any) plus files already marked dirty. Mark files individually with `lore dirty` for targeted updates, or pass `--scan` here for bulk reconciliation.
+  Without `--scan`, status reports only what is currently tracked: the staged revision (if any) plus files already
+  marked dirty. Mark files individually with `lore dirty` for targeted updates, or pass `--scan` here for bulk
+  reconciliation.
 * `--check-dirty` — Verify already-dirty files against the filesystem without a full scan.
 
-   Each file currently marked dirty is re-checked: one whose on-disk content still matches the tracked revision (same size, and same content when the modification time differs) has its dirty flag cleared and is dropped from the report, unless it is also staged. Adds, moves, copies, and deletes are always reported. The refreshed flags are persisted, so this requires write access.
+  Each file currently marked dirty is re-checked: one whose on-disk content still matches the tracked revision (same
+  size, and same content when the modification time differs) has its dirty flag cleared and is dropped from the report,
+  unless it is also staged. Adds, moves, copies, and deletes are always reported. The refreshed flags are persisted, so
+  this requires write access.
 * `--reset` — Drop the existing staged anchor before computing status. Combine with --scan to scan from a clean slate
 * `--revision-only` — Only show revision info, skip all diffs
 * `--count` — Count directories and files (staged state if present, else current revision; view-filtered)
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore repository info`
 
@@ -302,8 +318,6 @@ Get info about a repository
 
 * `<url>` — URL of repository
 
-
-
 ## `lore repository list`
 
 List repositories
@@ -314,8 +328,6 @@ List repositories
 
 * `<url>` — URL of remote
 
-
-
 ## `lore repository create`
 
 Create a repository in the given directory
@@ -324,7 +336,8 @@ Create a repository in the given directory
 
 ###### **Arguments:**
 
-* `<url>` — URL of repository. With --offline this is the repository name instead, and may be omitted to name it after the current directory
+* `<url>` — URL of repository. With --offline this is the repository name instead, and may be omitted to name it after
+  the current directory
 
 ###### **Options:**
 
@@ -335,21 +348,24 @@ Create a repository in the given directory
   Default value: `none`
 
   Possible values:
-  - `none`:
-    No virtual file system; files are materialized directly on disk
-  - `default`:
-    Use whichever VFS system is preferred based on the user's system
-  - `swfs`:
-    Use Epic's Split Write File System as the Virtual File System
+    - `none`:
+      No virtual file system; files are materialized directly on disk
+    - `default`:
+      Use whichever VFS system is preferred based on the user's system
+    - `swfs`:
+      Use Epic's Split Write File System as the Virtual File System
 
 * `--use-shared-store` — Use the shared store rather than create a local immutable store
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 
-
-
 ## `lore repository clone`
 
 Clone a remote repository into the given path
+
+A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline
+instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned
+revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare clone
+writes no files and reads them from the remote when a command needs them.
 
 **Usage:** `lore repository clone [OPTIONS] <url> [path]`
 
@@ -364,18 +380,19 @@ Clone a remote repository into the given path
 * `--revision <revision>` — Optional revision to sync
 * `--branch <branch>` — Optional branch to sync (shorthand for a full revision specifier)
 * `--bare` — Clone without files, only fetch latest revision tree
-* `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into place
+* `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into
+  place
 * `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
 
   Default value: `none`
 
   Possible values:
-  - `none`:
-    No virtual file system; files are materialized directly on disk
-  - `default`:
-    Use whichever VFS system is preferred based on the user's system
-  - `swfs`:
-    Use Epic's Split Write File System as the Virtual File System
+    - `none`:
+      No virtual file system; files are materialized directly on disk
+    - `default`:
+      Use whichever VFS system is preferred based on the user's system
+    - `swfs`:
+      Use Epic's Split Write File System as the Virtual File System
 
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
@@ -390,8 +407,6 @@ Clone a remote repository into the given path
 
   Default value: `0`
 
-
-
 ## `lore repository delete`
 
 Delete a repository
@@ -401,8 +416,6 @@ Delete a repository
 ###### **Arguments:**
 
 * `<url>` — URL of repository, or a bare name or ID resolved against this repository's remote
-
-
 
 ## `lore repository verify`
 
@@ -420,8 +433,6 @@ Verify repository state consistency
 * `--path <path>` — Optional path in the repository to start verification from (for state verification)
 * `--heal` — Attempt to heal discrepancies found in a new staged state
 
-
-
 ## `lore repository verify state`
 
 Verify repository state consistency (default)
@@ -432,8 +443,6 @@ Verify repository state consistency (default)
 
 * `--path <path>` — Optional path in the repository to start verification from
 * `--heal` — Attempt to heal discrepancies found in a new staged state
-
-
 
 ## `lore repository verify fragment`
 
@@ -450,8 +459,6 @@ Verify a specific fragment in the local store
 * `--context <CONTEXT>` — Context part of the address to verify
 * `--heal` — Attempt to heal if verification fails (remote only)
 
-
-
 ## `lore repository dump`
 
 Dump repository state information
@@ -464,15 +471,11 @@ Dump repository state information
 * `--revision <revision>` — Optional revision to dump
 * `--max-depth <max-depth>` — Optional max depth of tree dump
 
-
-
 ## `lore repository gc`
 
 Run a full garbage collection pass on the local repository store
 
 **Usage:** `lore repository gc`
-
-
 
 ## `lore repository store`
 
@@ -484,8 +487,6 @@ Access the repository data store
 
 * `immutable` — Operations on the immutable store
 
-
-
 ## `lore repository store immutable`
 
 Operations on the immutable store
@@ -495,8 +496,6 @@ Operations on the immutable store
 ###### **Subcommands:**
 
 * `query` — Query the store
-
-
 
 ## `lore repository store immutable query`
 
@@ -512,8 +511,6 @@ Query the store
 
 * `--recurse` — Recurse into subfragments
 
-
-
 ## `lore repository metadata`
 
 Repository metadata operations
@@ -526,8 +523,6 @@ Repository metadata operations
 * `set` — Set metadata on the repository
 * `clear` — Clear metadata from the repository
 
-
-
 ## `lore repository metadata get`
 
 Get metadata from the repository (omit key to list all)
@@ -537,8 +532,6 @@ Get metadata from the repository (omit key to list all)
 ###### **Arguments:**
 
 * `<key>` — Attribute to get (omit to list all)
-
-
 
 ## `lore repository metadata set`
 
@@ -555,8 +548,6 @@ Set metadata on the repository
 * `--binary` — Indicator that values are paths to binary files
 * `--numeric` — Indicator that values are numeric (u64)
 
-
-
 ## `lore repository metadata clear`
 
 Clear metadata from the repository
@@ -567,8 +558,6 @@ Clear metadata from the repository
 
 * `<keys>` — Keys to clear (omit to clear all user-defined keys)
 
-
-
 ## `lore repository instance`
 
 Instance management
@@ -578,9 +567,9 @@ Instance management
 ###### **Subcommands:**
 
 * `list` — List all registered instances for this repository
-* `prune` — Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now hold a different instance
-
-
+* `prune` — Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now
+  hold a different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when
+  it is not mounted
 
 ## `lore repository instance list`
 
@@ -588,15 +577,13 @@ List all registered instances for this repository
 
 **Usage:** `lore repository instance list`
 
-
-
 ## `lore repository instance prune`
 
-Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now hold a different instance
+Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now hold a
+different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when it is not
+mounted
 
 **Usage:** `lore repository instance prune`
-
-
 
 ## `lore repository config`
 
@@ -608,8 +595,6 @@ Read a configuration value
 
 * `get` — Get a configuration value
 
-
-
 ## `lore repository config get`
 
 Get a configuration value
@@ -620,15 +605,11 @@ Get a configuration value
 
 * `<KEY>` — The configuration key to read
 
-
-
 ## `lore repository update-path`
 
 Update the stored path for this instance
 
 **Usage:** `lore repository update-path`
-
-
 
 ## `lore branch`
 
@@ -644,15 +625,15 @@ Branch commands
 * `switch` — Switch to a different branch
 * `push` — Push commits to remote
 * `merge` — Merge two branches
-* `diff` — Diff two branches using the common ancestor base revision Will calculate the set of changes between source branch latest revision and the base revision that is not in the set of changes between the target branch latest revision and the base revision
+* `diff` — Diff two branches using the common ancestor base revision Will calculate the set of changes between source
+  branch latest revision and the base revision that is not in the set of changes between the target branch latest
+  revision and the base revision
 * `archive` — Archive an existing branch
 * `reset` — Reset local latest pointer for a branch
 * `protect` — Protect a branch from direct pushes
 * `unprotect` — Remove push protection from a branch
 * `latest` — Branch latest related commands
 * `metadata` — Branch metadata operations
-
-
 
 ## `lore branch list`
 
@@ -664,8 +645,6 @@ List available branches
 
 * `--archived` — Include archived local branches
 
-
-
 ## `lore branch info`
 
 Get info about the given branch
@@ -675,8 +654,6 @@ Get info about the given branch
 ###### **Arguments:**
 
 * `<branch>` — Name of the branch
-
-
 
 ## `lore branch create`
 
@@ -691,8 +668,6 @@ Create a new branch
 ###### **Options:**
 
 * `--id <id>` — Optional explicit branch ID (hex-encoded 16-byte identifier)
-
-
 
 ## `lore branch switch`
 
@@ -712,8 +687,6 @@ Switch to a different branch
 * `--reset` — Reset any local modified files to match the incoming revision
 * `--bare` — Only update anchor tracking without modifying or verifying files, useful for bare repositories
 
-
-
 ## `lore branch push`
 
 Push commits to remote
@@ -727,8 +700,6 @@ Push commits to remote
 ###### **Options:**
 
 * `--fast-forward-merge` — Allow the server to fast-forward merge if the target branch head has moved
-
-
 
 ## `lore branch merge`
 
@@ -754,9 +725,8 @@ Merge two branches
 
 * `--id <branch-id>` — ID of the source branch to merge into the current branch
 * `--message <MESSAGE>` — Change the message for committing when no conflicts arise from the merge
-* `--inherit-metadata <KEY>` — Carry this metadata key from the source revision onto the merge revision. Repeatable. Pass `*` to carry every key that is not reserved to the merge itself. Carries nothing when not given
-
-
+* `--inherit-metadata <KEY>` — Carry this metadata key from the source revision onto the merge revision. Repeatable.
+  Pass `*` to carry every key that is not reserved to the merge itself. Carries nothing when not given
 
 ## `lore branch merge unresolve`
 
@@ -771,8 +741,6 @@ Marks the merge unresolved
 ###### **Options:**
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore branch merge into`
 
@@ -790,9 +758,9 @@ Merge into branch
 * `--id <branch-id>` — ID of the target branch to merge the current branch into
 * `--link <LINK>` — Merge only a specific linked repository at the given mount path
 * `--ignore-links` — Merge only the main repository, skipping all linked repositories
-* `--inherit-metadata <KEY>` — Carry this metadata key from the current branch onto the revision created on the target branch. Repeatable. Pass `*` to carry every key that is not reserved to the merge itself. Carries nothing when not given
-
-
+* `--inherit-metadata <KEY>` — Carry this metadata key from the current branch onto the revision created on the target
+  branch. Repeatable. Pass `*` to carry every key that is not reserved to the merge itself. Carries nothing when not
+  given
 
 ## `lore branch merge start`
 
@@ -809,12 +777,12 @@ Start a merge process
 * `--id <branch-id>` — ID of the source branch to merge into the current branch
 * `--message <MESSAGE>` — Change the message for committing when no conflicts arise from the merge
 * `--no-commit` — Disable auto commits even if no conflicts arise from the merge
-* `--dry-run` — Do a dry run merge start and only report what changes would be done, do not change anything in the file system
+* `--dry-run` — Do a dry run merge start and only report what changes would be done, do not change anything in the file
+  system
 * `--link <LINK>` — Merge only a specific linked repository at the given mount path
 * `--ignore-links` — Merge only the main repository, skipping all linked repositories
-* `--inherit-metadata <KEY>` — Carry this metadata key from the source revision onto the merge revision. Repeatable. Pass `*` to carry every key that is not reserved to the merge itself. Carries nothing when not given
-
-
+* `--inherit-metadata <KEY>` — Carry this metadata key from the source revision onto the merge revision. Repeatable.
+  Pass `*` to carry every key that is not reserved to the merge itself. Carries nothing when not given
 
 ## `lore branch merge restart`
 
@@ -829,8 +797,6 @@ Restart the merge, resetting the current merge state
 ###### **Options:**
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore branch merge resolve`
 
@@ -852,8 +818,6 @@ Resolves the merge
 
 * `--targets <file>` — Path to a targets file
 
-
-
 ## `lore branch merge resolve mine`
 
 Resolve using my changes
@@ -867,8 +831,6 @@ Resolve using my changes
 ###### **Options:**
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore branch merge resolve theirs`
 
@@ -884,8 +846,6 @@ Resolve using their changes
 
 * `--targets <file>` — Path to a targets file
 
-
-
 ## `lore branch merge abort`
 
 Abort a merge process
@@ -897,11 +857,11 @@ Abort a merge process
 * `--link <LINK>` — Abort only a specific linked repository merge at the given mount path
 * `--ignore-links` — Abort only the main repository merge, keeping link pin updates
 
-
-
 ## `lore branch diff`
 
-Diff two branches using the common ancestor base revision Will calculate the set of changes between source branch latest revision and the base revision that is not in the set of changes between the target branch latest revision and the base revision
+Diff two branches using the common ancestor base revision Will calculate the set of changes between source branch latest
+revision and the base revision that is not in the set of changes between the target branch latest revision and the base
+revision
 
 **Usage:** `lore branch diff [OPTIONS] <target>`
 
@@ -913,8 +873,6 @@ Diff two branches using the common ancestor base revision Will calculate the set
 
 * `--source <source>` — Name of the source branch
 * `--auto-resolve` — Attempt to auto resolve conflicts if true
-
-
 
 ## `lore branch archive`
 
@@ -933,8 +891,6 @@ Archive an existing branch
 * `--include-links` — Also archive the branch in every configured link
 * `--link <path>` — Also archive the branch in the link at the given mount path
 
-
-
 ## `lore branch reset`
 
 Reset local latest pointer for a branch
@@ -949,8 +905,6 @@ Reset local latest pointer for a branch
 
 * `--branch <branch>` — Branch to reset, or the current branch if not set
 
-
-
 ## `lore branch protect`
 
 Protect a branch from direct pushes
@@ -960,8 +914,6 @@ Protect a branch from direct pushes
 ###### **Arguments:**
 
 * `<branch>` — Name of the branch to protect
-
-
 
 ## `lore branch unprotect`
 
@@ -973,8 +925,6 @@ Remove push protection from a branch
 
 * `<branch>` — Name of the branch to unprotect
 
-
-
 ## `lore branch latest`
 
 Branch latest related commands
@@ -984,8 +934,6 @@ Branch latest related commands
 ###### **Subcommands:**
 
 * `list` — List previous latest pointers of a branch
-
-
 
 ## `lore branch latest list`
 
@@ -1001,8 +949,6 @@ List previous latest pointers of a branch
 
 * `--branch <branch>` — Branch to query
 
-
-
 ## `lore branch metadata`
 
 Branch metadata operations
@@ -1014,8 +960,6 @@ Branch metadata operations
 * `get` — Get metadata from the branch (omit key to list all)
 * `set` — Set metadata on the branch
 * `clear` — Clear metadata from the branch
-
-
 
 ## `lore branch metadata get`
 
@@ -1030,8 +974,6 @@ Get metadata from the branch (omit key to list all)
 ###### **Options:**
 
 * `--branch <branch>` — Branch name (uses current branch if not specified)
-
-
 
 ## `lore branch metadata set`
 
@@ -1049,8 +991,6 @@ Set metadata on the branch
 * `--numeric` — Indicator that values are numeric (u64)
 * `--branch <branch>` — Branch name (uses current branch if not specified)
 
-
-
 ## `lore branch metadata clear`
 
 Clear metadata from the branch
@@ -1064,8 +1004,6 @@ Clear metadata from the branch
 ###### **Options:**
 
 * `--branch <branch>` — Branch name (uses current branch if not specified)
-
-
 
 ## `lore revision`
 
@@ -1088,8 +1026,6 @@ Revision commands
 * `revert` — Revert a revision from the currently synced revision
 * `metadata` — Manage metadata of a given revision
 
-
-
 ## `lore revision history`
 
 List revisions of a repository
@@ -1102,12 +1038,11 @@ List revisions of a repository
 
 ###### **Options:**
 
-* `--revision <revision>` — Start listing from the specified revision. If not specified, start listing from the current branch latest revision
+* `--revision <revision>` — Start listing from the specified revision. If not specified, start listing from the current
+  branch latest revision
 * `--branch <branch>` — Show branch revisions
 * `--only-branch` — Stop when reaching a revision on a different branch (includes the branch point revision)
 * `--oneline` — Output each revision on one line only
-
-
 
 ## `lore revision info`
 
@@ -1124,8 +1059,6 @@ Get info about a revision
 * `--delta` — Show delta information
 * `--metadata` — Show file metadata information
 
-
-
 ## `lore revision commit`
 
 Commit the staged state
@@ -1141,9 +1074,8 @@ Commit the staged state
 * `--link <LINK>` — Commit only changes in this linked repository (mount path relative to repo root)
 * `--link-message <PATH>` — Per-link commit message. Takes two values: <path> <message>. Can be specified multiple times
 * `--layer <LAYER>` — Commit only changes in this layer (mount path relative to repo root)
-* `--layer-message <PATH>` — Per-layer commit message. Takes two values: <path> <message>. Can be specified multiple times
-
-
+* `--layer-message <PATH>` — Per-layer commit message. Takes two values: <path> <message>. Can be specified multiple
+  times
 
 ## `lore revision amend`
 
@@ -1155,8 +1087,6 @@ Amend the latest commit's message
 
 * `<MESSAGE>` — Commit message
 
-
-
 ## `lore revision sync`
 
 Synchronize to a given state of a repository
@@ -1167,20 +1097,24 @@ Synchronize to a given state of a repository
 
 ###### **Arguments:**
 
-* `<revision>` — Revision to synchronize to: a whole hash signature, `[branch]@<number>`, `[branch]@LATEST`, or `<branch>@<hash>`. The `@` is optional, a target given without it applying to the branch you are on. A revision identifies the branch it was created on, and syncing moves onto that branch. A branch point can also identify the child branch by naming that child branch
+* `<revision>` — Revision to synchronize to: a whole hash signature, `[branch]@<number>`, `[branch]@LATEST`, or
+  `<branch>@<hash>`. The `@` is optional, a target given without it applying to the branch you are on. A revision
+  identifies the branch it was created on, and syncing moves onto that branch. A branch point can also identify the
+  child branch by naming that child branch
 
 ###### **Options:**
 
 * `--forward-changes` — Fast forward any local changes if syncing to a local revision
 * `--reset` — Reset any local modified files to match the incoming revision
-* `--root-file <path>` — Root files for dependency-based selective sync (only sync changes for these files and their dependencies)
+* `--root-file <path>` — Root files for dependency-based selective sync (only sync changes for these files and their
+  dependencies)
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based sync
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based sync
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
 
   Default value: `0`
-
-
+* `--view <file>` — View filter file to leave the working files materialized under, changing which subset of the
+  repository is on disk. Without it the instance keeps the view it holds
 
 ## `lore revision bisect`
 
@@ -1192,8 +1126,6 @@ Binary search for a change introduced between start (exclusive) and end (inclusi
 
 * `--start <start_revision>` — The latest revision known to not have the change
 * `--end <end_revision>` — The earliest revision known to have the change
-
-
 
 ## `lore revision diff`
 
@@ -1211,8 +1143,6 @@ Diff two revisions
 * `--path <PATH>` — Optional path in repository
 * `--targets <file>` — Path to a targets file
 
-
-
 ## `lore revision find`
 
 Find revision
@@ -1223,8 +1153,6 @@ Find revision
 
 * `metadata` — Find revision by metadata
 * `number` — Find revision by number
-
-
 
 ## `lore revision find metadata`
 
@@ -1237,8 +1165,6 @@ Find revision by metadata
 * `<key>` — Metadata key to search for
 * `<value>` — Metadata value to match with
 
-
-
 ## `lore revision find number`
 
 Find revision by number
@@ -1249,8 +1175,6 @@ Find revision by number
 
 * `<NUMBER>` — Revision number to search for
 
-
-
 ## `lore revision restore`
 
 Restore current revision as latest revision
@@ -1260,8 +1184,6 @@ Restore current revision as latest revision
 ###### **Arguments:**
 
 * `<MESSAGE>` — Commit message
-
-
 
 ## `lore revision cherry-pick`
 
@@ -1285,9 +1207,8 @@ Cherry-pick a revision onto the currently synced revision
 
 * `--message <MESSAGE>` — Change the message for committing when no conflicts arise from the cherry-pick
 * `--no-commit` — Disable auto commits even if no conflicts arise from the cherry-pick
-* `--inherit-metadata <KEY>` — Carry this metadata key from the picked revision onto the revision this creates. Repeatable. Pass `*` to carry every key that is not reserved to the cherry-pick itself. Carries nothing when not given
-
-
+* `--inherit-metadata <KEY>` — Carry this metadata key from the picked revision onto the revision this creates.
+  Repeatable. Pass `*` to carry every key that is not reserved to the cherry-pick itself. Carries nothing when not given
 
 ## `lore revision cherry-pick unresolve`
 
@@ -1303,8 +1224,6 @@ Marks the cherry-pick unresolved
 
 * `--targets <file>` — Path to a targets file
 
-
-
 ## `lore revision cherry-pick restart`
 
 Restart the cherry-pick, resetting the current cherry-pick state
@@ -1318,8 +1237,6 @@ Restart the cherry-pick, resetting the current cherry-pick state
 ###### **Options:**
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore revision cherry-pick resolve`
 
@@ -1341,8 +1258,6 @@ Resolve conflicts
 
 * `--targets <file>` — Path to a targets file
 
-
-
 ## `lore revision cherry-pick resolve mine`
 
 Resolve using my changes
@@ -1356,8 +1271,6 @@ Resolve using my changes
 ###### **Options:**
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore revision cherry-pick resolve theirs`
 
@@ -1373,15 +1286,11 @@ Resolve using the incoming changes
 
 * `--targets <file>` — Path to a targets file
 
-
-
 ## `lore revision cherry-pick abort`
 
 Abort a cherry-pick
 
 **Usage:** `lore revision cherry-pick abort`
-
-
 
 ## `lore revision revert`
 
@@ -1406,8 +1315,6 @@ Revert a revision from the currently synced revision
 * `--message <MESSAGE>` — Change the message for committing when no conflicts arise from the revert
 * `--no-commit` — Disable auto commits even if no conflicts arise from the revert
 
-
-
 ## `lore revision revert unresolve`
 
 Marks the revert unresolved
@@ -1422,8 +1329,6 @@ Marks the revert unresolved
 
 * `--targets <file>` — Path to a targets file
 
-
-
 ## `lore revision revert restart`
 
 Restart the revert, resetting the current revert state
@@ -1437,8 +1342,6 @@ Restart the revert, resetting the current revert state
 ###### **Options:**
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore revision revert resolve`
 
@@ -1460,8 +1363,6 @@ Resolve conflicts
 
 * `--targets <file>` — Path to a targets file
 
-
-
 ## `lore revision revert resolve mine`
 
 Resolve using my changes
@@ -1475,8 +1376,6 @@ Resolve using my changes
 ###### **Options:**
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore revision revert resolve theirs`
 
@@ -1492,15 +1391,11 @@ Resolve using the incoming changes
 
 * `--targets <file>` — Path to a targets file
 
-
-
 ## `lore revision revert abort`
 
 Abort a revert
 
 **Usage:** `lore revision revert abort`
-
-
 
 ## `lore revision metadata`
 
@@ -1514,15 +1409,11 @@ Manage metadata of a given revision
 * `get` — Get metadata from a revision
 * `set` — Set metadata on for a staged revision
 
-
-
 ## `lore revision metadata clear`
 
 Clear metadata for a staged revision
 
 **Usage:** `lore revision metadata clear`
-
-
 
 ## `lore revision metadata get`
 
@@ -1538,8 +1429,6 @@ Get metadata from a revision
 
 * `--revision <revision>` — Revision to get metadata for
 
-
-
 ## `lore revision metadata set`
 
 Set metadata on for a staged revision
@@ -1554,8 +1443,6 @@ Set metadata on for a staged revision
 
 * `--binary` — Indicator that values are paths to files
 
-
-
 ## `lore file`
 
 File commands
@@ -1568,7 +1455,8 @@ File commands
 * `metadata` — Manage metadata of a given file or directory
 * `dependency` — Manage file dependencies
 * `stage` — Stage changes for commit
-* `dirty` — Mark files as dirty so they show up in `lore status` and get picked up by directory-scoped `lore stage` (no content is read or staged)
+* `dirty` — Mark files as dirty so they show up in `lore status` and get picked up by directory-scoped `lore stage` (no
+  content is read or staged)
 * `unstage` — Unstage changes to a file or directory
 * `reset` — Reset changes to a path or file to the current revision, discarding your local changes
 * `obliterate` — Obliterate a file or fragment
@@ -1576,8 +1464,6 @@ File commands
 * `diff` — Show differences between two revisions of a file
 * `write` — Write data to a specific location
 * `hash` — Hash a local file
-
-
 
 ## `lore file info`
 
@@ -1596,8 +1482,6 @@ Get info about the given file or directory
 * `--local` — If given, calculate the local file system size and hash based on the current local filter
 * `--filtered` — If given, calculate the repository size based on the current local filter
 
-
-
 ## `lore file metadata`
 
 Manage metadata of a given file or directory
@@ -1610,8 +1494,6 @@ Manage metadata of a given file or directory
 * `get` — Get metadata from a file
 * `set` — Set metadata on for a staged file
 
-
-
 ## `lore file metadata clear`
 
 Clear metadata for a staged file
@@ -1621,8 +1503,6 @@ Clear metadata for a staged file
 ###### **Arguments:**
 
 * `<PATH>` — File path to clear metadata for
-
-
 
 ## `lore file metadata get`
 
@@ -1639,8 +1519,6 @@ Get metadata from a file
 
 * `--revision <revision>` — Revision to get metadata for
 
-
-
 ## `lore file metadata set`
 
 Set metadata on for a staged file
@@ -1656,8 +1534,6 @@ Set metadata on for a staged file
 
 * `--binary` — Indicator that values are paths to files
 
-
-
 ## `lore file dependency`
 
 Manage file dependencies
@@ -1669,8 +1545,6 @@ Manage file dependencies
 * `add` — Add dependency edges from a source file to one or more dependency files
 * `remove` — Remove dependency edges from a source file to one or more dependency files
 * `list` — List dependencies or dependents for files
-
-
 
 ## `lore file dependency add`
 
@@ -1688,8 +1562,6 @@ Add dependency edges from a source file to one or more dependency files
 * `--tag <tag>` — Tags to apply to all added dependency edges
 * `--force` — Skip cycle detection
 
-
-
 ## `lore file dependency remove`
 
 Remove dependency edges from a source file to one or more dependency files
@@ -1704,8 +1576,6 @@ Remove dependency edges from a source file to one or more dependency files
 ###### **Options:**
 
 * `--tag <tag>` — Remove only specific tags instead of entire edges
-
-
 
 ## `lore file dependency list`
 
@@ -1727,17 +1597,19 @@ List dependencies or dependents for files
   Default value: `0`
 * `--revision <revision>` — Revision to query (defaults to staged/current)
 
-
-
 ## `lore file stage`
 
 Stage changes for commit.
 
-Directory paths (including `.`) stage only files already marked dirty under that directory; clean or unmarked files are skipped. Mark files first with `lore file dirty` (or `lore status --scan` to reconcile dirty flags in bulk), or pass `--scan` here to walk the filesystem and stage in one pass.
+Directory paths (including `.`) stage only files already marked dirty under that directory; clean or unmarked files are
+skipped. Mark files first with `lore file dirty` (or `lore status --scan` to reconcile dirty flags in bulk), or pass
+`--scan` here to walk the filesystem and stage in one pass.
 
-Specific file paths are checked against the filesystem and staged if content differs from the current revision, regardless of their dirty flag.
+Specific file paths are checked against the filesystem and staged if content differs from the current revision,
+regardless of their dirty flag.
 
-`--scan` walks the filesystem under the given paths, marks every detected modification/add/delete dirty, and stages them in one step.
+`--scan` walks the filesystem under the given paths, marks every detected modification/add/delete dirty, and stages them
+in one step.
 
 **Usage:** `lore file stage [OPTIONS] <paths|--targets <file>>
        stage [OPTIONS] <COMMAND>`
@@ -1756,21 +1628,23 @@ Specific file paths are checked against the filesystem and staged if content dif
 * `--case <case>` — Case change handling
 
   Possible values:
-  - `error`:
-    Generate error on case mismatch
-  - `keep`:
-    Keep current case in repository (update file system)
-  - `rename`:
-    Rename case in repository (keep file system)
+    - `error`:
+      Generate error on case mismatch
+    - `keep`:
+      Keep current case in repository (update file system)
+    - `rename`:
+      Rename case in repository (keep file system)
 
 * `--scan` — Walk the filesystem under the given paths to detect modified, added, and deleted files.
 
-   Detected changes are marked dirty and staged in a single pass. Use this when changes were made externally (without going through `lore dirty`), or to recover after losing track of dirty state. Equivalent in effect to running `lore status --scan` followed by `lore stage`, but performed in one traversal.
+  Detected changes are marked dirty and staged in a single pass. Use this when changes were made externally (without
+  going through `lore dirty`), or to recover after losing track of dirty state. Equivalent in effect to running
+  `lore status --scan` followed by `lore stage`, but performed in one traversal.
 
-   Without `--scan`, directory staging stages only files already marked dirty under that directory — mark them first with `lore dirty <paths>`, or run `lore status --scan` to reconcile dirty flags across a tree. Single-file stage paths are always checked against the filesystem regardless of this flag.
+  Without `--scan`, directory staging stages only files already marked dirty under that directory — mark them first with
+  `lore dirty <paths>`, or run `lore status --scan` to reconcile dirty flags across a tree. Single-file stage paths are
+  always checked against the filesystem regardless of this flag.
 * `--targets <file>` — Path to a targets file containing all the paths to all files
-
-
 
 ## `lore file stage move`
 
@@ -1782,8 +1656,6 @@ Move or rename a file or directory
 
 * `<from>` — Original path of file
 * `<to>` — New path of file
-
-
 
 ## `lore file stage merge`
 
@@ -1799,13 +1671,13 @@ Stage as a merge
 
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 
-
-
 ## `lore file dirty`
 
-Mark files as dirty so they show up in `lore status` and get picked up by directory-scoped `lore stage` (no content is read or staged).
+Mark files as dirty so they show up in `lore status` and get picked up by directory-scoped `lore stage` (no content is
+read or staged).
 
-Use when files were changed externally and you want to notify Lore of specific paths without performing a full filesystem walk. For bulk reconciliation across a tree, prefer `lore status --scan` or `lore stage --scan`.
+Use when files were changed externally and you want to notify Lore of specific paths without performing a full
+filesystem walk. For bulk reconciliation across a tree, prefer `lore status --scan` or `lore stage --scan`.
 
 **Usage:** `lore file dirty [OPTIONS] [paths]... [COMMAND]`
 
@@ -1822,8 +1694,6 @@ Use when files were changed externally and you want to notify Lore of specific p
 
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 
-
-
 ## `lore file dirty move`
 
 Mark a file as moved (dirty)
@@ -1835,8 +1705,6 @@ Mark a file as moved (dirty)
 * `<from>` — Original path of file
 * `<to>` — New path of file
 
-
-
 ## `lore file dirty copy`
 
 Mark a file as copied (dirty)
@@ -1847,8 +1715,6 @@ Mark a file as copied (dirty)
 
 * `<from>` — Source path of file
 * `<to>` — Destination path of copy
-
-
 
 ## `lore file unstage`
 
@@ -1863,8 +1729,6 @@ Unstage changes to a file or directory
 ###### **Options:**
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore file reset`
 
@@ -1881,9 +1745,11 @@ Reset changes to a path or file to the current revision, discarding your local c
 * `--purge` — Delete untracked files
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 * `--revision <revision>` — Revision to reset files to
-* `--last-merged-from <branch>` — If given, the files will be reset to the last point of merge from this branch, or the branch point from this branch if no merge has been performed
-
-
+* `--last-merged-from <branch>` — If given, the files will be reset to the last point of merge from this branch, or the
+  branch point from this branch if no merge has been performed
+* `--mine` — Reset to the version this branch held going into that merge rather than the version the conflict was
+  resolved with
+* `--theirs` — Reset to the version the merged branch brought in rather than the version the conflict was resolved with
 
 ## `lore file obliterate`
 
@@ -1895,8 +1761,6 @@ Obliterate a file or fragment
 
 * `--address <ADDRESS>` — Address of a blob
 * `--path <PATH>` — Path to a file
-
-
 
 ## `lore file history`
 
@@ -1916,8 +1780,6 @@ List revisions of a file
 * `--depth <depth>` — Number of revisions to search initially
 * `--oneline` — Output each revision on one line only
 
-
-
 ## `lore file diff`
 
 Show differences between two revisions of a file
@@ -1931,7 +1793,8 @@ Show differences between two revisions of a file
 ###### **Options:**
 
 * `--source <revision_source>` — Optional signature of the source revision to diff from, by default the current revision
-* `--target <revision_target>` — Optional signature of the target revision to diff to, by default the current file system state
+* `--target <revision_target>` — Optional signature of the target revision to diff to, by default the current file
+  system state
 * `--diff3` — If given, produce three-way merge output with conflict markers instead of a two-way unified diff
 * `-U`, `--context <n>` — Number of unchanged context lines to show around each hunk
 
@@ -1939,8 +1802,6 @@ Show differences between two revisions of a file
 * `--ignore-space-at-eol` — Treat lines that differ only in trailing whitespace as unchanged
 * `--ignore-space-change` — Collapse runs of internal whitespace to a single space before comparing
 * `--targets <file>` — Path to a targets file containing all the paths to all files
-
-
 
 ## `lore file write`
 
@@ -1954,8 +1815,6 @@ Write data to a specific location
 * `--path <PATH>` — Path to a file
 * `--revision <REVISION>` — Revision specifier
 * `--output <OUTPUT>` — Path to a destination
-
-
 
 ## `lore file hash`
 
@@ -1971,8 +1830,6 @@ Hash a local file
 
 * `--targets <file>` — Path to a targets file
 
-
-
 ## `lore auth`
 
 Authentication commands
@@ -1986,8 +1843,6 @@ Authentication commands
 * `list` — List all stored authentication identities
 * `logout` — Remove stored authentication and authorization tokens
 * `clear` — Clear all stored authentication data
-
-
 
 ## `lore auth login`
 
@@ -2003,10 +1858,9 @@ Authenticate the CLI
 
 * `--token-type <TOKEN_TYPE>` — Token type for non-interactive login (e.g. "api-key", "eg1", "lore")
 * `--token <TOKEN>` — Token value for non-interactive login (requires --token-type)
-* `--auth-url <AUTH_URL>` — Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`). Required when logging in with `--token` outside a repository without a remote-url
+* `--auth-url <AUTH_URL>` — Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`). Required when logging in
+  with `--token` outside a repository without a remote-url
 * `--no-browser` — Avoid opening a browser to login
-
-
 
 ## `lore auth info`
 
@@ -2023,8 +1877,6 @@ Display identity information for the current user or specified user IDs
 * `--with-identity-token` — Include cached identity tokens in the output
 * `--with-access-token` — Include the current repository's access token in the output
 
-
-
 ## `lore auth list`
 
 List all stored authentication identities
@@ -2034,8 +1886,6 @@ List all stored authentication identities
 ###### **Options:**
 
 * `--with-token` — Include cached tokens in the output
-
-
 
 ## `lore auth logout`
 
@@ -2049,15 +1899,11 @@ Remove stored authentication and authorization tokens
 * `--resource <resource>` — Resource ID to remove a specific authorization (e.g. "urc-{id}")
 * `--user-id <user-id>` — User ID to remove (omit to remove all identities)
 
-
-
 ## `lore auth clear`
 
 Clear all stored authentication data
 
 **Usage:** `lore auth clear`
-
-
 
 ## `lore layer`
 
@@ -2070,8 +1916,6 @@ Layer commands
 * `add` — Add a repository layer
 * `remove` — Remove a repository layer
 * `list` — List repository layers
-
-
 
 ## `lore layer add`
 
@@ -2089,8 +1933,6 @@ Add a repository layer
 
 * `--metadata <metadata>` — Metadata key to use for matching revisions
 
-
-
 ## `lore layer remove`
 
 Remove a repository layer
@@ -2100,21 +1942,18 @@ Remove a repository layer
 ###### **Arguments:**
 
 * `<path>` — Path in the current repository where the layer is placed
-* `<repository>` — Repository placed as a layer. Optional when the target path matches a single configured layer; required to disambiguate when multiple layers share the same target path
+* `<repository>` — Repository placed as a layer. Optional when the target path matches a single configured layer;
+  required to disambiguate when multiple layers share the same target path
 
 ###### **Options:**
 
 * `--purge` — Also delete untracked files and all directories inside the layer mount
-
-
 
 ## `lore layer list`
 
 List repository layers
 
 **Usage:** `lore layer list`
-
-
 
 ## `lore logfile`
 
@@ -2126,15 +1965,11 @@ Logfile commands
 
 * `info` — Info
 
-
-
 ## `lore logfile info`
 
 Info
 
 **Usage:** `lore logfile info`
-
-
 
 ## `lore login`
 
@@ -2150,10 +1985,9 @@ Authenticate the CLI
 
 * `--token-type <TOKEN_TYPE>` — Token type for non-interactive login (e.g. "api-key", "eg1", "lore")
 * `--token <TOKEN>` — Token value for non-interactive login (requires --token-type)
-* `--auth-url <AUTH_URL>` — Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`). Required when logging in with `--token` outside a repository without a remote-url
+* `--auth-url <AUTH_URL>` — Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`). Required when logging in
+  with `--token` outside a repository without a remote-url
 * `--no-browser` — Avoid opening a browser to login
-
-
 
 ## `lore link`
 
@@ -2168,8 +2002,6 @@ Link commands
 * `update` — Update the link to a new pin
 * `list` — List all links in the repository
 * `info` — Show detailed information about the link at the given path
-
-
 
 ## `lore link add`
 
@@ -2188,8 +2020,6 @@ Link to the given point in the repository and subpath from the given repository
 * `--pin <pin>` — Branch or specific revision to pin the link to, defaulting to latest on the main branch
 * `--disable-branching` — Disable automatic branch creation in the linked repository
 
-
-
 ## `lore link remove`
 
 Remove the link at the given point in the repository
@@ -2199,8 +2029,6 @@ Remove the link at the given point in the repository
 ###### **Arguments:**
 
 * `<link_path>` — Path in the current repository where the module is linked in
-
-
 
 ## `lore link update`
 
@@ -2216,8 +2044,6 @@ Update the link to a new pin
 
 * `--pin <pin>` — Branch or specific revision to pin the link to, defaulting to latest on the current branch
 
-
-
 ## `lore link list`
 
 List all links in the repository
@@ -2227,8 +2053,6 @@ List all links in the repository
 ###### **Options:**
 
 * `--staged` — Only show links with staged changes
-
-
 
 ## `lore link info`
 
@@ -2240,15 +2064,17 @@ Show detailed information about the link at the given path
 
 * `<link_path>` — Path in the repository of the link to describe
 
-
-
 ## `lore status`
 
 Show current repository status.
 
-Reports the staged revision (if any) plus the files and directories currently marked dirty. By default no filesystem walk is performed — only the tracked dirty flags are read, so changes made without prior `lore dirty` or `--scan` will not appear.
+Reports the staged revision (if any) plus the files and directories currently marked dirty. By default no filesystem
+walk is performed — only the tracked dirty flags are read, so changes made without prior `lore dirty` or `--scan` will
+not appear.
 
-Pass `--scan` to walk the filesystem under the given paths, reconcile every file against the current revision, and refresh dirty flags (setting them on detected modifications/adds/deletes and clearing stale ones). The refreshed flags are persisted so subsequent `lore stage` / `lore status` calls see an accurate picture without rescanning.
+Pass `--scan` to walk the filesystem under the given paths, reconcile every file against the current revision, and
+refresh dirty flags (setting them on detected modifications/adds/deletes and clearing stale ones). The refreshed flags
+are persisted so subsequent `lore stage` / `lore status` calls see an accurate picture without rescanning.
 
 **Usage:** `lore status [OPTIONS] [PATH]...`
 
@@ -2260,22 +2086,32 @@ Pass `--scan` to walk the filesystem under the given paths, reconcile every file
 
 * `--scan` — Walk the filesystem under the given paths and reconcile every file against the current revision.
 
-   Detected modifications, adds, and deletes are marked dirty; stale dirty flags are cleared. The refreshed flags are persisted in the staged state so subsequent `lore stage` and `lore status` calls see an accurate picture without rescanning.
+  Detected modifications, adds, and deletes are marked dirty; stale dirty flags are cleared. The refreshed flags are
+  persisted in the staged state so subsequent `lore stage` and `lore status` calls see an accurate picture without
+  rescanning.
 
-   Without `--scan`, status reports only what is currently tracked: the staged revision (if any) plus files already marked dirty. Mark files individually with `lore dirty` for targeted updates, or pass `--scan` here for bulk reconciliation.
+  Without `--scan`, status reports only what is currently tracked: the staged revision (if any) plus files already
+  marked dirty. Mark files individually with `lore dirty` for targeted updates, or pass `--scan` here for bulk
+  reconciliation.
 * `--check-dirty` — Verify already-dirty files against the filesystem without a full scan.
 
-   Each file currently marked dirty is re-checked: one whose on-disk content still matches the tracked revision (same size, and same content when the modification time differs) has its dirty flag cleared and is dropped from the report, unless it is also staged. Adds, moves, copies, and deletes are always reported. The refreshed flags are persisted, so this requires write access.
+  Each file currently marked dirty is re-checked: one whose on-disk content still matches the tracked revision (same
+  size, and same content when the modification time differs) has its dirty flag cleared and is dropped from the report,
+  unless it is also staged. Adds, moves, copies, and deletes are always reported. The refreshed flags are persisted, so
+  this requires write access.
 * `--reset` — Drop the existing staged anchor before computing status. Combine with --scan to scan from a clean slate
 * `--revision-only` — Only show revision info, skip all diffs
 * `--count` — Count directories and files (staged state if present, else current revision; view-filtered)
 * `--targets <file>` — Path to a targets file
 
-
-
 ## `lore clone`
 
 Clone a remote repository into the given path
+
+A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline
+instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned
+revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare clone
+writes no files and reads them from the remote when a command needs them.
 
 **Usage:** `lore clone [OPTIONS] <url> [path]`
 
@@ -2290,18 +2126,19 @@ Clone a remote repository into the given path
 * `--revision <revision>` — Optional revision to sync
 * `--branch <branch>` — Optional branch to sync (shorthand for a full revision specifier)
 * `--bare` — Clone without files, only fetch latest revision tree
-* `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into place
+* `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into
+  place
 * `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
 
   Default value: `none`
 
   Possible values:
-  - `none`:
-    No virtual file system; files are materialized directly on disk
-  - `default`:
-    Use whichever VFS system is preferred based on the user's system
-  - `swfs`:
-    Use Epic's Split Write File System as the Virtual File System
+    - `none`:
+      No virtual file system; files are materialized directly on disk
+    - `default`:
+      Use whichever VFS system is preferred based on the user's system
+    - `swfs`:
+      Use Epic's Split Write File System as the Virtual File System
 
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
@@ -2316,17 +2153,20 @@ Clone a remote repository into the given path
 
   Default value: `0`
 
-
-
 ## `lore stage`
 
 Stage changes for commit.
 
-Directory path (including `.`): stages only files already marked dirty under that directory. No filesystem walk is performed; clean or unmarked files are skipped. Mark files first with `lore dirty` (or `lore status --scan` to reconcile in bulk), or pass `--scan` here to discover and stage in one pass.
+Directory path (including `.`): stages only files already marked dirty under that directory. No filesystem walk is
+performed; clean or unmarked files are skipped. Mark files first with `lore dirty` (or `lore status --scan` to reconcile
+in bulk), or pass `--scan` here to discover and stage in one pass.
 
-Specific file path: checked against the filesystem and staged if its on-disk content differs from the current revision, regardless of its dirty flag.
+Specific file path: checked against the filesystem and staged if its on-disk content differs from the current revision,
+regardless of its dirty flag.
 
-`--scan`: forces a filesystem walk under the given paths, marks modified, added, and deleted files dirty, and stages them in one step. Use this when changes were made externally without going through `lore dirty`, or to recover after losing track of dirty state.
+`--scan`: forces a filesystem walk under the given paths, marks modified, added, and deleted files dirty, and stages
+them in one step. Use this when changes were made externally without going through `lore dirty`, or to recover after
+losing track of dirty state.
 
 **Usage:** `lore stage [OPTIONS] <paths|--targets <file>>
        stage [OPTIONS] <COMMAND>`
@@ -2345,21 +2185,23 @@ Specific file path: checked against the filesystem and staged if its on-disk con
 * `--case <case>` — Case change handling
 
   Possible values:
-  - `error`:
-    Generate error on case mismatch
-  - `keep`:
-    Keep current case in repository (update file system)
-  - `rename`:
-    Rename case in repository (keep file system)
+    - `error`:
+      Generate error on case mismatch
+    - `keep`:
+      Keep current case in repository (update file system)
+    - `rename`:
+      Rename case in repository (keep file system)
 
 * `--scan` — Walk the filesystem under the given paths to detect modified, added, and deleted files.
 
-   Detected changes are marked dirty and staged in a single pass. Use this when changes were made externally (without going through `lore dirty`), or to recover after losing track of dirty state. Equivalent in effect to running `lore status --scan` followed by `lore stage`, but performed in one traversal.
+  Detected changes are marked dirty and staged in a single pass. Use this when changes were made externally (without
+  going through `lore dirty`), or to recover after losing track of dirty state. Equivalent in effect to running
+  `lore status --scan` followed by `lore stage`, but performed in one traversal.
 
-   Without `--scan`, directory staging stages only files already marked dirty under that directory — mark them first with `lore dirty <paths>`, or run `lore status --scan` to reconcile dirty flags across a tree. Single-file stage paths are always checked against the filesystem regardless of this flag.
+  Without `--scan`, directory staging stages only files already marked dirty under that directory — mark them first with
+  `lore dirty <paths>`, or run `lore status --scan` to reconcile dirty flags across a tree. Single-file stage paths are
+  always checked against the filesystem regardless of this flag.
 * `--targets <file>` — Path to a targets file containing all the paths to all files
-
-
 
 ## `lore stage move`
 
@@ -2371,8 +2213,6 @@ Move or rename a file or directory
 
 * `<from>` — Original path of file
 * `<to>` — New path of file
-
-
 
 ## `lore stage merge`
 
@@ -2388,13 +2228,12 @@ Stage as a merge
 
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 
-
-
 ## `lore dirty`
 
 Mark files as dirty so they show up in `lore status` and get picked up by `lore stage` (no content is read or staged).
 
-Use this when your editor or build tool has modified files and you want to inform Lore of the change without performing a full `--scan`. For bulk reconciliation across a tree, prefer `lore status --scan` or `lore stage --scan`.
+Use this when your editor or build tool has modified files and you want to inform Lore of the change without performing
+a full `--scan`. For bulk reconciliation across a tree, prefer `lore status --scan` or `lore stage --scan`.
 
 **Usage:** `lore dirty [OPTIONS] [paths]... [COMMAND]`
 
@@ -2411,8 +2250,6 @@ Use this when your editor or build tool has modified files and you want to infor
 
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 
-
-
 ## `lore dirty move`
 
 Mark a file as moved (dirty)
@@ -2424,8 +2261,6 @@ Mark a file as moved (dirty)
 * `<from>` — Original path of file
 * `<to>` — New path of file
 
-
-
 ## `lore dirty copy`
 
 Mark a file as copied (dirty)
@@ -2436,8 +2271,6 @@ Mark a file as copied (dirty)
 
 * `<from>` — Source path of file
 * `<to>` — Destination path of copy
-
-
 
 ## `lore unstage`
 
@@ -2452,8 +2285,6 @@ Unstage changes to a file or directory
 ###### **Options:**
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore reset`
 
@@ -2470,9 +2301,11 @@ Reset changes to a file or directory
 * `--purge` — Delete untracked files
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 * `--revision <revision>` — Revision to reset files to
-* `--last-merged-from <branch>` — If given, the files will be reset to the last point of merge from this branch, or the branch point from this branch if no merge has been performed
-
-
+* `--last-merged-from <branch>` — If given, the files will be reset to the last point of merge from this branch, or the
+  branch point from this branch if no merge has been performed
+* `--mine` — Reset to the version this branch held going into that merge rather than the version the conflict was
+  resolved with
+* `--theirs` — Reset to the version the merged branch brought in rather than the version the conflict was resolved with
 
 ## `lore diff`
 
@@ -2487,7 +2320,8 @@ Show differences between two revisions of a file
 ###### **Options:**
 
 * `--source <revision_source>` — Optional signature of the source revision to diff from, by default the current revision
-* `--target <revision_target>` — Optional signature of the target revision to diff to, by default the current file system state
+* `--target <revision_target>` — Optional signature of the target revision to diff to, by default the current file
+  system state
 * `--diff3` — If given, produce three-way merge output with conflict markers instead of a two-way unified diff
 * `-U`, `--context <n>` — Number of unchanged context lines to show around each hunk
 
@@ -2495,8 +2329,6 @@ Show differences between two revisions of a file
 * `--ignore-space-at-eol` — Treat lines that differ only in trailing whitespace as unchanged
 * `--ignore-space-change` — Collapse runs of internal whitespace to a single space before comparing
 * `--targets <file>` — Path to a targets file containing all the paths to all files
-
-
 
 ## `lore history`
 
@@ -2510,12 +2342,11 @@ List revisions of a repository
 
 ###### **Options:**
 
-* `--revision <revision>` — Start listing from the specified revision. If not specified, start listing from the current branch latest revision
+* `--revision <revision>` — Start listing from the specified revision. If not specified, start listing from the current
+  branch latest revision
 * `--branch <branch>` — Show branch revisions
 * `--only-branch` — Stop when reaching a revision on a different branch (includes the branch point revision)
 * `--oneline` — Output each revision on one line only
-
-
 
 ## `lore commit`
 
@@ -2532,9 +2363,8 @@ Commit the staged revision
 * `--link <LINK>` — Commit only changes in this linked repository (mount path relative to repo root)
 * `--link-message <PATH>` — Per-link commit message. Takes two values: <path> <message>. Can be specified multiple times
 * `--layer <LAYER>` — Commit only changes in this layer (mount path relative to repo root)
-* `--layer-message <PATH>` — Per-layer commit message. Takes two values: <path> <message>. Can be specified multiple times
-
-
+* `--layer-message <PATH>` — Per-layer commit message. Takes two values: <path> <message>. Can be specified multiple
+  times
 
 ## `lore sync`
 
@@ -2546,20 +2376,24 @@ Synchronize to a repository state
 
 ###### **Arguments:**
 
-* `<revision>` — Revision to synchronize to: a whole hash signature, `[branch]@<number>`, `[branch]@LATEST`, or `<branch>@<hash>`. The `@` is optional, a target given without it applying to the branch you are on. A revision identifies the branch it was created on, and syncing moves onto that branch. A branch point can also identify the child branch by naming that child branch
+* `<revision>` — Revision to synchronize to: a whole hash signature, `[branch]@<number>`, `[branch]@LATEST`, or
+  `<branch>@<hash>`. The `@` is optional, a target given without it applying to the branch you are on. A revision
+  identifies the branch it was created on, and syncing moves onto that branch. A branch point can also identify the
+  child branch by naming that child branch
 
 ###### **Options:**
 
 * `--forward-changes` — Fast forward any local changes if syncing to a local revision
 * `--reset` — Reset any local modified files to match the incoming revision
-* `--root-file <path>` — Root files for dependency-based selective sync (only sync changes for these files and their dependencies)
+* `--root-file <path>` — Root files for dependency-based selective sync (only sync changes for these files and their
+  dependencies)
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based sync
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based sync
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
 
   Default value: `0`
-
-
+* `--view <file>` — View filter file to leave the working files materialized under, changing which subset of the
+  repository is on disk. Without it the instance keeps the view it holds
 
 ## `lore push`
 
@@ -2575,8 +2409,6 @@ Push commits to remote
 
 * `--fast-forward-merge` — Allow the server to fast-forward merge if the target branch head has moved
 
-
-
 ## `lore lock`
 
 Lock file
@@ -2589,8 +2421,6 @@ Lock file
 * `status` — Get lock status on file(s)
 * `query` — Query the lock status given a branch, owner or path
 * `release` — Release lock on file(s)
-
-
 
 ## `lore lock acquire`
 
@@ -2606,8 +2436,6 @@ Acquire lock on file(s)
 
 * `--branch <branch>` — Branch where lock is to be acquired
 
-
-
 ## `lore lock status`
 
 Get lock status on file(s)
@@ -2622,8 +2450,6 @@ Get lock status on file(s)
 
 * `--branch <branch>` — Branch where lock was acquired
 
-
-
 ## `lore lock query`
 
 Query the lock status given a branch, owner or path
@@ -2635,8 +2461,6 @@ Query the lock status given a branch, owner or path
 * `--branch <branch-name>` — Branch to query locks on
 * `--owner <owner-id>` — Owner to query locks belonging to them
 * `--path <path>` — Path to query lock information on
-
-
 
 ## `lore lock release`
 
@@ -2653,8 +2477,6 @@ Release lock on file(s)
 * `--branch <branch>` — Branch where lock was acquired
 * `--owner <owner>` — Owner of the lock
 
-
-
 ## `lore service`
 
 Manage the repository in a service process
@@ -2666,10 +2488,9 @@ Manage the repository in a service process
 * `run` — Run this process as the service
 * `start` — Start the service, unless one is already running
 * `stop` — Stop the running service
+* `status` — Report whether the service is running, and what it is doing
 * `set-executable` — Set which executable is started as the service
 * `set-use-automatically` — Set whether commands are carried out by the service
-
-
 
 ## `lore service run`
 
@@ -2677,15 +2498,11 @@ Run this process as the service
 
 **Usage:** `lore service run`
 
-
-
 ## `lore service start`
 
 Start the service, unless one is already running
 
 **Usage:** `lore service start`
-
-
 
 ## `lore service stop`
 
@@ -2693,7 +2510,11 @@ Stop the running service
 
 **Usage:** `lore service stop`
 
+## `lore service status`
 
+Report whether the service is running, and what it is doing
+
+**Usage:** `lore service status`
 
 ## `lore service set-executable`
 
@@ -2705,8 +2526,6 @@ Set which executable is started as the service
 
 * `<path>` — Path of the executable to start as the service. Leave empty to clear it
 
-
-
 ## `lore service set-use-automatically`
 
 Set whether commands are carried out by the service
@@ -2717,12 +2536,10 @@ Set whether commands are carried out by the service
 
 * `<enabled>` — Whether to carry commands out in the service
 
-   `Set` rather than the default a `bool` field is given: this reads a value rather than being present or absent, and clap refuses a positional whose action takes none.
+  `Set` rather than the default a `bool` field is given: this reads a value rather than being present or absent, and
+  clap refuses a positional whose action takes none.
 
   Possible values: `true`, `false`
-
-
-
 
 ## `lore notification`
 
@@ -2734,8 +2551,6 @@ Notifications
 
 * `subscribe` — Subscribe to events on the given repository
 
-
-
 ## `lore notification subscribe`
 
 Subscribe to events on the given repository
@@ -2745,8 +2560,6 @@ Subscribe to events on the given repository
 ###### **Arguments:**
 
 * `<seconds>` — Time to be subscribed in seconds
-
-
 
 ## `lore completions`
 
@@ -2762,8 +2575,6 @@ Generate terminal autocompletions
 
 * `<path>` — Directory path to write the autocompletion script to
 
-
-
 ## `lore shared-store`
 
 Manage the shared store
@@ -2776,8 +2587,6 @@ Manage the shared store
 * `info` — Show the shared store this repository uses
 * `list` — Show information about the registry of shared stores
 * `set-use-automatically` — Set whether new clones use a shared store without being asked to
-
-
 
 ## `lore shared-store create`
 
@@ -2796,16 +2605,11 @@ Create a shared store backed by a remote
 
   Possible values: `true`, `false`
 
-
-
-
 ## `lore shared-store info`
 
 Show the shared store this repository uses
 
 **Usage:** `lore shared-store info`
-
-
 
 ## `lore shared-store list`
 
@@ -2819,9 +2623,6 @@ Show information about the registry of shared stores
 
   Possible values: `true`, `false`
 
-
-
-
 ## `lore shared-store set-use-automatically`
 
 Set whether new clones use a shared store without being asked to
@@ -2834,12 +2635,9 @@ Set whether new clones use a shared store without being asked to
 
   Possible values: `true`, `false`
 
-
-
-
 <hr/>
 
 <small><i>
-    This document was generated automatically by
-    <a href="https://crates.io/crates/clap-markdown"><code>clap-markdown</code></a>.
+This document was generated automatically by
+<a href="https://crates.io/crates/clap-markdown"><code>clap-markdown</code></a>.
 </i></small>

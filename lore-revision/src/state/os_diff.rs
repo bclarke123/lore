@@ -29,6 +29,7 @@ use crate::change;
 use crate::change::FileAction;
 use crate::change::NodeChange;
 use crate::change::NodeChangeState;
+use crate::errors::NodeNotFound;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::filter::WalkPath;
@@ -37,36 +38,42 @@ use crate::fs::filesystem_provider::FilesystemDiffContext;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::StageIntent;
+use crate::fs::os::FileListItem;
 use crate::lore::*;
 use crate::lore_drain_tasks;
 use crate::lore_trace;
 use crate::node::*;
 use crate::repository::BASE_SUFFIX;
-use crate::repository::DOT_LORE;
-use crate::repository::DOT_URC;
 use crate::repository::RepositoryContext;
 use crate::repository::TEMP_FILE_EXTENSION;
 use crate::repository::THEIRS_SUFFIX;
+use crate::repository::is_reserved_node_name;
 use crate::state::ChangeSender;
+use crate::state::diff::NodeMatch;
 use crate::state::diff::get_filtered_node_and_path;
 use crate::state::diff::get_node_match;
 use crate::state::stream::emit;
-use crate::util;
 use crate::util::path::EntryPath;
 use crate::util::path::RelativePath;
 
-/// Find-or-create the directory node chain from `ROOT_NODE` down to `path`,
-/// marking newly created segments as dirty-add. A path-filtered scan can enter
-/// a directory (or a file's parent) present on disk but absent from `state_from`;
-/// creating the chain lets adds discovered inside resolve their parent node.
-/// Returns the node for the final path segment.
-async fn ensure_scan_dir_chain(
+/// Find-or-create the directory node chain from `start` down to `path`, relative
+/// to it, marking newly created segments as dirty-add. A path-filtered scan can
+/// enter a directory (or a file's parent) present on disk but absent from
+/// `state_from`; creating the chain lets adds discovered inside resolve their
+/// parent node. Returns the node for the final path segment.
+///
+/// `path` is generic so a caller spawning this future can hand over an owned path.
+pub(crate) async fn ensure_scan_dir_chain(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
-    path: &str,
+    start: NodeID,
+    path: impl AsRef<str>,
 ) -> Result<NodeID, StateError> {
-    let mut current_node = ROOT_NODE;
-    for segment in path.split('/').filter(|s| !s.is_empty()) {
+    let mut current_node = start;
+    for segment in path.as_ref().split('/').filter(|s| !s.is_empty()) {
+        if is_reserved_node_name(segment) {
+            return Err(NodeNotFound.into());
+        }
         let name_hash = crate::hash::hash_string(segment);
         if let Ok(child_id) = state
             .find_subnode(repository.clone(), current_node, name_hash)
@@ -96,11 +103,11 @@ async fn diff_filesystem_subtree_impl(
         .filesystem_path
         .to_absolute_path(ctx.from.repository.require_path()?);
 
-    match util::fs::list_path(absolute_path)
+    match crate::fs::os::list_path(absolute_path)
         .await
         .forward::<StateError>("Failed to list the path")?
     {
-        util::fs::PathListingResult::Directory { listing } => {
+        crate::fs::os::PathListingResult::Directory { listing } => {
             // A path-filtered scan can enter a directory present on disk but
             // absent from state_from (an untracked add). Create its dirty-add
             // node chain so adds discovered inside resolve their parent node.
@@ -111,6 +118,7 @@ async fn diff_filesystem_subtree_impl(
                 let entry_node = ensure_scan_dir_chain(
                     ctx.from.repository.clone(),
                     ctx.from.state.clone(),
+                    ROOT_NODE,
                     ctx.filesystem_path.as_str(),
                 )
                 .await?;
@@ -118,7 +126,7 @@ async fn diff_filesystem_subtree_impl(
             }
             diff_filesystem_directory(ctx, listing, changes).await
         }
-        util::fs::PathListingResult::File { item } => {
+        crate::fs::os::PathListingResult::File { item } => {
             // A path-filtered scan of a new file: ensure its parent directory
             // chain exists so the add resolves its parent node.
             if ctx.intent.marks_dirty()
@@ -126,12 +134,17 @@ async fn diff_filesystem_subtree_impl(
                 && let Some(parent) = ctx.filesystem_path.parent()
                 && !parent.is_empty()
             {
-                ensure_scan_dir_chain(ctx.from.repository.clone(), ctx.from.state.clone(), parent)
-                    .await?;
+                ensure_scan_dir_chain(
+                    ctx.from.repository.clone(),
+                    ctx.from.state.clone(),
+                    ROOT_NODE,
+                    parent,
+                )
+                .await?;
             }
             diff_filesystem_single_file(ctx, item, changes).await
         }
-        util::fs::PathListingResult::NotFound => {
+        crate::fs::os::PathListingResult::NotFound => {
             // Path doesn't exist on filesystem - everything in state is deleted
             diff_filesystem_missing(
                 ctx.from,
@@ -140,26 +153,21 @@ async fn diff_filesystem_subtree_impl(
                 ctx.filter_mode,
                 ctx.intent,
                 changes,
+                &ctx.link_mounts,
             )
             .await
         }
     }
 }
 
-/// Compare a single file from filesystem against state and determine the type of change.
-/// This is a pure comparison function that doesn't create changes - it just determines
-/// what kind of change (if any) occurred.
+/// How the file at `file_path` compares to `from_node`: a type change, a modification, or
+/// neither. Reports what it found and leaves both trees alone.
 ///
-/// # Arguments
-/// * `repository` - Repository context
-/// * `from_node` - The state node to compare against (None if file is new)
-/// * `current_node` - The current state node (for timestamp tracking comparison)
-/// * `observed` - What the walk measured at the file
-/// * `file_path` - Path to the file (relative)
-/// * `is_filesystem_file` - Whether the filesystem path is a file (vs directory)
+/// A file is modified where its executable bit differs from the node's or its content does.
+/// The bit settles the answer on its own, so it is tested before anything is read.
 ///
-/// # Returns
-/// The comparison result indicating what type of change occurred
+/// `current_node` is what the working copy last held, which is what says whether a recorded
+/// modification time can answer for `from_node`.
 async fn compare_single_file_against_state(
     operation: &InstanceOperationImpl,
     repository: Arc<RepositoryContext>,
@@ -192,6 +200,10 @@ async fn compare_single_file_against_state(
 
     // At this point, both are files - check for modifications
     if state_is_file && filesystem_is_file {
+        if observed.mode_differs_from(from_node.mode) {
+            return Ok(SingleFileCompareResult::Modified);
+        }
+
         // Force hash check if the from state doesn't match current state
         // (timestamp tracking only tells us if file matches what was last written,
         // which is the current state)
@@ -340,7 +352,7 @@ async fn settle_insisted_directory(
 /// which is how a commit drops the old content and records the new.
 ///
 /// Returns the replacement node, [`INVALID_NODE`] where the intent minted none, so a walk
-/// descends into a directory it created.
+/// knows whether to descend against the node or against an empty listing.
 async fn emit_type_replacement(
     ctx: &FileDiffContext,
     file_path: &RelativePath,
@@ -429,7 +441,7 @@ async fn emit_unstaged_add(
     }
     let staging = intent.stage().is_some();
     if staging {
-        record_observed_file(&state, &repository, from_node_id, observed).await?;
+        record_observed_size(&state, &repository, from_node_id, observed).await?;
     }
     if staging || !from_node.is_dirty_add() {
         mark_settled(
@@ -481,12 +493,15 @@ async fn emit_unstaged_add(
     Ok(())
 }
 
-/// Record on `node_id` what the walk measured at its path, which is what a commit reads to
-/// realize the file being staged.
+/// Record on `node_id` the size the walk measured at its path.
+///
+/// The mode is not recorded. A commit reads the file's mode and compares it with the node's to
+/// see whether the revision has to carry a change to it, so a mode recorded here would be
+/// compared against itself and a change to the executable bit alone would be lost.
 ///
 /// The node is a file already: a path whose type the tree disagrees with is replaced rather
 /// than recorded, which is [`emit_type_replacement`]'s.
-async fn record_observed_file(
+async fn record_observed_size(
     state: &Arc<State>,
     repository: &Arc<RepositoryContext>,
     node_id: NodeID,
@@ -497,9 +512,7 @@ async fn record_observed_file(
     let block = state.block(repository.clone(), block_index).await?;
     let dirtied = {
         let mut locked_block = block.write();
-        let node = locked_block.node(node_index);
-        node.mode = observed.mode(node.mode);
-        node.size = observed.size();
+        locked_block.node(node_index).size = observed.size();
         locked_block.mark_dirty()
     };
     if dirtied {
@@ -511,7 +524,7 @@ async fn record_observed_file(
 
 /// Emit a single Add change for `node_id` without recursing into its subtree —
 /// the caller's walk recursion surfaces the children. Used to report a dirty-add
-/// directory exactly once per scan (unlike `add_change`, which recurses the whole
+/// directory exactly once per scan (unlike `add_change`, which walks the whole
 /// hierarchy for a directory add and would double-count against the recursion).
 async fn emit_dirty_add_node_single(
     repository: Arc<RepositoryContext>,
@@ -546,37 +559,34 @@ async fn emit_add_node_single(
         .block(repository.clone(), NodeBlock::index(node_id))
         .await?;
     let node = block.node(Node::index(node_id));
-    emit(
-        changes,
-        NodeChange {
-            action: change::FileAction::Add,
-            flags: compute_change_flags(&node),
-            from: NodeChangeState {
-                mapping: NodeMapping {
-                    repository: repository.clone(),
-                    state: state.clone(),
-                    path: path.clone(),
-                    node: INVALID_NODE,
-                },
-                observed: None,
-                flags: NodeFlags::NoFlags,
-                address: Address::default(),
-                mode: 0,
+    emit(changes, || NodeChange {
+        action: change::FileAction::Add,
+        flags: compute_change_flags(&node),
+        from: NodeChangeState {
+            mapping: NodeMapping {
+                repository: repository.clone(),
+                state: state.clone(),
+                path: path.clone(),
+                node: INVALID_NODE,
             },
-            to: NodeChangeState {
-                mapping: NodeMapping {
-                    repository: repository.clone(),
-                    state: state.clone(),
-                    path: path.clone(),
-                    node: node_id,
-                },
-                observed: None,
-                flags: NodeFlags::from_bits_retain(node.flags),
-                address: node.address,
-                mode: node.mode,
-            },
+            observed: None,
+            flags: NodeFlags::NoFlags,
+            address: Address::default(),
+            mode: 0,
         },
-    )
+        to: NodeChangeState {
+            mapping: NodeMapping {
+                repository: repository.clone(),
+                state: state.clone(),
+                path: path.clone(),
+                node: node_id,
+            },
+            observed: None,
+            flags: NodeFlags::from_bits_retain(node.flags),
+            address: node.address,
+            mode: node.mode,
+        },
+    })
     .await?;
     stats.file_add.fetch_add(1, Ordering::Relaxed);
     Ok(())
@@ -684,7 +694,7 @@ async fn handle_single_file_compare_result(
             // compute_change_flags loads the dirty node and includes Dirty in the event.
             if ctx.intent.marks_dirty() && ctx.from_node_id.is_valid_node_id() {
                 if ctx.intent.stage().is_some() {
-                    record_observed_file(
+                    record_observed_size(
                         &ctx.state_from,
                         &ctx.repository_from,
                         ctx.from_node_id,
@@ -865,12 +875,13 @@ async fn diff_filesystem_directory(
     let drain_result = lore_drain_tasks!(tasks, StateError::internal("Task failure"));
     work_result?;
     drain_result?;
-    apply_pending_discards(
-        node_list.state.clone(),
-        node_list.repository.clone(),
-        pending_discards,
-    )
-    .await?;
+    if let Some(discards) = &ctx.discards {
+        discards.queue(
+            node_list.state.clone(),
+            node_list.repository.clone(),
+            pending_discards,
+        );
+    }
     Ok(stats)
 }
 
@@ -887,30 +898,38 @@ async fn emit_single_delete(
         .block(repository.clone(), NodeBlock::index(node_id))
         .await?;
     let node = block.node(Node::index(node_id));
-    let flags = compute_change_flags(&node);
-    let from = NodeChangeState {
-        mapping: NodeMapping {
-            repository,
-            state,
-            path: path.clone(),
-            node: node_id,
-        },
-        observed: None,
-        flags: NodeFlags::from_bits_retain(node.flags),
-        address: node.address,
-        mode: node.mode,
-    };
-    let to = from.invalid(path.clone());
-    emit(
-        changes,
+    emit(changes, move || {
+        let from = NodeChangeState {
+            mapping: NodeMapping {
+                repository,
+                state,
+                path: path.clone(),
+                node: node_id,
+            },
+            observed: None,
+            flags: NodeFlags::from_bits_retain(node.flags),
+            address: node.address,
+            mode: node.mode,
+        };
+        let to = from.invalid(path.clone());
         NodeChange {
             action: FileAction::Delete,
-            flags,
+            flags: compute_change_flags(&node),
             from,
             to,
-        },
-    )
+        }
+    })
     .await
+}
+
+/// A mount stays absent while the linked repository cannot be read, so the working tree not
+/// holding one says nothing about the link. `link remove` takes a link out of the tree.
+fn keeps_absent_link(node: &Node, path: &RelativePath) -> bool {
+    if !node.is_link() {
+        return false;
+    }
+    lore_trace!("Link mount {path} is absent from the filesystem, keeping the link");
+    true
 }
 
 /// Emit the buffered ancestor-directory deletes, outermost first, and clear the
@@ -961,6 +980,8 @@ async fn flush_pending_dir_deletes(
 /// leaves out too: an excluded child is descended rather than skipped, and reported along
 /// with the rest of the descent. Narrowing those reports to the in-view set is the
 /// view-filtered delete work, which needs a walk that marks without reporting.
+///
+/// A directory holding a link is never buffered: the link stays, so the directory does too.
 #[allow(clippy::too_many_arguments)]
 async fn emit_filesystem_subtree_deletes(
     state: Arc<State>,
@@ -973,9 +994,14 @@ async fn emit_filesystem_subtree_deletes(
     intent: FilesystemDiffIntent,
     changes: &ChangeSender,
     pending: &mut Vec<(NodeID, RelativePath)>,
+    link_mounts: &[LinkMountInfo],
 ) -> Result<bool, StateError> {
     // Caller guarantees `node` is not filter-excluded.
-    if node.is_file() || node.is_link() {
+    if keeps_absent_link(node, path) {
+        return Ok(false);
+    }
+
+    if node.is_file() {
         flush_pending_dir_deletes(&state, &repository, changes, pending, intent).await?;
         if intent.marks_dirty() {
             mark_settled(&state, &repository, node_id, SettledAction::Delete, intent).await?;
@@ -984,7 +1010,10 @@ async fn emit_filesystem_subtree_deletes(
         return Ok(true);
     }
 
-    pending.push((node_id, path.clone()));
+    let holds_link = LinkMountInfo::any_under(link_mounts, path);
+    if !holds_link {
+        pending.push((node_id, path.clone()));
+    }
     let depth = pending.len();
 
     let mut children =
@@ -1016,6 +1045,7 @@ async fn emit_filesystem_subtree_deletes(
             intent,
             changes,
             pending,
+            link_mounts,
         ))
         .await?
         {
@@ -1037,7 +1067,9 @@ async fn emit_filesystem_subtree_deletes(
     }
 
     // Nothing under this directory materialized: drop its buffered entry.
-    pending.truncate(depth - 1);
+    if !holds_link {
+        pending.truncate(depth - 1);
+    }
     Ok(false)
 }
 
@@ -1165,6 +1197,11 @@ async fn staged_entry(
 /// nested working copy — by queueing it for discard rather than reporting a
 /// `Delete`: with no committed base there is nothing to delete from, and no
 /// mutation verb would clear the entry.
+///
+/// Each kind of entry other than a file, and each pass after the listing, runs
+/// in a function of its own. A local live across several awaits takes space in
+/// every state of the future holding it, so kept here those would add to the
+/// file comparison, the walk's largest state.
 #[allow(clippy::too_many_arguments)]
 async fn diff_filesystem_directory_walk(
     ctx: &FilesystemDiffContext,
@@ -1186,12 +1223,12 @@ async fn diff_filesystem_directory_walk(
         .filesystem_path
         .to_buf_with_capacity(RelativePath::COMPONENT_ROOM);
     while let Some(entry) = file_listing.next().await {
-        let Some(item) =
-            util::fs::file_list_item(entry).forward::<StateError>("Unusable directory entry")?
+        let Some(item) = crate::fs::os::file_list_item(entry)
+            .forward::<StateError>("Unusable directory entry")?
         else {
             continue;
         };
-        if item.name == DOT_URC || item.name == DOT_LORE {
+        if is_reserved_node_name(item.name.as_str()) {
             continue;
         }
         if staging && staging_ignores_name(item.name.as_str()) {
@@ -1364,306 +1401,505 @@ async fn diff_filesystem_directory_walk(
             )
             .await?;
         } else if was_link && is_directory {
-            let item_path = entry.to_path();
-            let from_path = from_match.path(&ctx.from.path, item.name.as_str());
-            let current_path = current_match
-                .as_ref()
-                .map_or_else(RelativePath::new, |(_, matched)| {
-                    matched.path(&ctx.current.path, item.name.as_str())
-                });
-            if staged == StagedEntry::Undeleted {
-                emit_add_node_single(
-                    node_list.repository.clone(),
-                    node_list.state.clone(),
-                    from_named_node.node,
-                    &item_path,
-                    changes,
-                    stats,
-                )
-                .await?;
-            }
-            let link = from_node.linked_node();
-            let (link_from, state_from) = link
-                .resolve(ctx.from.repository.clone(), ctx.from.state.clone())
-                .await?;
-            let subnode_from = link.node;
-
-            let (link_current, state_current, subnode_current) = if current_node.is_link() {
-                let link = current_node.linked_node();
-                let (linked_repository, state) = link
-                    .resolve(ctx.current.repository.clone(), ctx.current.state.clone())
-                    .await?;
-                (linked_repository, state, link.node)
-            } else {
-                // Current state has no matching link (staged-add link or link replacing
-                // a non-link in current). Use the from-side linked state for both sides
-                // so files already tracked in the linked tree aren't misclassified as
-                // unstaged adds.
-                (link_from.clone(), state_from.clone(), subnode_from)
-            };
-            let from_item_states = ctx
-                .from
-                .repository
-                .filter
-                .child_excludes_tree(ctx.from_states, &from_path, true, ctx.filter_mode)
-                .0;
-            diff_filesystem_subtree_dispatch(
-                FilesystemDiffContext {
-                    operation: ctx.operation.clone(),
-                    from: NodeMapping {
-                        repository: link_from,
-                        state: state_from,
-                        path: from_path,
-                        node: subnode_from,
-                    },
-                    current: NodeMapping {
-                        repository: link_current,
-                        state: state_current,
-                        path: current_path,
-                        node: subnode_current,
-                    },
-                    filesystem_path: item_path,
-                    states: item_states,
-                    from_states: from_item_states,
-                    filter_mode: ctx.filter_mode,
-                    intent: ctx.intent,
-                    layer_mounts: ctx.layer_mounts.clone(),
-                    // Crossing into the linked state; parent's link mounts
-                    // are paths in the parent tree and do not apply here.
-                    link_mounts: Arc::new(vec![]),
-                },
+            diff_filesystem_linked_directory(
+                ctx,
+                node_list,
+                from_named_node,
+                from_node,
+                current_node,
+                &from_match,
+                &current_match,
+                &entry,
+                &item,
+                item_states,
+                staged,
                 tasks,
                 changes,
                 stats,
             )
             .await?;
         } else if was_directory && is_directory {
-            let item_path = entry.to_path();
-            let from_path = from_match.path(&ctx.from.path, item.name.as_str());
-            let current_path = current_match
-                .as_ref()
-                .map_or_else(RelativePath::new, |(_, matched)| {
-                    matched.path(&ctx.current.path, item.name.as_str())
-                });
-            let uncommitted = ctx.intent.marks_dirty() && !current_node_id.is_valid_node_id();
-            if uncommitted {
-                let probe = nested_probe
-                    .get_or_insert_with(|| ctx.filesystem_path.to_absolute_path(repository_root));
-                if is_nested_repository_root(probe, item.name.as_str()).await {
-                    lore_trace!("Discarding zombie entry for nested repository root {item_path}");
-                    node_list_found[current_index] = false;
-                    continue;
-                }
-            }
-            if staged == StagedEntry::Undeleted {
-                emit_add_node_single(
-                    node_list.repository.clone(),
-                    node_list.state.clone(),
-                    from_named_node.node,
-                    &item_path,
-                    changes,
-                    stats,
-                )
-                .await?;
-            } else if staged == StagedEntry::Settled {
-                // The node already carries its staged action; the descent below still runs.
-            } else if uncommitted {
-                emit_dirty_add_node_single(
-                    node_list.repository.clone(),
-                    node_list.state.clone(),
-                    from_named_node.node,
-                    &item_path,
-                    changes,
-                    stats,
-                    ctx.intent,
-                )
-                .await?;
-            } else if is_rename {
-                let measured = if from_node.address == current_node.address
-                    && from_node.mode == current_node.mode
-                {
-                    change::Flags::None
-                } else {
-                    change::Flags::Modify
-                };
-                add_change(
-                    NodeChangeState {
-                        mapping: NodeMapping {
-                            repository: node_list.repository.clone(),
-                            state: node_list.state.clone(),
-                            path: from_path.clone(),
-                            node: from_named_node.node,
-                        },
-                        observed: None,
-                        flags: NodeFlags::from_bits_retain(from_node.flags),
-                        address: from_node.address,
-                        mode: from_node.mode,
-                    },
-                    NodeChangeState {
-                        mapping: NodeMapping {
-                            repository: current_node_list.repository.clone(),
-                            state: current_node_list.state.clone(),
-                            path: item_path.clone(),
-                            node: current_node_id,
-                        },
-                        observed: None,
-                        flags: NodeFlags::from_bits_retain(current_node.flags),
-                        address: current_node.address,
-                        mode: current_node.mode,
-                    },
-                    FileAction::Move,
-                    measured,
-                    changes,
-                    ctx.filter_mode,
-                    item_states,
-                )
-                .await?;
-            } else if matches!(staged, StagedEntry::Compare { insisted: true }) {
-                settle_insisted_directory(
-                    node_list,
-                    from_named_node.node,
-                    &from_node,
-                    &item_path,
-                    FileInfo::from_metadata(&item.metadata),
-                    changes,
-                    ctx.intent,
-                    ctx.filter_mode,
-                )
-                .await?;
-            }
-            let from_item_states = ctx
-                .from
-                .repository
-                .filter
-                .child_excludes_tree(ctx.from_states, &from_path, true, ctx.filter_mode)
-                .0;
-            let repository_from = node_list.repository.clone();
-            let state_from = node_list.state.clone();
-            let repository_current = current_node_list.repository.clone();
-            let state_current = current_node_list.state.clone();
-            let subnode_from = from_named_node.node;
-            let current_is_link = current_node.is_link();
-            let (repository_current, state_current, subnode_current) = if current_is_link {
-                let link = current_node.linked_node();
-                let (linked_repository, state) = link
-                    .resolve(repository_current.clone(), state_current.clone())
-                    .await?;
-                (linked_repository, state, link.node)
-            } else {
-                (repository_current, state_current.clone(), current_node_id)
-            };
-            // Stay in the parent's link mounts when recursing into a normal
-            // sub-directory; reset when crossing into a linked state because
-            // those mount paths are in the parent tree, not the linked tree.
-            let link_mounts_recurse = if current_is_link {
-                Arc::new(vec![])
-            } else {
-                ctx.link_mounts.clone()
-            };
-            diff_filesystem_subtree_dispatch(
-                FilesystemDiffContext {
-                    operation: ctx.operation.clone(),
-                    from: NodeMapping {
-                        repository: repository_from,
-                        state: state_from,
-                        path: from_path,
-                        node: subnode_from,
-                    },
-                    current: NodeMapping {
-                        repository: repository_current,
-                        state: state_current,
-                        path: current_path,
-                        node: subnode_current,
-                    },
-                    filesystem_path: item_path,
-                    states: item_states,
-                    from_states: from_item_states,
-                    filter_mode: ctx.filter_mode,
-                    intent: ctx.intent,
-                    layer_mounts: ctx.layer_mounts.clone(),
-                    link_mounts: link_mounts_recurse,
-                },
+            let descended = diff_filesystem_matched_directory(
+                ctx,
+                node_list,
+                current_node_list,
+                from_named_node,
+                from_node,
+                current_node_id,
+                current_node,
+                &from_match,
+                &current_match,
+                &entry,
+                &item,
+                item_states,
+                staged,
+                is_rename,
+                &mut nested_probe,
+                repository_root,
                 tasks,
                 changes,
                 stats,
             )
             .await?;
+            if !descended {
+                node_list_found[current_index] = false;
+            }
         } else {
-            // Type change: file <-> directory
-            let file_ctx = FileDiffContext {
-                repository_from: node_list.repository.clone(),
-                state_from: node_list.state.clone(),
-                from_node_id: from_named_node.node,
-                from_node: Some(from_node),
-                parent_node_id: Some(ctx.from.node),
-                intent: ctx.intent,
-                states: item_states,
-                observed: FileInfo::from_metadata(&item.metadata),
-                insists: false,
-            };
-
-            // Determine the type change direction
-            let compare_result = if is_file {
-                SingleFileCompareResult::TypeChangedToFile
-            } else {
-                SingleFileCompareResult::TypeChangedToDirectory
-            };
-
-            lore_trace!(
-                "Filesystem type (file/directory) differs for node {} in path {}, add delete and add changes",
-                from_named_node.node,
-                entry.path()
-            );
-
-            let replacement = handle_single_file_compare_result(
-                &file_ctx,
-                compare_result,
-                entry.path(),
-                None,
+            diff_filesystem_type_change(
+                ctx,
+                node_list,
+                from_named_node,
+                from_node,
+                &entry,
+                &item,
+                item_states,
+                is_file,
                 is_directory,
+                &mut nested_probe,
+                repository_root,
+                tasks,
                 changes,
                 stats,
-                ctx.filter_mode,
             )
             .await?;
-
-            // A directory that replaced a file is walked against the node the replacement
-            // minted, so the content it holds is staged with it. A file that replaced a
-            // directory holds none.
-            if is_directory && replacement.is_valid_node_id() {
-                let item_path = entry.to_path();
-                diff_filesystem_subtree_dispatch(
-                    FilesystemDiffContext {
-                        operation: ctx.operation.clone(),
-                        from: NodeMapping {
-                            repository: ctx.from.repository.clone(),
-                            state: ctx.from.state.clone(),
-                            path: item_path.clone(),
-                            node: replacement,
-                        },
-                        current: NodeMapping {
-                            repository: ctx.current.repository.clone(),
-                            state: ctx.current.state.clone(),
-                            path: RelativePath::new(),
-                            node: INVALID_NODE,
-                        },
-                        filesystem_path: item_path,
-                        states: item_states,
-                        from_states: item_states,
-                        filter_mode: ctx.filter_mode,
-                        intent: ctx.intent,
-                        layer_mounts: ctx.layer_mounts.clone(),
-                        link_mounts: ctx.link_mounts.clone(),
-                    },
-                    tasks,
-                    changes,
-                    stats,
-                )
-                .await?;
-            }
         }
     }
 
+    diff_filesystem_missing_nodes(
+        ctx,
+        node_list,
+        current_node_list,
+        node_list_found,
+        staging,
+        changes,
+        pending_discards,
+    )
+    .await?;
+
+    diff_filesystem_new_entries(
+        ctx,
+        &new_file_list,
+        &mut nested_probe,
+        repository_root,
+        staging,
+        tasks,
+        changes,
+        stats,
+    )
+    .await?;
+
+    while let Some(joined) = tasks.join_next().await {
+        diff_filesystem_subtree_merge_task(joined, stats)?;
+    }
+
+    Ok(())
+}
+
+/// Walks a directory the tree holds as a link, against the linked state, for
+/// [`diff_filesystem_directory_walk`].
+#[allow(clippy::too_many_arguments)]
+async fn diff_filesystem_linked_directory(
+    ctx: &FilesystemDiffContext,
+    node_list: &StateChildrenNodes,
+    from_named_node: &StateNamedNode,
+    from_node: Node,
+    current_node: Node,
+    from_match: &NodeMatch,
+    current_match: &Option<(NodeID, NodeMatch)>,
+    entry: &EntryPath<'_>,
+    item: &FileListItem,
+    item_states: FilterStates,
+    staged: StagedEntry,
+    tasks: &mut SubtreeTasks,
+    changes: &ChangeSender,
+    stats: &mut FilesystemDiffStats,
+) -> Result<(), StateError> {
+    let item_path = entry.to_path();
+    let from_path = from_match.path(&ctx.from.path, item.name.as_str());
+    let current_path = current_match
+        .as_ref()
+        .map_or_else(RelativePath::new, |(_, matched)| {
+            matched.path(&ctx.current.path, item.name.as_str())
+        });
+    if staged == StagedEntry::Undeleted {
+        emit_add_node_single(
+            node_list.repository.clone(),
+            node_list.state.clone(),
+            from_named_node.node,
+            &item_path,
+            changes,
+            stats,
+        )
+        .await?;
+    }
+    let link = from_node.linked_node();
+    let (link_from, state_from) = link
+        .resolve(ctx.from.repository.clone(), ctx.from.state.clone())
+        .await?;
+    let subnode_from = link.node;
+
+    let (link_current, state_current, subnode_current) = if current_node.is_link() {
+        let link = current_node.linked_node();
+        let (linked_repository, state) = link
+            .resolve(ctx.current.repository.clone(), ctx.current.state.clone())
+            .await?;
+        (linked_repository, state, link.node)
+    } else {
+        // Current state has no matching link (staged-add link or link replacing
+        // a non-link in current). Use the from-side linked state for both sides
+        // so files already tracked in the linked tree aren't misclassified as
+        // unstaged adds.
+        (link_from.clone(), state_from.clone(), subnode_from)
+    };
+    let from_item_states = ctx
+        .from
+        .repository
+        .filter
+        .child_excludes_tree(ctx.from_states, &from_path, true, ctx.filter_mode)
+        .0;
+    // Both sides of the crossing, where the link is pinned to a different revision on each:
+    // the mounts are spelled from the from-side path the walk below compares against.
+    let mut linked_trees = vec![(&state_from, &link_from, subnode_from)];
+    if subnode_current != subnode_from || !Arc::ptr_eq(&state_current, &state_from) {
+        linked_trees.push((&state_current, &link_current, subnode_current));
+    }
+    let linked_mounts = collect_link_mounts(&linked_trees, &from_path).await?;
+    diff_filesystem_subtree_dispatch(
+        FilesystemDiffContext {
+            operation: ctx.operation.clone(),
+            from: NodeMapping {
+                repository: link_from,
+                state: state_from,
+                path: from_path,
+                node: subnode_from,
+            },
+            current: NodeMapping {
+                repository: link_current,
+                state: state_current,
+                path: current_path,
+                node: subnode_current,
+            },
+            filesystem_path: item_path,
+            states: item_states,
+            from_states: from_item_states,
+            filter_mode: ctx.filter_mode,
+            intent: ctx.intent,
+            discards: ctx.discards.clone(),
+            layer_mounts: ctx.layer_mounts.clone(),
+            link_mounts: Arc::new(linked_mounts),
+        },
+        tasks,
+        changes,
+        stats,
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Settles a directory both the tree and the file system hold and walks below it, for
+/// [`diff_filesystem_directory_walk`]. `false` when a marking walk finds an uncommitted entry at
+/// the root of a nested repository, which the walk discards rather than descends into.
+#[allow(clippy::too_many_arguments)]
+async fn diff_filesystem_matched_directory(
+    ctx: &FilesystemDiffContext,
+    node_list: &StateChildrenNodes,
+    current_node_list: &StateChildrenNodes,
+    from_named_node: &StateNamedNode,
+    from_node: Node,
+    current_node_id: NodeID,
+    current_node: Node,
+    from_match: &NodeMatch,
+    current_match: &Option<(NodeID, NodeMatch)>,
+    entry: &EntryPath<'_>,
+    item: &FileListItem,
+    item_states: FilterStates,
+    staged: StagedEntry,
+    is_rename: bool,
+    nested_probe: &mut Option<std::path::PathBuf>,
+    repository_root: &std::path::Path,
+    tasks: &mut SubtreeTasks,
+    changes: &ChangeSender,
+    stats: &mut FilesystemDiffStats,
+) -> Result<bool, StateError> {
+    let item_path = entry.to_path();
+    let from_path = from_match.path(&ctx.from.path, item.name.as_str());
+    let current_path = current_match
+        .as_ref()
+        .map_or_else(RelativePath::new, |(_, matched)| {
+            matched.path(&ctx.current.path, item.name.as_str())
+        });
+    let uncommitted = ctx.intent.marks_dirty() && !current_node_id.is_valid_node_id();
+    if uncommitted {
+        let probe = nested_probe
+            .get_or_insert_with(|| ctx.filesystem_path.to_absolute_path(repository_root));
+        if is_nested_repository_root(probe, item.name.as_str()).await {
+            lore_trace!("Discarding zombie entry for nested repository root {item_path}");
+            return Ok(false);
+        }
+    }
+    if staged == StagedEntry::Undeleted {
+        emit_add_node_single(
+            node_list.repository.clone(),
+            node_list.state.clone(),
+            from_named_node.node,
+            &item_path,
+            changes,
+            stats,
+        )
+        .await?;
+    } else if staged == StagedEntry::Settled {
+        // The node already carries its staged action; the descent below still runs.
+    } else if uncommitted {
+        emit_dirty_add_node_single(
+            node_list.repository.clone(),
+            node_list.state.clone(),
+            from_named_node.node,
+            &item_path,
+            changes,
+            stats,
+            ctx.intent,
+        )
+        .await?;
+    } else if is_rename {
+        let measured =
+            if from_node.address == current_node.address && from_node.mode == current_node.mode {
+                change::Flags::None
+            } else {
+                change::Flags::Modify
+            };
+        add_change(
+            NodeChangeState {
+                mapping: NodeMapping {
+                    repository: node_list.repository.clone(),
+                    state: node_list.state.clone(),
+                    path: from_path.clone(),
+                    node: from_named_node.node,
+                },
+                observed: None,
+                flags: NodeFlags::from_bits_retain(from_node.flags),
+                address: from_node.address,
+                mode: from_node.mode,
+            },
+            NodeChangeState {
+                mapping: NodeMapping {
+                    repository: current_node_list.repository.clone(),
+                    state: current_node_list.state.clone(),
+                    path: item_path.clone(),
+                    node: current_node_id,
+                },
+                observed: None,
+                flags: NodeFlags::from_bits_retain(current_node.flags),
+                address: current_node.address,
+                mode: current_node.mode,
+            },
+            FileAction::Move,
+            measured,
+            changes,
+            ctx.filter_mode,
+            item_states,
+        )
+        .await?;
+    } else if matches!(staged, StagedEntry::Compare { insisted: true }) {
+        settle_insisted_directory(
+            node_list,
+            from_named_node.node,
+            &from_node,
+            &item_path,
+            FileInfo::from_metadata(&item.metadata),
+            changes,
+            ctx.intent,
+            ctx.filter_mode,
+        )
+        .await?;
+    }
+    let from_item_states = ctx
+        .from
+        .repository
+        .filter
+        .child_excludes_tree(ctx.from_states, &from_path, true, ctx.filter_mode)
+        .0;
+    let repository_from = node_list.repository.clone();
+    let state_from = node_list.state.clone();
+    let repository_current = current_node_list.repository.clone();
+    let state_current = current_node_list.state.clone();
+    let subnode_from = from_named_node.node;
+    let current_is_link = current_node.is_link();
+    let (repository_current, state_current, subnode_current) = if current_is_link {
+        let link = current_node.linked_node();
+        let (linked_repository, state) = link
+            .resolve(repository_current.clone(), state_current.clone())
+            .await?;
+        (linked_repository, state, link.node)
+    } else {
+        (repository_current, state_current.clone(), current_node_id)
+    };
+    // Stay in the parent's link mounts when recursing into a normal
+    // sub-directory; reset when crossing into a linked state because
+    // those mount paths are in the parent tree, not the linked tree.
+    let link_mounts_recurse = if current_is_link {
+        Arc::new(vec![])
+    } else {
+        ctx.link_mounts.clone()
+    };
+    diff_filesystem_subtree_dispatch(
+        FilesystemDiffContext {
+            operation: ctx.operation.clone(),
+            from: NodeMapping {
+                repository: repository_from,
+                state: state_from,
+                path: from_path,
+                node: subnode_from,
+            },
+            current: NodeMapping {
+                repository: repository_current,
+                state: state_current,
+                path: current_path,
+                node: subnode_current,
+            },
+            filesystem_path: item_path,
+            states: item_states,
+            from_states: from_item_states,
+            filter_mode: ctx.filter_mode,
+            intent: ctx.intent,
+            discards: ctx.discards.clone(),
+            layer_mounts: ctx.layer_mounts.clone(),
+            link_mounts: link_mounts_recurse,
+        },
+        tasks,
+        changes,
+        stats,
+    )
+    .await?;
+
+    Ok(true)
+}
+
+/// Replaces a node whose type the file system changed, file to directory or back, for
+/// [`diff_filesystem_directory_walk`].
+#[allow(clippy::too_many_arguments)]
+async fn diff_filesystem_type_change(
+    ctx: &FilesystemDiffContext,
+    node_list: &StateChildrenNodes,
+    from_named_node: &StateNamedNode,
+    from_node: Node,
+    entry: &EntryPath<'_>,
+    item: &FileListItem,
+    item_states: FilterStates,
+    is_file: bool,
+    is_directory: bool,
+    nested_probe: &mut Option<std::path::PathBuf>,
+    repository_root: &std::path::Path,
+    tasks: &mut SubtreeTasks,
+    changes: &ChangeSender,
+    stats: &mut FilesystemDiffStats,
+) -> Result<(), StateError> {
+    // Type change: file <-> directory
+    let file_ctx = FileDiffContext {
+        repository_from: node_list.repository.clone(),
+        state_from: node_list.state.clone(),
+        from_node_id: from_named_node.node,
+        from_node: Some(from_node),
+        parent_node_id: Some(ctx.from.node),
+        intent: ctx.intent,
+        states: item_states,
+        observed: FileInfo::from_metadata(&item.metadata),
+        insists: false,
+    };
+
+    // Determine the type change direction
+    let compare_result = if is_file {
+        SingleFileCompareResult::TypeChangedToFile
+    } else {
+        SingleFileCompareResult::TypeChangedToDirectory
+    };
+
+    lore_trace!(
+        "Filesystem type (file/directory) differs for node {} in path {}, add delete and add changes",
+        from_named_node.node,
+        entry.path()
+    );
+
+    let replacement = handle_single_file_compare_result(
+        &file_ctx,
+        compare_result,
+        entry.path(),
+        None,
+        is_directory,
+        changes,
+        stats,
+        ctx.filter_mode,
+    )
+    .await?;
+
+    // A directory that replaced a file is walked against the node the replacement
+    // minted, so the content it holds is staged with it. A walk that only reports
+    // mints no node and walks it against an empty listing, so the content is reported
+    // as added and a reversed diff deletes it before the directory itself. A marking
+    // walk without a minted node stays out: its chain would resolve the path to the
+    // old file node and queue that node for discard. A nested repository root stays
+    // out too, as it does everywhere else in the walk: reported as added, a reversed
+    // diff would delete another repository's working files. A file that replaced a
+    // directory holds none.
+    let reports_without_node = !replacement.is_valid_node_id() && !ctx.intent.marks_dirty();
+    let nested_root = is_directory && reports_without_node && {
+        let probe = nested_probe
+            .get_or_insert_with(|| ctx.filesystem_path.to_absolute_path(repository_root));
+        is_nested_repository_root(probe, item.name.as_str()).await
+    };
+    if nested_root {
+        lore_trace!(
+            "Not descending into nested repository root {} that replaced a file",
+            entry.path()
+        );
+    }
+    if is_directory && (replacement.is_valid_node_id() || (reports_without_node && !nested_root)) {
+        let item_path = entry.to_path();
+        diff_filesystem_subtree_dispatch(
+            FilesystemDiffContext {
+                operation: ctx.operation.clone(),
+                from: NodeMapping {
+                    repository: ctx.from.repository.clone(),
+                    state: ctx.from.state.clone(),
+                    path: item_path.clone(),
+                    node: replacement,
+                },
+                current: NodeMapping {
+                    repository: ctx.current.repository.clone(),
+                    state: ctx.current.state.clone(),
+                    path: RelativePath::new(),
+                    node: INVALID_NODE,
+                },
+                filesystem_path: item_path,
+                states: item_states,
+                from_states: item_states,
+                filter_mode: ctx.filter_mode,
+                intent: ctx.intent,
+                discards: ctx.discards.clone(),
+                layer_mounts: ctx.layer_mounts.clone(),
+                link_mounts: ctx.link_mounts.clone(),
+            },
+            tasks,
+            changes,
+            stats,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Reports the nodes of `node_list` the listing did not match, for
+/// [`diff_filesystem_directory_walk`].
+async fn diff_filesystem_missing_nodes(
+    ctx: &FilesystemDiffContext,
+    node_list: &StateChildrenNodes,
+    current_node_list: &StateChildrenNodes,
+    node_list_found: &[bool],
+    staging: bool,
+    changes: &ChangeSender,
+    pending_discards: &mut Vec<NodeID>,
+) -> Result<(), StateError> {
     // Nodes that were not iterated are deleted in file system
     for (index, from_named_node) in node_list.children.iter().enumerate() {
         if node_list_found[index] {
@@ -1705,6 +1941,10 @@ async fn diff_filesystem_directory_walk(
             }
         }
 
+        if keeps_absent_link(&from_node.node, &from_node.path) {
+            continue;
+        }
+
         // Emit deletes only for the materialized portion of the subtree,
         // suppressing directories the filter merely descended through but never
         // wrote to disk (see emit_filesystem_subtree_deletes).
@@ -1721,6 +1961,7 @@ async fn diff_filesystem_directory_walk(
                 ctx.intent,
                 changes,
                 &mut pending,
+                &ctx.link_mounts,
             )
             .await?;
             continue;
@@ -1799,6 +2040,22 @@ async fn diff_filesystem_directory_walk(
         .await?;
     }
 
+    Ok(())
+}
+
+/// Reports the entries of the listing no node matched, walking below new directories, for
+/// [`diff_filesystem_directory_walk`].
+#[allow(clippy::too_many_arguments)]
+async fn diff_filesystem_new_entries(
+    ctx: &FilesystemDiffContext,
+    new_file_list: &[FileListItem],
+    nested_probe: &mut Option<std::path::PathBuf>,
+    repository_root: &std::path::Path,
+    staging: bool,
+    tasks: &mut SubtreeTasks,
+    changes: &ChangeSender,
+    stats: &mut FilesystemDiffStats,
+) -> Result<(), StateError> {
     // Remaining files/directories are added (all are children of node_path)
     'new_file_iter: for file in new_file_list.iter() {
         // For directory listing, new items are children
@@ -1836,7 +2093,7 @@ async fn diff_filesystem_directory_walk(
             if ctx
                 .link_mounts
                 .iter()
-                .any(|m| m.target_path == child_file_path.as_str())
+                .any(|m| m.target_path.as_str() == child_file_path.as_str())
             {
                 lore_trace!(
                     "Filesystem path {child_file_path} matches a link in the current state, skipping link-internal content"
@@ -1851,7 +2108,7 @@ async fn diff_filesystem_directory_walk(
             if let Some(mount) = ctx
                 .layer_mounts
                 .iter()
-                .find(|m| m.target_path == child_file_path.as_str())
+                .find(|m| m.target_path.as_str() == child_file_path.as_str())
             {
                 // A staging walk leaves the mount alone: the layer's own tree is staged by
                 // its own walk against its own state, and staging it from here as well
@@ -1888,6 +2145,7 @@ async fn diff_filesystem_directory_walk(
                         from_states: child_states,
                         filter_mode: ctx.filter_mode,
                         intent: ctx.intent,
+                        discards: ctx.discards.clone(),
                         // Non-overlapping layers: no nested mounts inside a layer.
                         layer_mounts: Arc::new(vec![]),
                         // Crossing into the layer state; parent's link mounts
@@ -1986,6 +2244,7 @@ async fn diff_filesystem_directory_walk(
                     from_states: dir_from_states,
                     filter_mode: ctx.filter_mode,
                     intent: ctx.intent,
+                    discards: ctx.discards.clone(),
                     layer_mounts: ctx.layer_mounts.clone(),
                     // Same parent state; deeper paths may still match a link.
                     link_mounts: ctx.link_mounts.clone(),
@@ -2028,10 +2287,6 @@ async fn diff_filesystem_directory_walk(
             ctx.filter_mode,
         )
         .await?;
-    }
-
-    while let Some(joined) = tasks.join_next().await {
-        diff_filesystem_subtree_merge_task(joined, stats)?;
     }
 
     Ok(())
@@ -2096,7 +2351,7 @@ fn diff_filesystem_subtree_merge_task(
 #[allow(clippy::too_many_arguments)]
 async fn diff_filesystem_single_file(
     ctx: FilesystemDiffContext,
-    file_item: util::fs::FileListItem,
+    file_item: crate::fs::os::FileListItem,
     changes: &ChangeSender,
 ) -> Result<FilesystemDiffStats, StateError> {
     let stats = FilesystemDiffStats::default();
@@ -2229,7 +2484,7 @@ async fn diff_filesystem_single_file(
 }
 
 /// Handle diff when filesystem path doesn't exist.
-/// Everything in state under this path is considered deleted.
+/// Everything in state under this path is considered deleted, bar what a link keeps.
 async fn diff_filesystem_missing(
     from: NodeMapping,
     filesystem_path: RelativePath,
@@ -2237,12 +2492,35 @@ async fn diff_filesystem_missing(
     filter_mode: FilterMode,
     intent: FilesystemDiffIntent,
     changes: &ChangeSender,
+    link_mounts: &[LinkMountInfo],
 ) -> Result<FilesystemDiffStats, StateError> {
     let stats = FilesystemDiffStats::default();
 
     // Add delete changes for all nodes under the from node
     if from.node.is_valid_node_id() {
         let from_node = from.state.node(from.repository.clone(), from.node).await?;
+
+        if keeps_absent_link(&from_node, &filesystem_path) {
+            return Ok(stats);
+        }
+
+        if LinkMountInfo::any_under(link_mounts, &from.path) {
+            emit_filesystem_subtree_deletes(
+                from.state.clone(),
+                from.repository.clone(),
+                from.node,
+                &from_node,
+                &from.path,
+                states,
+                filter_mode,
+                intent,
+                changes,
+                &mut Vec::new(),
+                link_mounts,
+            )
+            .await?;
+            return Ok(stats);
+        }
 
         lore_trace!(
             "Filesystem path {} does not exist, marking state node {} as deleted",
@@ -2313,9 +2591,27 @@ fn diff_filesystem_subtree_recurse<'a>(
 /// The module's entry, and what
 /// [`OsOperation`](crate::fs::os::OsOperation)'s
 /// `changes_from_filesystem_to_state` answers with.
-pub(crate) async fn diff_os_filesystem(
-    diff: FilesystemDiffContext,
+///
+/// A marking walk handed no queue for what it finds stale holds it on one of its own and
+/// discards it once the whole walk has drained, so no directory discards while another is
+/// still marking. Discarding is boxed as the cold path: most walks find nothing stale.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub(crate) fn diff_os_filesystem(
+    mut diff: FilesystemDiffContext,
     changes: &ChangeSender,
-) -> Result<FilesystemDiffStats, StateError> {
-    diff_filesystem_subtree_recurse(diff, changes).await
+) -> impl Future<Output = Result<FilesystemDiffStats, StateError>> + Send + '_ {
+    let owned = (diff.discards.is_none() && diff.intent.marks_dirty()).then(|| {
+        let discards = Arc::new(WalkDiscards::default());
+        diff.discards = Some(discards.clone());
+        discards
+    });
+    async move {
+        let stats = diff_filesystem_subtree_recurse(diff, changes).await?;
+        if let Some(discards) = owned.filter(|discards| !discards.is_empty()) {
+            Box::pin(discards.apply()).await?;
+        }
+        Ok(stats)
+    }
 }

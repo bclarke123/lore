@@ -54,7 +54,7 @@ mod tests {
         let mut changes: Vec<NodeChange> = vec![];
 
         let repository = new_test_context().await;
-        let state = Arc::new(State::new());
+        let state = State::new();
 
         let hashes = [
             Hash::from(rand::random::<[u8; 32]>()),
@@ -396,7 +396,7 @@ mod tests {
         let parent = new_test_context().await;
         let mounted = new_test_context().await;
         let unmounted = new_test_context().await;
-        let state = Arc::new(State::new());
+        let state = State::new();
 
         let link_side = |target: &Arc<RepositoryContext>| NodeChangeState {
             mapping: NodeMapping {
@@ -466,7 +466,7 @@ mod tests {
     #[tokio::test]
     async fn a_change_stands_at_the_path_of_the_side_it_resolves_to() {
         let repository = new_test_context().await;
-        let state = Arc::new(State::new());
+        let state = State::new();
 
         let side = |name: &str| NodeChangeState {
             mapping: NodeMapping {

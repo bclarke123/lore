@@ -31,12 +31,12 @@ pub fn get_lore_args_impl(input: &DeriveInput) -> TokenStream {
         #validate_text
 
         impl crate::args::InvokableLoreArgs for #name {
-            async fn invoke_local(
+            fn invoke_local(
                 self,
                 globals: LoreGlobalArgs,
                 callback: LoreEventCallback,
-            ) -> i32 {
-                #handler_fn_name (globals, self, callback).await
+            ) -> impl ::core::future::Future<Output = i32> + Send {
+                #handler_fn_name (globals, self, callback)
             }
         }
     }

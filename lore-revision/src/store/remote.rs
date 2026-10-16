@@ -6,7 +6,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use lore_error_set::prelude::*;
+use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
+use lore_storage::read::heal_on_receipt;
+use lore_storage::read::verify_receipt;
 use lore_transport::Admin;
 use lore_transport::Connection;
 use lore_transport::ProtocolError;
@@ -32,6 +35,8 @@ use crate::store::StoreGetData;
 use crate::store::StoreMatch;
 use crate::store::StoreMatchResult;
 
+/// An immutable store served by a remote over the storage protocol. The remote is an untrusted
+/// source: a payload it serves is checked against its address on receipt.
 pub struct RemoteImmutableStore {
     /// Remote address
     remote_url: String,
@@ -49,6 +54,17 @@ impl RemoteImmutableStore {
             remote_url: remote_url.to_string(),
             identity: identity.map(|url| url.to_string()),
             connections: Mutex::new(HashMap::new()),
+            admin: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// A store whose connection for `partition` is `connection`.
+    #[cfg(feature = "test-util")]
+    pub fn with_connection(partition: Partition, connection: Arc<Connection>) -> Self {
+        RemoteImmutableStore {
+            remote_url: String::new(),
+            identity: None,
+            connections: Mutex::new(HashMap::from([(partition, connection)])),
             admin: Mutex::new(HashMap::new()),
         }
     }
@@ -75,8 +91,9 @@ impl RemoteImmutableStore {
         let connection = self.connection(partition).await?;
         let correlation_id = execution_context().globals().correlation_id.to_string();
         connection
-            .session(partition, &correlation_id)
+            .session_pool(partition, &correlation_id)
             .await
+            .map(|pool| pool.pick())
             .forward_with(|| format!("creating session to remote store at {}", self.remote_url))
     }
 
@@ -104,6 +121,16 @@ impl RemoteImmutableStore {
                 .forward_with(|| format!("connecting to remote store at {}", self.remote_url))
         }
     }
+}
+
+/// `err` as an internal failure where the remote refused the connection or the request as
+/// unsupported. A read takes an internal failure as a miss, as it takes a remote it cannot reach,
+/// and fails on `NotSupported`, which it takes as a payload this build cannot decode.
+fn unsupported_as_internal(err: StoreError) -> StoreError {
+    if err.is_not_supported() {
+        return StoreError::internal_with_context(err, "remote refused the request as unsupported");
+    }
+    err
 }
 
 #[async_trait]
@@ -185,25 +212,45 @@ impl store::ImmutableStore for RemoteImmutableStore {
         }
     }
 
+    /// Serves the payload as the remote stored it, with the content its check on receipt expanded
+    /// ([`verify_receipt`]). A payload that fails the check is fetched again once where the remote
+    /// heals it ([`heal_on_receipt`]). It answers `NotSupported` only for a payload this build
+    /// cannot decode ([`unsupported_as_internal`]).
     async fn get(
         self: Arc<Self>,
         partition: Partition,
         address: Address,
     ) -> Result<StoreGetData, StoreError> {
-        let session = self.session(partition).await?;
-        let (fragment, payload) = session
-            .get(&address)
+        let session = self
+            .session(partition)
             .await
-            .forward::<StoreError>("Remote store get failed")?;
-        lore_storage::validate_fragment_payload(&fragment, payload.len())?;
-
-        // The peer answers exact addresses only, so anything it served was a full match.
-        Ok(StoreGetData {
-            fragment,
-            match_made: StoreMatch::MatchFull,
-            partition,
-            payload: Some(payload),
-        })
+            .map_err(unsupported_as_internal)?;
+        let mut heal_attempted = false;
+        loop {
+            let (fragment, payload) = session
+                .get(&address)
+                .await
+                .forward::<StoreError>("Remote store get failed")
+                .map_err(unsupported_as_internal)?;
+            match verify_receipt(fragment, payload.clone(), address) {
+                // The peer answers exact addresses only, so anything it served was a full match.
+                Ok(content) => {
+                    return Ok(StoreGetData {
+                        fragment,
+                        match_made: StoreMatch::MatchFull,
+                        partition,
+                        payload: Some(payload),
+                        content: Some(content),
+                    });
+                }
+                Err(err) => {
+                    if !heal_on_receipt(&session, address, &err, heal_attempted).await {
+                        return Err(err).forward_any::<StoreError>("checking a remote payload");
+                    }
+                    heal_attempted = true;
+                }
+            }
+        }
     }
 
     async fn put(
@@ -234,9 +281,10 @@ impl store::ImmutableStore for RemoteImmutableStore {
         source_address: Address,
         destination_partition: Partition,
         destination_context: Context,
-        // The remote service tracks durability on its own side; the local-flag bookkeeping that
-        // `durable` controls happens in the local-store leg of a composite copy.
-        _durable: bool,
+        // The remote service decides both for itself: durability is tracked on its own side, and
+        // it owns which of its peers the copy reaches. The local-flag bookkeeping the caller's
+        // behaviour describes happens in the local-store leg of a composite copy.
+        _behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
         let session = self.session(destination_partition).await?;
         session
@@ -336,8 +384,9 @@ impl RemoteMutableStore {
         drop(lock);
         let correlation_id = execution_context().globals().correlation_id.to_string();
         connection
-            .session(partition, &correlation_id)
+            .session_pool(partition, &correlation_id)
             .await
+            .map(|pool| pool.pick())
             .forward_with(|| format!("creating session to remote store at {}", self.remote_url))
     }
 }

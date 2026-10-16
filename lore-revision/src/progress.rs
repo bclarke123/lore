@@ -9,10 +9,10 @@ pub const DEFAULT_WORK_CHANNEL_CAPACITY: usize = 200_000;
 /// Ceiling on concurrently-spawned directory discovery tasks during a commit.
 ///
 /// Build-time tunable: start heavily parallel here and reduce by
-/// experimentation. Once this many directory tasks are live, deeper
-/// directories recurse inline instead of spawning, which bounds peak memory
+/// experimentation. Once this many directory tasks are live, a walk enters a
+/// deeper directory itself instead of spawning it, which bounds peak memory
 /// from discovery run-ahead (each live directory task pins a deserialized
-/// name-table block). Because overflow recurses inline rather than blocking on
+/// name-table block). Because overflow is walked inline rather than blocking on
 /// a permit, any value >= 1 is correct — it only trades parallelism for memory.
 pub const MAX_CONCURRENT_DIRECTORY_TASKS: usize = 10_000;
 

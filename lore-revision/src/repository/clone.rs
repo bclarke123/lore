@@ -13,11 +13,12 @@ use std::sync::atomic::Ordering;
 use dashmap::DashMap;
 use dashmap::DashSet;
 use dashmap::Entry;
+use futures::FutureExt;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::Notify;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -31,6 +32,7 @@ use super::RepositoryWriteToken;
 use super::SharedStoreToUseConfig;
 use super::VfsConfig;
 use super::get_dot_lore_path;
+use super::load_repository_config_from_dot_dir;
 use crate::branch;
 use crate::branch::BranchLatestStatus;
 use crate::dependency;
@@ -40,10 +42,13 @@ use crate::event::EventError;
 use crate::filter;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
-use crate::fs::filesystem_provider::FileInfo;
+use crate::fs::filesystem_provider::HoldOptions;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::create_empty_directory;
+use crate::fs::filesystem_provider::match_node_executable;
+use crate::fs::filesystem_provider::set_file_to_node;
+use crate::fs::hold;
 use crate::hash::hash_string_bytes;
 use crate::instance::InstanceId;
 use crate::interface::LoreArray;
@@ -177,7 +182,7 @@ impl Drop for RepositoryCloneGuard {
 
 /// Data for the event emitted when a clone starts.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryCloneBeginEventData {
     /// Identifier of the repository being cloned.
@@ -192,7 +197,7 @@ pub struct LoreRepositoryCloneBeginEventData {
 
 /// Progress counts for a clone operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryCloneCountData {
     /// Number of files finished.
@@ -235,16 +240,17 @@ impl LoreRepositoryCloneCountData {
 
 /// Data for the event emitted to report clone progress.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryCloneProgressEventData {
     /// Current progress counts.
     pub count: LoreRepositoryCloneCountData,
 }
 
-/// Data for the event emitted when a clone finishes.
+/// Data for the event emitted when a clone succeeds. A clone that fails sends no such event, and
+/// reports its outcome on the complete event as every clone does.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryCloneEndEventData {
     /// Name of the branch that was cloned.
@@ -333,6 +339,10 @@ pub struct CloneOptions {
     pub dependency_recursive: bool,
     /// Maximum dependency traversal depth. 0 means unlimited.
     pub dependency_depth_limit: u32,
+    /// Where the clone writes its files, cache every file metadata block of the cloned revision,
+    /// which staging and committing write to, so both work without the remote, and fail the clone
+    /// if that fails.
+    pub cache_file_metadata: bool,
 }
 
 pub struct CloneWorkItem {
@@ -461,8 +471,9 @@ impl BlockDiscoverDispatcher {
             Err(mpsc::error::TrySendError::Full(item)) => {
                 let dispatcher = Arc::clone(self);
                 lore_spawn!(async move {
-                    if tx.send(item).await.is_err() {
-                        dispatcher.item_complete();
+                    match tx.reserve().await {
+                        Ok(permit) => permit.send(item),
+                        Err(_closed) => dispatcher.item_complete(),
                     }
                 });
             }
@@ -568,94 +579,93 @@ async fn process_block_item(
         node.walk_step(current_node_id, expected_parent, &mut cycle)
             .forward::<CloneError>("invalid node hierarchy in revision state")?;
 
-        let node_name = block
-            .node_name_ref(node_index)
+        if let Some(node_name) = block
+            .node_name_ref_or_skip(node_index, current_node_id)
             .forward::<CloneError>("Failed to deserialize node name")?
-            .freeze();
+        {
+            let node_name = node_name.freeze();
+            if node_name.is_empty() {
+                return Err(CloneError::internal("Failed to deserialize node name"));
+            }
 
-        if node_name.is_empty() {
-            return Err(CloneError::internal("Failed to deserialize node name"));
-        }
+            let node_path = item.repository_path.join(&node_name);
 
-        let node_path = item.repository_path.join(&node_name);
+            let (node_states, excluded) = dispatcher.repository.filter.child_emit_excludes(
+                item.states,
+                &node_path,
+                node.is_directory(),
+                FilterMode::View,
+            );
+            if !excluded {
+                visited_child = true;
+                if node.is_file() {
+                    dispatcher
+                        .stats
+                        .discovery
+                        .total_files
+                        .fetch_add(1, Ordering::Relaxed);
+                    dispatcher
+                        .stats
+                        .discovery
+                        .total_bytes
+                        .fetch_add(node.size, Ordering::Relaxed);
 
-        let (node_states, excluded) = dispatcher.repository.filter.child_emit_excludes(
-            item.states,
-            &node_path,
-            node.is_directory(),
-            FilterMode::View,
-        );
-        if !excluded {
-            visited_child = true;
-            if node.is_file() {
-                dispatcher
-                    .stats
-                    .discovery
-                    .total_files
-                    .fetch_add(1, Ordering::Relaxed);
-                dispatcher
-                    .stats
-                    .discovery
-                    .total_bytes
-                    .fetch_add(node.size, Ordering::Relaxed);
-
-                if dispatcher
-                    .file_tx
-                    .send(CloneWorkItem {
+                    let Ok(permit) = dispatcher.file_tx.reserve().await else {
+                        // Receiver dropped, consumer encountered an error
+                        return Err(CloneError::internal("Recursion task failed"));
+                    };
+                    permit.send(CloneWorkItem {
                         repository: dispatcher.repository.clone(),
                         node,
                         repository_path: node_path,
-                    })
-                    .await
-                    .is_err()
-                {
-                    // Receiver dropped, consumer encountered an error
-                    return Err(CloneError::internal("Recursion task failed"));
-                }
-            } else if node.is_link() {
-                if dispatcher.is_shutdown() {
-                    dispatcher.item_complete();
-                    return Ok(());
-                }
-                dispatcher.inner.pending.fetch_add(1, Ordering::AcqRel);
-
-                let d = Arc::clone(dispatcher);
-                let link_node = node;
-                let link_ctx = CloneContext {
-                    repository: dispatcher.repository.clone(),
-                    state: dispatcher.state.clone(),
-                    operation: dispatcher.operation.clone(),
-                    options: dispatcher.options.clone(),
-                    stats: dispatcher.stats.clone(),
-                    modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
-                };
-                let link_tx = dispatcher.file_tx.clone();
-                lore_spawn!(async move {
-                    let result = clone_discover_link(link_ctx, link_node, node_path, link_tx).await;
-                    if let Err(err) = result {
-                        d.set_error(err);
-                    }
-                    d.item_complete();
-                });
-            } else if node.is_directory() {
-                if execution_context().globals().dry_run() {
-                    lore_info!("{}", node_path);
-                }
-
-                if let Some(first_child) = node.child() {
-                    dispatcher.dispatch(BlockDiscoverItem {
-                        node_id: first_child,
-                        expected_parent: current_node_id,
-                        repository_path: node_path,
-                        states: node_states,
-                        dep_context: None,
-                        follow_deps: false,
-                        depth: 0,
-                        cycle: SiblingCycleGuard::new(current_node_id),
-                        visited_child: false,
                     });
-                } else if !execution_context().globals().dry_run() {
-                    create_empty_directory::<CloneError>(&dispatcher.operation, &node_path).await?;
+                } else if node.is_link() {
+                    if dispatcher.is_shutdown() {
+                        dispatcher.item_complete();
+                        return Ok(());
+                    }
+                    dispatcher.inner.pending.fetch_add(1, Ordering::AcqRel);
+
+                    let d = Arc::clone(dispatcher);
+                    let link_node = node;
+                    let link_ctx = CloneContext {
+                        repository: dispatcher.repository.clone(),
+                        state: dispatcher.state.clone(),
+                        operation: dispatcher.operation.clone(),
+                        options: dispatcher.options.clone(),
+                        stats: dispatcher.stats.clone(),
+                        modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
+                    };
+                    let link_tx = dispatcher.file_tx.clone();
+                    lore_spawn!(async move {
+                        let result =
+                            clone_discover_link(link_ctx, link_node, node_path, link_tx).await;
+                        if let Err(err) = result {
+                            d.set_error(err);
+                        }
+                        d.item_complete();
+                    });
+                } else if node.is_directory() {
+                    if execution_context().globals().dry_run() {
+                        lore_info!("{}", node_path);
+                    }
+
+                    if let Some(first_child) = node.child() {
+                        dispatcher.dispatch(BlockDiscoverItem {
+                            node_id: first_child,
+                            expected_parent: current_node_id,
+                            repository_path: node_path,
+                            states: node_states,
+                            dep_context: None,
+                            follow_deps: false,
+                            depth: 0,
+                            cycle: SiblingCycleGuard::new(current_node_id),
+                            visited_child: false,
+                        });
+                    } else if !execution_context().globals().dry_run() {
+                        create_empty_directory::<CloneError>(&dispatcher.operation, &node_path)
+                            .await?;
+                    }
                 }
             }
         }
@@ -728,18 +738,14 @@ async fn process_block_item_dependency(
             .total_bytes
             .fetch_add(node.size, Ordering::Relaxed);
 
-        if dispatcher
-            .file_tx
-            .send(CloneWorkItem {
-                repository: dispatcher.repository.clone(),
-                node,
-                repository_path: item.repository_path.clone(),
-            })
-            .await
-            .is_err()
-        {
+        let Ok(permit) = dispatcher.file_tx.reserve().await else {
             return Err(CloneError::internal("Recursion task failed"));
-        }
+        };
+        permit.send(CloneWorkItem {
+            repository: dispatcher.repository.clone(),
+            node,
+            repository_path: item.repository_path.clone(),
+        });
     }
 
     // Only load and follow dependencies when this item is marked to do so.
@@ -865,7 +871,10 @@ pub async fn clone(
 
     let existing_dot_dir = get_dot_lore_path(path)?;
     if existing_dot_dir.exists() {
-        if call.force() {
+        let existing_repository_is_swfs =
+            load_repository_config_from_dot_dir(existing_dot_dir.as_path())
+                .is_ok_and(|config| config.is_swfs());
+        if call.force() && !existing_repository_is_swfs {
             lore_io::IoDriver::global()
                 .remove_dir_all(existing_dot_dir.as_path())
                 .await
@@ -1013,6 +1022,45 @@ pub async fn clone(
 
     let (repository, prefetched_branch) = tokio::try_join!(local_init_fut, prefetch_branch_fut)?;
 
+    clone_into(
+        repository,
+        remote,
+        repository_metadata,
+        prefetched_branch,
+        path,
+        revision,
+        view,
+        layer,
+        options,
+        &mut repository_path_guard,
+    )
+    .await
+}
+
+/// Completes [`clone`] once the repository exists locally and its branch is fetched: applies the
+/// view, resolves the revision and layer, records the branch and materializes the tree.
+///
+/// Sends the clone end event only for a clone that succeeded. A failure to materialize the tree
+/// is reported ahead of a failure to record the branch or to finish the operation.
+///
+/// A function of its own because its locals live across several awaits: kept in [`clone`] they
+/// would take space in its future while the repository is created as well.
+#[allow(clippy::too_many_arguments)]
+async fn clone_into(
+    repository: Arc<RepositoryContext>,
+    remote: Arc<lore_transport::Connection>,
+    repository_metadata: repository::RepositoryMetadata,
+    prefetched_branch: Option<branch::BranchStatus>,
+    path: &Path,
+    revision: Option<String>,
+    view: Option<&Path>,
+    layer: Option<CloneLayer>,
+    options: CloneOptions,
+    repository_path_guard: &mut RepositoryCloneGuard,
+) -> Result<(), CloneError> {
+    let context = execution_context();
+    let call = context.globals();
+
     let mut dot_directory_guard =
         RepositoryCloneGuard::new(repository.dot_dir_path()?, call.dry_run());
 
@@ -1125,7 +1173,7 @@ pub async fn clone(
         );
 
         lore_info!("Resolving layer revisions");
-        let module = Arc::new(repository.to_layer_context(repository_id).await);
+        let module = repository.to_layer_context(repository_id).await;
         let layer_latest = layer::latest_revision(module.clone(), branch_id)
             .await
             .forward::<CloneError>("Failed to get layer latest revision")?;
@@ -1154,6 +1202,7 @@ pub async fn clone(
             );
         }
     }
+    refuse_on_held_state(&repository, &options, revision)?;
 
     let (state, metadata) = tokio::try_join!(
         async {
@@ -1249,7 +1298,7 @@ pub async fn clone(
     let _ = repository.flush(call.sync_data()).await;
 
     let operation_result = operation
-        .finalize(true)
+        .finalize()
         .await
         .forward::<CloneError>("Finishing operation");
 
@@ -1262,6 +1311,8 @@ pub async fn clone(
         let _ = task.await;
     }
 
+    materialize_result.and(store_result).and(operation_result)?;
+
     event::LoreEvent::RepositoryCloneEnd(LoreRepositoryCloneEndEventData {
         branch: branch_name.into(),
         revision,
@@ -1269,7 +1320,7 @@ pub async fn clone(
     })
     .send();
 
-    operation_result.and(materialize_result.and(store_result))
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1283,6 +1334,52 @@ pub struct CloneContext {
     pub modified_times: Arc<state::RecordedModifiedTimes>,
 }
 
+/// Refuses a clone of `revision` restricted to a dependency set onto a provider that holds its
+/// state in a `State` ([`FilesystemProvider::holds_state`](crate::fs::filesystem_provider::FilesystemProvider::holds_state)),
+/// which holds whole revisions. A bare clone, or one of an empty repository, writes no tree, so it
+/// is refused nothing.
+#[lore_macro::test_pub]
+fn refuse_on_held_state(
+    repository: &RepositoryContext,
+    options: &CloneOptions,
+    revision: Hash,
+) -> Result<(), CloneError> {
+    if options.bare
+        || revision.is_zero()
+        || options.root_files.is_empty()
+        || !repository.file_system().holds_state()
+    {
+        return Ok(());
+    }
+    Err(hold::refused("restrict a clone to a dependency set").into())
+}
+
+/// Hands `ctx.state` to the operation to hold ([`InstanceOperationImpl::hold_state`]), for a
+/// provider that holds its state in a `State` ([`InstanceOperationImpl::holds_state`]).
+///
+/// A bare clone, or one of an empty repository, hands it nothing, as either writes no tree, and
+/// so does a dry run.
+#[lore_macro::test_pub]
+async fn clone_materialize_hold(ctx: &CloneContext) -> Result<(), CloneError> {
+    if ctx.options.bare || ctx.state.revision().is_zero() {
+        return Ok(());
+    }
+    if execution_context().globals().dry_run() {
+        return Ok(());
+    }
+    ctx.operation
+        .hold_state(
+            ctx.repository.clone(),
+            ctx.state.clone(),
+            HoldOptions::default(),
+        )
+        .await
+        .forward::<CloneError>("Holding the cloned revision")
+}
+
+/// Materializes `revision` in the working tree and records it, and `branch_id`, as the instance's
+/// current state, which it records whether or not materializing succeeded. A failure to
+/// materialize is reported ahead of a failure to record the state.
 async fn clone_materialize(
     ctx: CloneContext,
     remote: Arc<lore_transport::Connection>,
@@ -1299,7 +1396,9 @@ async fn clone_materialize(
     let mut clone_result = Ok(());
     let mut cache_task = None;
 
-    if !options.bare && !revision.is_zero() {
+    if ctx.operation.holds_state() {
+        clone_materialize_hold(&ctx).await?;
+    } else if !options.bare && !revision.is_zero() {
         lore_info!("Pull state {revision}");
         let correlation_id = execution_context().globals().correlation_id.to_string();
         let _storage = remote
@@ -1325,8 +1424,11 @@ async fn clone_materialize(
 
         let cache_repository = repository.clone();
         let cache_state = state.clone();
+        let cache_file_metadata = options.cache_file_metadata;
         cache_task = Some(lore_spawn!(async move {
-            let _ = cache_state.cache_fragments(cache_repository).await;
+            cache_state
+                .cache_fragments(cache_repository, cache_file_metadata)
+                .await
         }));
 
         clone_result = clone_in_path(ctx).await;
@@ -1338,20 +1440,32 @@ async fn clone_materialize(
     .send();
 
     if let Some(task) = cache_task {
-        let _ = task.await;
+        let cached = task.await;
+        if options.cache_file_metadata {
+            clone_result = clone_result.and_then(|()| {
+                cached
+                    .internal("Caching the cloned state")?
+                    .forward("Failed to cache file metadata for working offline")
+            });
+        }
     }
 
-    crate::instance::store_current_anchor_branch(&repository, branch_id)
-        .await
-        .forward::<CloneError>("Failed to write current state anchor to repository")?;
-    crate::instance::store_current_anchor(&repository, revision)
-        .await
-        .forward::<CloneError>("Failed to write current state anchor to repository")?;
+    let anchor_result = async {
+        crate::instance::store_current_anchor_branch(&repository, branch_id).await?;
+        crate::instance::store_current_anchor(&repository, revision).await
+    }
+    .await
+    .forward::<CloneError>("Failed to write current state anchor to repository");
 
-    clone_result
+    clone_result.and(anchor_result)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Writes the files of `ctx.state` to the working tree, discovering them in one task and writing
+/// them in another.
+///
+/// A failure to write a file is reported ahead of a failure in discovery. Discovery fails once
+/// writing stops taking files, so its error is then a result of the failure to write.
+#[lore_macro::test_pub]
 async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
     let (file_tx, file_rx) = mpsc::channel(DEFAULT_WORK_CHANNEL_CAPACITY);
 
@@ -1462,8 +1576,10 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
     let consumer = lore_spawn!(async move { clone_execute(file_rx, ctx).await });
 
     let (producer_result, consumer_result) = tokio::join!(producer, consumer);
-    producer_result.internal("Recursion task failed")??;
-    consumer_result.internal("Recursion task failed")??;
+    let producer_result = producer_result.internal("Recursion task failed")?;
+    let consumer_result = consumer_result.internal("Recursion task failed")?;
+    consumer_result?;
+    producer_result?;
 
     Ok(())
 }
@@ -1584,29 +1700,10 @@ pub async fn clone_execute(
             repository: item.repository,
             ..ctx.clone()
         };
-        lore_spawn!(tasks, async move {
-            let _permit = permit;
-            let stats = item_ctx.stats.clone();
-            stats.complete.file_count.fetch_add(1, Ordering::Relaxed);
-            stats.file_inflight_count.fetch_add(1, Ordering::Relaxed);
-            let mut retry = lore_base::retry::retry(500, 5_000, CLONE_FILE_RETRIES);
-            let result = loop {
-                match clone_file(item_ctx.clone(), item.node, item.repository_path.clone()).await {
-                    Err(err) if is_transient_clone_error(&err) => {
-                        if !retry.wait().await {
-                            break Err(err);
-                        }
-                        lore_debug!(
-                            "Retrying {} after transient failure: {err}",
-                            item.repository_path
-                        );
-                    }
-                    result => break result,
-                }
-            };
-            stats.file_inflight_count.fetch_sub(1, Ordering::Relaxed);
-            result
-        });
+        lore_spawn!(
+            tasks,
+            clone_file(item_ctx, item.node, item.repository_path, permit)
+        );
 
         // A failed file must not stop the rest of the tree: every other file
         // still lands, and the shortfall is reported once at the end.
@@ -1749,6 +1846,7 @@ fn clone_child_node(
 
 /// Ensure the parent directory of `path` exists; second and later files under the same parent hit the `DashSet` cache and skip the syscall.
 /// A parent that already exists but cannot be created over — the clone root on a container bind mount, a drive root, an ACL'd share — counts as success.
+#[lore_macro::test_pub]
 async fn ensure_parent_dir(
     repository_path: &RelativePath,
     operation: &Arc<InstanceOperationImpl>,
@@ -1779,32 +1877,21 @@ async fn ensure_parent_dir(
     Ok(())
 }
 
-/// Sets the executable bit at `path` to what `node` holds, where the filesystem reported
-/// a bit to compare against. A platform that reports none leaves the file alone.
-async fn match_node_executable(
-    operation: &Arc<InstanceOperationImpl>,
-    path: &RelativePath,
-    node: &Node,
-    file_info: &FileInfo,
-) -> Result<(), CloneError> {
-    let node_executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
-    if file_info
-        .executable()
-        .is_some_and(|observed| observed != node_executable)
-    {
-        operation
-            .make_executable(path, node_executable)
-            .await
-            .forward_with::<CloneError, _>(|| format!("Failed to clone file {path}"))?;
-    }
-    Ok(())
-}
-
-async fn clone_file(
+/// Writes `node` to `repository_path`, or retains the file there when it holds the node.
+///
+/// Returns the modified time entry of a file written, or retained with a time older than the
+/// operation's clock floor ([`InstanceOperationImpl::clock_floor`]), which a comparison reads before
+/// reading the file; `None`
+/// for any other retained file, one a dry run would write, or one `ignore_existing` leaves in
+/// place. Counts the file as in flight, and holds `permit`, until it is done. Not an `async fn`,
+/// which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn clone_file(
     ctx: CloneContext,
     node: Node,
     repository_path: RelativePath,
-) -> Result<Option<(Hash, u64)>, CloneError> {
+    permit: OwnedSemaphorePermit,
+) -> impl Future<Output = Result<Option<(Hash, u64)>, CloneError>> {
     let CloneContext {
         repository,
         operation,
@@ -1812,42 +1899,129 @@ async fn clone_file(
         stats,
         ..
     } = ctx;
+    stats.complete.file_count.fetch_add(1, Ordering::Relaxed);
+    stats.file_inflight_count.fetch_add(1, Ordering::Relaxed);
+    let inflight = stats.clone();
 
-    let context = execution_context();
-    let call = context.globals();
-    let force = call.force();
-    let file_info = operation.file_info(&repository_path).await;
-    if let Ok(file_info) = file_info
-        && file_info.exists()
-    {
-        if options.ignore_existing {
-            lore_trace!("Ignore existing file {}", repository_path);
-            return Ok(None);
+    async move {
+        let context = execution_context();
+        let call = context.globals();
+        let force = call.force();
+        let file_info = operation.file_info(&repository_path).await;
+        if let Ok(file_info) = file_info
+            && file_info.exists()
+        {
+            if options.ignore_existing {
+                lore_trace!("Ignore existing file {}", repository_path);
+                return Ok(None);
+            }
+
+            // Check if the existing file matches what we will realize from state. Only an
+            // established match retains the file: a file that cannot be read settles nothing, and
+            // keeping it would leave content nobody compared standing in for the node.
+            let matches_node = matches!(
+                file_modification(
+                    repository.clone(),
+                    &node,
+                    file_info.mtime(),
+                    file_info.size(),
+                    &repository_path,
+                    force,
+                    &operation,
+                    &lore_storage::ContentHashes::default(),
+                )
+                .await,
+                Ok(FileModification::UnmodifiedByMtime | FileModification::UnmodifiedByHash)
+            );
+            if matches_node {
+                // Existing file is identical, just use it
+                match_node_executable::<CloneError>(
+                    &operation,
+                    &repository_path,
+                    &node,
+                    &file_info,
+                )
+                .await?;
+
+                lore_trace!("Retain {}", repository_path);
+                stats.complete.file_retain.fetch_add(1, Ordering::Relaxed);
+                stats.complete.file_complete.fetch_add(1, Ordering::Relaxed);
+                let floor = operation.clock_floor(&repository).await;
+                return Ok((file_info.mtime() < floor).then(|| {
+                    state::file_modified_time_entry(
+                        &repository,
+                        &repository_path,
+                        file_info.mtime(),
+                    )
+                }));
+            }
+            if !force {
+                lore_error!(
+                    "File already exist in file system and not identical {}",
+                    repository_path
+                );
+                return Err(CloneError::internal(format!(
+                    "File already exist in file system: {repository_path}"
+                )));
+            }
+            if !call.dry_run() {
+                let mut retry = util::fs::file_unlink_retry();
+
+                while let Err(err) = operation.remove_recursive(&repository_path).await {
+                    lore_trace!(
+                        "Unable to unlink local directory {}: {} (attempt {} of {})",
+                        repository_path,
+                        err,
+                        retry.counter() + 1,
+                        retry.limit()
+                    );
+                    if !retry.wait().await {
+                        return Err(CloneError::internal(format!(
+                            "Failed to force delete existing file {repository_path}"
+                        )));
+                    }
+                }
+            }
+            stats.complete.file_replace.fetch_add(1, Ordering::Relaxed);
+            lore_trace!("Replace {}", repository_path);
+        } else {
+            lore_trace!("Create {}", repository_path);
         }
 
-        // Check if the existing file matches what we will realize from state. Only an
-        // established match retains the file: a file that cannot be read settles nothing, and
-        // keeping it would leave content nobody compared standing in for the node.
-        let matches_node = matches!(
-            file_modification(
-                repository.clone(),
-                &node,
-                file_info.mtime(),
-                file_info.size(),
-                &repository_path,
-                force,
-                &operation,
-                &lore_storage::ContentHashes::default(),
-            )
-            .await,
-            Ok(FileModification::UnmodifiedByMtime | FileModification::UnmodifiedByHash)
-        );
-        if matches_node {
-            // Existing file is identical, just use it
-            match_node_executable(&operation, &repository_path, &node, &file_info).await?;
+        if !call.dry_run() {
+            // Discovery no longer pre-creates dirs; create per-file parent just-in-time via the cache.
+            ensure_parent_dir(&repository_path, &operation, &stats).await?;
 
-            lore_trace!("Retain {}", repository_path);
-            stats.complete.file_retain.fetch_add(1, Ordering::Relaxed);
+            // A remote read can fail transiently (server shedding load, a QUIC
+            // reconnect mid-transfer); retry the file before giving up on it.
+            let mut retry = lore_base::retry::retry(500, 5_000, CLONE_FILE_RETRIES);
+            let (fragment, file_info) = loop {
+                match set_file_to_node::<CloneError>(
+                    &operation,
+                    repository.clone(),
+                    &node,
+                    &repository_path,
+                )
+                .await
+                {
+                    Err(err) if is_transient_clone_error(&err) => {
+                        if !retry.wait().await {
+                            return Err(err);
+                        }
+                        lore_debug!("Retrying {repository_path} after transient failure: {err}");
+                    }
+                    result => break result?,
+                }
+            };
+            stats
+                .complete
+                .bytes_transferred
+                .fetch_add(fragment.size_content, Ordering::Relaxed);
+
+            // Compute the (mtime_key, mtime) pair and return it; the caller
+            // (`clone_execute`) collects pairs in a stack-local buffer and
+            // fire-and-forgets a batched mutable-store write when the buffer fills,
+            // so each `clone_file` task avoids awaiting its own bucket write.
             stats.complete.file_complete.fetch_add(1, Ordering::Relaxed);
             return Ok(Some(state::file_modified_time_entry(
                 &repository,
@@ -1855,131 +2029,49 @@ async fn clone_file(
                 file_info.mtime(),
             )));
         }
-        if !force {
-            lore_error!(
-                "File already exist in file system and not identical {}",
-                repository_path
-            );
-            return Err(CloneError::internal(format!(
-                "File already exist in file system: {repository_path}"
-            )));
-        }
-        if !call.dry_run() {
-            let mut retry = util::fs::file_unlink_retry();
 
-            while let Err(err) = operation.remove_recursive(&repository_path).await {
-                lore_trace!(
-                    "Unable to unlink local directory {}: {} (attempt {} of {})",
-                    repository_path,
-                    err,
-                    retry.counter() + 1,
-                    retry.limit()
-                );
-                if !retry.wait().await {
-                    return Err(CloneError::internal(format!(
-                        "Failed to force delete existing file {repository_path}"
-                    )));
-                }
-            }
-        }
-        stats.complete.file_replace.fetch_add(1, Ordering::Relaxed);
-        lore_trace!("Replace {}", repository_path);
-    } else {
-        lore_trace!("Create {}", repository_path);
-    }
-
-    if !call.dry_run() {
-        // Discovery no longer pre-creates dirs; create per-file parent just-in-time via the cache.
-        ensure_parent_dir(&repository_path, &operation, &stats).await?;
-
-        // `read_into_file` returns the file's metadata when its single-fragment
-        // path captures it on the open write handle; on that path we skip the
-        // post-write stat entirely. Multi-fragment and zero-size paths
-        // still need a separate metadata query.
-        let captured_file_info = if node.size > 0 {
-            let (fragment, file_info) = operation
-                .set_file_to_immutable_store_contents(repository.clone(), &node, &repository_path)
-                .await
-                .forward_with::<CloneError, _>(|| {
-                    format!("Failed to clone file {repository_path}")
-                })?;
-            stats
-                .complete
-                .bytes_transferred
-                .fetch_add(fragment.size_content, Ordering::Relaxed);
-            file_info
-        } else {
-            // Zero sized file, just create
-            operation
-                .create_file(&repository_path)
-                .await
-                .forward_with::<CloneError, _>(|| {
-                    format!("Failed to clone file {repository_path}")
-                })?;
-            None
-        };
-
-        let file_info = if let Some(file_info) = captured_file_info {
-            file_info
-        } else {
-            operation
-                .file_info(&repository_path)
-                .await
-                .forward_with::<CloneError, _>(|| {
-                    format!("Failed to clone file {repository_path}")
-                })?
-        };
-
-        match_node_executable(&operation, &repository_path, &node, &file_info).await?;
-
-        // Compute the (mtime_key, mtime) pair and return it; the caller
-        // (`clone_execute`) collects pairs in a stack-local buffer and
-        // fire-and-forgets a batched mutable-store write when the buffer fills,
-        // so each `clone_file` task avoids awaiting its own bucket write.
         stats.complete.file_complete.fetch_add(1, Ordering::Relaxed);
-        return Ok(Some(state::file_modified_time_entry(
-            &repository,
-            &repository_path,
-            file_info.mtime(),
-        )));
+
+        Ok(None)
     }
-
-    stats.complete.file_complete.fetch_add(1, Ordering::Relaxed);
-
-    Ok(None)
+    .map(move |result| {
+        inflight.file_inflight_count.fetch_sub(1, Ordering::Relaxed);
+        drop(permit);
+        result
+    })
 }
 
-async fn spawn_clone_file(
+/// Spawns [`clone_file`] once a file permit is free. The task records the file's modified time
+/// itself, as the tasks of `clone_node` return none.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn spawn_clone_file(
     tasks: &mut JoinSet<Result<(), CloneError>>,
     ctx: CloneContext,
     node: Node,
     repository_path: RelativePath,
-) {
-    let spawn_ctx = ctx.clone();
-    let CloneContext { stats, .. } = ctx;
-    let permit = Arc::clone(&stats.file_inflight)
-        .acquire_owned()
-        .await
-        .expect("file_inflight semaphore closed unexpectedly");
-    let modified_times = spawn_ctx.modified_times.clone();
-    lore_spawn!(tasks, async move {
-        let _permit = permit;
-        stats.complete.file_count.fetch_add(1, Ordering::Relaxed);
-        stats.file_inflight_count.fetch_add(1, Ordering::Relaxed);
-        let result = clone_file(spawn_ctx, node, repository_path).await;
-        stats.file_inflight_count.fetch_sub(1, Ordering::Relaxed);
-        // Link sub-clones don't share the consumer-loop mtime batch; small
-        // workload, so just inline-store the mtime here. Result is squashed
-        // back to `()` so the JoinSet shape stays the same as elsewhere.
-        match result {
-            Ok(Some(entry)) => {
-                modified_times.push(entry);
-                Ok(())
-            }
-            Ok(None) => Ok(()),
-            Err(err) => Err(err),
-        }
-    });
+) -> impl Future<Output = ()> + '_ {
+    async move {
+        let permit = Arc::clone(&ctx.stats.file_inflight)
+            .acquire_owned()
+            .await
+            .expect("file_inflight semaphore closed unexpectedly");
+        let modified_times = ctx.modified_times.clone();
+        lore_spawn!(
+            tasks,
+            clone_file(ctx, node, repository_path, permit).map(move |result| {
+                match result {
+                    Ok(Some(entry)) => {
+                        modified_times.push(entry);
+                        Ok(())
+                    }
+                    Ok(None) => Ok(()),
+                    Err(err) => Err(err),
+                }
+            })
+        );
+    }
 }
 
 fn spawn_clone_link(
@@ -2111,241 +2203,3 @@ urc_repository_clone_module_in_path(urc_repository_t* repository, urc_state_t* s
     return err;
 }
 */
-
-#[cfg(test)]
-// Fixture setup builds and permissions files directly rather than through the driver: what these
-// tests exercise is how clone reacts to a filesystem in a given state, not how that state is
-// reached.
-#[allow(clippy::disallowed_methods)]
-mod tests {
-    use lore_base::test_util::TempDir;
-
-    use super::*;
-    use crate::fs::filesystem_provider::FilesystemProvider;
-    use crate::fs::os::OsFilesystem;
-
-    async fn create_operation() -> (TempDir, Arc<InstanceOperationImpl>) {
-        let temp = TempDir::new("lore-clone-temp-path-");
-        let os_filesystem = OsFilesystem::new(temp.path());
-        let operation = <OsFilesystem as FilesystemProvider>::begin_operation(&os_filesystem)
-            .await
-            .expect("Starting test operation");
-        (temp, operation)
-    }
-
-    fn relative_path(path: &str) -> RelativePath {
-        RelativePath::new_from_initial_path(path).expect("Relative path")
-    }
-
-    /// Where `path` is under the root the test operation was opened on, for the fixtures that
-    /// build filesystem state directly rather than through it.
-    fn on_disk(temp: &TempDir, path: &RelativePath) -> std::path::PathBuf {
-        temp.path().join(path.as_str())
-    }
-
-    #[tokio::test]
-    async fn ensure_parent_dir_creates_missing_ancestors() {
-        let (temp, operation) = create_operation().await;
-        let file = relative_path("nested/deeper/file.txt");
-        let stats = CloneStats::default();
-
-        ensure_parent_dir(&file, &operation, &stats)
-            .await
-            .expect("missing parent should be created");
-
-        assert!(on_disk(&temp, &file.parent_path()).is_dir());
-    }
-
-    /// The clone root already exists and is not ours to create: files at the top of the tree
-    /// take it as their parent, so this must not fail the clone.
-    #[tokio::test]
-    async fn ensure_parent_dir_accepts_existing_parent() {
-        let (_temp, operation) = create_operation().await;
-        let file = relative_path("file.txt");
-        let stats = CloneStats::default();
-
-        ensure_parent_dir(&file, &operation, &stats)
-            .await
-            .expect("existing parent should not fail");
-    }
-
-    #[tokio::test]
-    async fn ensure_parent_dir_caches_parent_once_per_path() {
-        let (_temp, operation) = create_operation().await;
-        let stats = CloneStats::default();
-        let first = relative_path("dir/a.txt");
-        let second = relative_path("dir/b.txt");
-
-        ensure_parent_dir(&first, &operation, &stats)
-            .await
-            .expect("first file should create the parent");
-        ensure_parent_dir(&second, &operation, &stats)
-            .await
-            .expect("sibling should hit the cache");
-
-        assert_eq!(stats.created_parents.len(), 1);
-    }
-
-    /// Tolerating an existing parent must not extend to tolerating a real failure: a file
-    /// sitting where the parent directory belongs still has to abort the clone.
-    #[tokio::test]
-    async fn ensure_parent_dir_rejects_parent_that_is_a_file() {
-        let (temp, operation) = create_operation().await;
-        let blocker = relative_path("blocker");
-        tokio::fs::File::create(on_disk(&temp, &blocker))
-            .await
-            .expect("create blocker file");
-        let stats = CloneStats::default();
-
-        let err = ensure_parent_dir(&blocker.join("file.txt"), &operation, &stats)
-            .await
-            .expect_err("a file where the parent belongs must fail");
-
-        assert!(err.to_string().contains("Failed to create directory"));
-        assert!(stats.created_parents.is_empty());
-    }
-
-    /// A parent that genuinely cannot be created still has to abort the clone.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn ensure_parent_dir_rejects_uncreatable_parent() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let (temp, operation) = create_operation().await;
-        let locked = relative_path("locked");
-        tokio::fs::create_dir(on_disk(&temp, &locked))
-            .await
-            .expect("create locked dir");
-        tokio::fs::set_permissions(
-            on_disk(&temp, &locked),
-            std::fs::Permissions::from_mode(0o500),
-        )
-        .await
-        .expect("drop write permission");
-        let stats = CloneStats::default();
-
-        let result = ensure_parent_dir(&locked.join("child/file.txt"), &operation, &stats).await;
-
-        // Restore write permission first so the temp dir can be cleaned up.
-        tokio::fs::set_permissions(
-            on_disk(&temp, &locked),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .await
-        .expect("restore write permission");
-        let err = result.expect_err("uncreatable parent must fail");
-        assert!(err.to_string().contains("Failed to create directory"));
-        assert!(stats.created_parents.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn adversarial_dangling_symlink_parent() {
-        let (temp, operation) = create_operation().await;
-        let link = relative_path("link");
-        std::os::unix::fs::symlink(temp.path().join("nowhere"), on_disk(&temp, &link))
-            .expect("create dangling symlink");
-        let stats = CloneStats::default();
-
-        let result = ensure_parent_dir(&link.join("file.txt"), &operation, &stats).await;
-
-        assert!(result.is_err(), "a dangling symlink is not a usable parent");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn adversarial_symlink_to_file_parent() {
-        let (temp, operation) = create_operation().await;
-        let target = relative_path("target");
-        tokio::fs::File::create(on_disk(&temp, &target))
-            .await
-            .expect("create target file");
-        let link = relative_path("link");
-        std::os::unix::fs::symlink(on_disk(&temp, &target), on_disk(&temp, &link))
-            .expect("create symlink");
-        let stats = CloneStats::default();
-
-        let result = ensure_parent_dir(&link.join("file.txt"), &operation, &stats).await;
-
-        assert!(
-            result.is_err(),
-            "a symlink to a file is not a usable parent"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn adversarial_symlink_to_directory_parent() {
-        let (temp, operation) = create_operation().await;
-        let target = relative_path("target");
-        tokio::fs::create_dir(on_disk(&temp, &target))
-            .await
-            .expect("create target dir");
-        let link = relative_path("link");
-        std::os::unix::fs::symlink(on_disk(&temp, &target), on_disk(&temp, &link))
-            .expect("create symlink");
-        let stats = CloneStats::default();
-
-        ensure_parent_dir(&link.join("file.txt"), &operation, &stats)
-            .await
-            .expect("a symlink to a directory is a usable parent");
-    }
-
-    #[tokio::test]
-    async fn adversarial_parent_nested_under_a_file() {
-        let (temp, operation) = create_operation().await;
-        let blocker = relative_path("blocker");
-        tokio::fs::File::create(on_disk(&temp, &blocker))
-            .await
-            .expect("create blocker file");
-        let stats = CloneStats::default();
-
-        let result = ensure_parent_dir(&blocker.join("deep/file.txt"), &operation, &stats).await;
-
-        assert!(result.is_err(), "a file cannot contain a directory");
-    }
-
-    #[tokio::test]
-    async fn adversarial_paths_without_a_usable_parent() {
-        let (_temp, operation) = create_operation().await;
-        let stats = CloneStats::default();
-
-        // Filesystem root: no parent to create.
-        ensure_parent_dir(&relative_path("/"), &operation, &stats)
-            .await
-            .expect("root must be a no-op");
-        // Bare relative name: parent is the empty path.
-        ensure_parent_dir(&relative_path("file.txt"), &operation, &stats)
-            .await
-            .expect("a bare relative name must be a no-op");
-        // Empty path.
-        ensure_parent_dir(&RelativePath::new(), &operation, &stats)
-            .await
-            .expect("empty path must be a no-op");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn adversarial_concurrent_calls_same_parent() {
-        let (temp, operation) = create_operation().await;
-        let stats = Arc::new(CloneStats::default());
-        let parent = relative_path("shared/nested");
-
-        let mut tasks = Vec::new();
-        for index in 0..16 {
-            let operation = operation.clone();
-            let stats = stats.clone();
-            let file = parent.join(format!("file-{index}.txt"));
-            tasks.push(lore_spawn!(async move {
-                ensure_parent_dir(&file, &operation, &stats).await
-            }));
-        }
-        for task in tasks {
-            task.await
-                .expect("task must not panic")
-                .expect("concurrent creation of the same parent must not fail");
-        }
-
-        assert!(on_disk(&temp, &parent).is_dir());
-        assert_eq!(stats.created_parents.len(), 1);
-    }
-}

@@ -523,7 +523,7 @@ mod tests {
                 .with_path(&path),
         ));
 
-        let state = Arc::new(State::new());
+        let state = State::new();
 
         // Add three file nodes
         let node_a = state

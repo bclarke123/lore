@@ -3,6 +3,8 @@
 import base64
 import json
 import logging
+import os
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -15,6 +17,7 @@ from lore_server import (
     generate_server_config,
     launch_lore_server,
 )
+from service_util import LORE_SERVICE_ENVIRONMENT
 
 from lore import Lore
 
@@ -46,30 +49,59 @@ def test_auth_info_not_supported_without_auth_endpoint(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_auth_user_info_not_supported_without_auth_endpoint(
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["auth", "info"],
+        ["auth", "login", "--no-browser"],
+        ["auth", "login", "--token-type", "lore", "--token", "unused"],
+        ["auth", "logout"],
+    ],
+    ids=["info", "login", "login-with-token", "logout"],
+)
+def test_auth_resolves_a_relative_repository_against_the_caller(
+    new_lore_repo, lore_service_runner, tmp_path, command
+):
+    """These commands read the remote from the repository at `--repository`.
+    The service runs in a directory unrelated to the caller's, so it must
+    resolve a relative path where the caller ran and reach the authless test
+    server, which answers `NotSupported`."""
+    service_directory = tmp_path / "service_elsewhere"
+    service_directory.mkdir()
+    lore_service_runner.start(str(service_directory))
+
+    repo: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+
+    with pytest.raises(NotSupportedError):
+        repo.run(
+            urc_args=command,
+            path=os.path.basename(repo.path),
+            cwd=os.path.dirname(repo.path),
+        )
+
+
+@pytest.mark.smoke
+def test_auth_user_info_answers_from_the_token_only_service_without_auth_endpoint(
     new_lore_repo, lore_library_path
 ):
-    """`authUserInfo` (remote user-info resolution) must fail with
-    `NotSupported` against the authless test server, not `NotAuthenticated`:
-    the real failure is that the server has no auth endpoint at all, and
-    replacing it with `NotAuthenticated` sends consumers chasing login state
-    that cannot exist.
+    """`authUserInfo` (remote user-info resolution) succeeds against the
+    authless test server. With no auth service and no directory advertised
+    there is nothing to exchange a token with and nothing to ask, so the
+    token-only service answers: every ID is its own display name. Failing
+    here, with `NotSupported` or worse `NotAuthenticated`, would send SDK
+    consumers chasing login state that cannot exist on this server.
 
-    No CLI command surfaces this call's errors (the CLI only uses it to
-    decorate output with display names and deliberately ignores failures), so
-    the test calls the public C API — the surface the SDK's `authUserInfo`
-    binding is built on — and asserts on the returned FFI code."""
+    No CLI command surfaces this call's result directly (the CLI only uses it
+    to decorate output with display names), so the test calls the public C
+    API — the surface the SDK's `authUserInfo` binding is built on — and
+    asserts on the returned FFI code."""
 
     repo: Lore = new_lore_repo()
 
     result = repo.auth_user_info_capi(lore_library_path, "some-other-user")
 
-    assert result != 0, "resolving a user against an authless server must fail"
-    assert result != NOT_AUTHENTICATED, (
-        "the authless failure must not be masked as NotAuthenticated"
-    )
-    assert result == NOT_SUPPORTED, (
-        f"expected NotSupported ({NOT_SUPPORTED}), got FFI code {result}"
+    assert result == 0, (
+        f"the token-only service answers an authless server; got FFI code {result}"
     )
 
 
@@ -102,28 +134,15 @@ def _write_throwaway_jwks(path: Path) -> None:
     )
 
 
-@pytest.mark.smoke
-def test_auth_user_info_not_authenticated_with_auth_endpoint(
-    request,
-    tmp_path_factory,
-    lore_server_executable_path,
-    new_lore_repo,
-    lore_library_path,
-):
-    """Counterpart to the authless test above: against a server that DOES
-    advertise an auth endpoint, a logged-out `authUserInfo` must fail with
-    `NotAuthenticated` — the endpoint exists, the caller just holds no token.
-    Guards against the authless `NotSupported` mapping leaking into the
-    authenticated case, and against the logged-out state (identity saved in
-    the repository config by a previous login, tokens removed by logout)
-    collapsing into an internal error.
+@contextmanager
+def _server_with_auth_url(request, tmp_path_factory, lore_server_executable_path):
+    """Launches a server instance whose advertised environment carries an auth
+    URL and no OIDC issuer, and yields the port it serves on. The session
+    server is authless, so tests of the authenticated case need their own.
 
-    The session server is authless, so this test launches its own server
-    instance whose advertised environment carries an auth URL (the URL is
-    never contacted: the client fails at the local token lookup first, and
-    the server's OIDC discovery against it is lazy — no token ever arrives
-    to verify). The repository is created offline so the first server
-    contact is the `authUserInfo` call itself.
+    The URL is never contacted: the client fails before reaching it, and the
+    server's OIDC discovery against it is lazy — no token ever arrives to
+    verify.
 
     `auth_url` without `[server.auth]` is a config error (tokens would go
     unverified), so the server also gets a `[server.auth]` block naming the
@@ -160,8 +179,36 @@ def test_auth_user_info_not_authenticated_with_auth_endpoint(
         server_root, server_env, lore_server_executable_path
     )
     try:
+        yield shared_port
+    finally:
+        _kill_server_by_pid(server_proc.pid, server_log_path, label="auth-url server")
+        server_log_fd.close()
+
+
+@pytest.mark.smoke
+def test_auth_user_info_not_authenticated_with_auth_endpoint(
+    request,
+    tmp_path_factory,
+    lore_server_executable_path,
+    new_lore_repo,
+    lore_library_path,
+):
+    """Counterpart to the authless test above: against a server that DOES
+    advertise an auth endpoint, a logged-out `authUserInfo` must fail with
+    `NotAuthenticated` — the endpoint exists, the caller just holds no token.
+    Guards against the authless `NotSupported` mapping leaking into the
+    authenticated case, and against the logged-out state (identity saved in
+    the repository config by a previous login, tokens removed by logout)
+    collapsing into an internal error.
+
+    The repository is created offline so the first server contact is the
+    `authUserInfo` call itself."""
+
+    with _server_with_auth_url(
+        request, tmp_path_factory, lore_server_executable_path
+    ) as port:
         repo: Lore = new_lore_repo(
-            remote_url=f"lore://127.0.0.1:{shared_port}/", create_repo=False
+            remote_url=f"lore://127.0.0.1:{port}/", create_repo=False
         )
         repo.repository_create(offline=True)
 
@@ -170,6 +217,36 @@ def test_auth_user_info_not_authenticated_with_auth_endpoint(
         assert result == NOT_AUTHENTICATED, (
             f"expected NotAuthenticated ({NOT_AUTHENTICATED}), got FFI code {result}"
         )
-    finally:
-        _kill_server_by_pid(server_proc.pid, server_log_path, label="auth-url server")
-        server_log_fd.close()
+
+
+@pytest.mark.smoke
+def test_auth_login_asking_for_oidc_fails_when_the_server_advertises_none(
+    request,
+    tmp_path_factory,
+    lore_server_executable_path,
+    new_lore_repo,
+):
+    """A client asking for the OIDC path (`--auth-mode oidc`) against a server
+    that advertises only its gRPC auth service must fail with `NotSupported`,
+    not fall back to the gRPC path. A fall back would contact the auth URL,
+    which here is unreachable, so the error kind is what tells the two apart."""
+
+    with _server_with_auth_url(
+        request, tmp_path_factory, lore_server_executable_path
+    ) as port:
+        repo: Lore = new_lore_repo(
+            remote_url=f"lore://127.0.0.1:{port}/", create_repo=False
+        )
+        repo.repository_create(offline=True)
+
+        with pytest.raises(NotSupportedError):
+            repo.run(
+                urc_args=[
+                    "--auth-mode",
+                    "oidc",
+                    "auth",
+                    "login",
+                    repo.remote_path,
+                    "--no-browser",
+                ]
+            )

@@ -4,6 +4,7 @@ import logging
 import os
 import platform
 import subprocess
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -20,17 +21,17 @@ SERVICE_UNAVAILABLE = 32
 def name_service_executable(
     env: dict[str, str], lore_executable_path: str
 ) -> dict[str, str]:
-    """Names the executable under test as the service, where relaying is on.
+    """Names the executable under test as the service.
 
-    Relaying requires both the setting and a named executable, so a test that
-    sets only `LORE_USE_SERVICE` would quietly run its commands locally instead.
-    Applied here rather than in each test so that no test can leave it out.
+    `service start` needs an executable to spawn, and commands relaying to a
+    service need an executable to start one when none is running. Setting it
+    here rather than in each test ensures no test can leave it out, and that
+    the service serving a test is always the build being tested rather than
+    whichever Lore is installed on the machine running the suite.
 
-    Naming the build under test is what a test wants regardless: the service
-    serving it is then the build being tested, not whichever Lore is installed
-    on the machine running the suite. A test that names one itself keeps it.
+    A test that names one itself keeps it.
     """
-    if env.get("LORE_USE_SERVICE") and not env.get("LORE_SERVICE_EXECUTABLE"):
+    if not env.get("LORE_SERVICE_EXECUTABLE"):
         env["LORE_SERVICE_EXECUTABLE"] = lore_executable_path
     return env
 
@@ -41,28 +42,45 @@ def name_service_executable(
 # runs could not proceed at once.
 LORE_SERVICE_SOCKET_VAR = "LORE_SERVICE_SOCKET"
 
+# Names the socket of a service started before the run, which then carries out
+# every command of every test that neither manages a service of its own nor is
+# marked `runs_in_process`. See `docs/developing/code-standards/testing.md`.
+LORE_TEST_SERVICE_SOCKET_VAR = "LORE_TEST_SERVICE_SOCKET"
+
+# Set to have the suite start that service itself, from the build under test,
+# and stop it when the run ends.
+LORE_TEST_SHARED_SERVICE_VAR = "LORE_TEST_SHARED_SERVICE"
+
 # Lines the client prints about the service. They are matched rather than
 # parsed, so they are kept here next to each other: each one pairs with a string
 # in the Rust sources and has to be changed with it.
 #
 # `lore service run` prints this once it has bound its socket.
 LORE_SERVICE_LISTENING_MESSAGE = "Lore service listening"
+# `lore service run` exits with this when another service has claimed the socket.
+LORE_SERVICE_CLAIM_REFUSED_MESSAGE = "Another Lore service has claimed the socket"
 # `lore service stop` prints this when there was no service to stop.
 LORE_NO_SERVICE_MESSAGE = "No Lore service is running"
 # `lore service start` prints this once a service is reachable.
 LORE_SERVICE_RUNNING_MESSAGE = "Lore service is running"
 # Printed by the `service` setters when the two settings relaying needs are left
 # in a state that will not relay.
-LORE_NO_SERVICE_EXECUTABLE_MESSAGE = "No service executable is named"
-
-
-# Names the directory the suite stands in for the machine's Lore settings with,
-# so that a test can tell it apart from a developer's own.
-MACHINE_SETTINGS_PREFIX = "lore_machine_settings_"
+LORE_NO_SERVICE_EXECUTABLE_MESSAGE = "No service executable is set"
+# Headings `lore service status` prints for the metadata it reports. Only the
+# labels, because the values are the machine's rather than the suite's.
+LORE_SERVICE_STATUS_LABELS = ("Executable:", "Uptime:", "Connections:", "SWFS mounts:")
 
 
 def service_supported():
     return platform.system() in ("Windows", "Linux", "Darwin")
+
+
+def service_claim_path(socket_name: str) -> Path:
+    """The lock file a service claims `socket_name` with, beside the socket, on
+    systems with Unix sockets. Paired with `uds_sock_dir` in
+    `lore/src/remote/network/unix.rs`."""
+    base = os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("TMPDIR") or "/tmp"
+    return Path(base) / f"lore-{os.getuid()}" / f"{socket_name}.lock"
 
 
 def stop_lore_service(lore_executable_path: str, global_dir_name: str) -> str:
@@ -74,10 +92,6 @@ def stop_lore_service(lore_executable_path: str, global_dir_name: str) -> str:
     """
     env = os.environ.copy()
     env["LORE_GLOBAL_PATH"] = global_dir_name
-    # Alongside the global config, as the `Lore` wrapper does for its own
-    # commands. Assigned rather than defaulted, for the same reason it is there:
-    # `env` starts from the ambient environment, so a `LORE_AUTH_PATH` already
-    # exported would win and this would read that credential store.
     env["LORE_AUTH_PATH"] = global_dir_name
     stop = subprocess.run(
         [lore_executable_path, "service", "stop"],

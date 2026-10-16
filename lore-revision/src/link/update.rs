@@ -26,7 +26,7 @@ use crate::state::NodeMapping;
 use crate::state::State;
 use crate::util::path::RelativePath;
 
-pub async fn update(
+pub(crate) async fn update(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     link_path: RelativePath,
@@ -89,7 +89,7 @@ pub async fn update(
     // TODO(vri): Verify filesystem in any case for local modifications
     // Tree roots at the innermost node; filesystem path is the full link path.
     if state_current.revision() != state_staged.revision() {
-        let changed = with_operation(repository.file_system(), false, async |operation| {
+        let changed = with_operation(repository.file_system(), async |operation| {
             let linked_changes = state::diff_filesystem_subtree(
                 &operation,
                 NodeMapping {
@@ -206,14 +206,7 @@ pub async fn update(
     // Fold nested link revisions up into the top-level state (no-op if flat).
     link::propagate_link_chain(&chain, token).await?;
 
-    state_staged.set_parent_self(state_current.revision());
-
-    // If staged state is the initial stage based on current state, reset other parent. Otherwise
-    // leave it as is, in case previous staged state was a merge/integrate
-    if state_staged.revision() == state_current.revision() {
-        state_staged.set_parent_other(Hash::default());
-        state_staged.set_metadata_hash(Hash::default());
-    }
+    state_staged.reparent_onto(state_current.revision());
 
     // Serialize the staged state
     let signature = state_staged
@@ -235,4 +228,14 @@ pub async fn update(
     .send();
 
     Ok(())
+}
+
+/// Boxed version of [`update`] for cross-crate use.
+pub fn update_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    link_path: RelativePath,
+    pin: Option<String>,
+) -> crate::BoxFuture<'_, Result<(), LinkError>> {
+    Box::pin(update(repository, token, link_path, pin))
 }

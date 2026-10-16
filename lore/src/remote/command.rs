@@ -1,15 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use enum_dispatch::enum_dispatch;
 use lore_macro::LoreCommand;
-use serde::Deserialize;
-use serde::Serialize;
 
-use crate::args::LoreArgs;
-
-//  LoreCommand derive generates `invoke_local` async method that calls the LoreArgs' invoke_local method.
-#[derive(Debug, Clone, Serialize, Deserialize, LoreCommand)]
-#[enum_dispatch(LoreArgs)]
+// The LoreCommand derive generates `invoke_local`, which runs a variant's handler as a future,
+// `run_local`, which runs it to completion on the calling thread, `ValidateText`, which checks the
+// variant's arguments, and a `From` conversion from each variant's arguments.
+#[derive(Debug, Clone, LoreCommand, bitcode::Encode, bitcode::Decode)]
 pub enum LoreCommand {
     AuthUserInfo(crate::auth::LoreAuthUserInfoArgs),
     AuthLoginWithToken(crate::auth::LoreAuthLoginWithTokenArgs),
@@ -35,6 +31,7 @@ pub enum LoreCommand {
     BranchMergeStart(crate::branch::LoreBranchMergeStartArgs),
     BranchSwitch(crate::branch::LoreBranchSwitchArgs),
     BranchReset(crate::branch::LoreBranchResetArgs),
+    BranchLatestList(crate::branch::LoreBranchLatestListArgs),
     BranchPush(crate::branch::LoreBranchPushArgs),
     BranchMetadataGet(crate::branch::LoreBranchMetadataGetArgs),
     BranchMetadataSet(crate::branch::LoreBranchMetadataSetArgs),
@@ -74,11 +71,13 @@ pub enum LoreCommand {
     LinkRemove(crate::link::LoreLinkRemoveArgs),
     LinkInfo(crate::link::LoreLinkInfoArgs),
     LinkList(crate::link::LoreLinkListArgs),
+    LinkListStaged(crate::link::LoreLinkListStagedArgs),
     LinkUpdate(crate::link::LoreLinkUpdateArgs),
     RepositoryClone(crate::repository::LoreRepositoryCloneArgs),
     RepositoryInfo(crate::repository::LoreRepositoryInfoArgs),
     RepositoryDump(crate::repository::LoreRepositoryDumpArgs),
     RepositoryCreate(crate::repository::LoreRepositoryCreateArgs),
+    RepositoryDelete(crate::repository::LoreRepositoryDeleteArgs),
     RepositoryFlush(crate::repository::LoreRepositoryFlushArgs),
     RepositoryGc(crate::repository::LoreRepositoryGcArgs),
     RepositoryInstanceList(crate::repository::LoreRepositoryInstanceListArgs),
@@ -120,6 +119,7 @@ pub enum LoreCommand {
     RevisionMetadataList(crate::revision::LoreRevisionMetadataListArgs),
     RevisionMetadataSet(crate::revision::LoreRevisionMetadataSetArgs),
     RevisionSync(crate::revision::LoreRevisionSyncArgs),
+    RevisionBisect(crate::revision::LoreRevisionBisectArgs),
     ServiceStart(crate::service::LoreServiceStartArgs),
     ServiceStop(crate::service::LoreServiceStopArgs),
     ServiceSetExecutable(crate::service::LoreServiceSetExecutableArgs),
@@ -168,4 +168,5 @@ pub enum LoreCommand {
     StoragePutResolved(crate::storage::put_resolved::LoreStoragePutResolvedArgs),
     StorageGetFileResolved(crate::storage::get_file_resolved::LoreStorageGetFileResolvedArgs),
     StoragePutFileResolved(crate::storage::put_file_resolved::LoreStoragePutFileResolvedArgs),
+    ServiceStatus(crate::service::LoreServiceStatusArgs),
 }

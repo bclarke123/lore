@@ -5,6 +5,7 @@ use crate::fs::swfs::api_interface::SwfsInterfaceError;
 use crate::fs::swfs::api_interface::swfs_api::SWFSFInfo;
 use crate::fs::swfs::api_interface::swfs_api::SWFSFile;
 use crate::fs::swfs::api_interface::swfs_api::swfs_u16;
+use crate::fs::swfs::api_interface::swfs_api::swfs_u64;
 
 pub struct SwfsFileArray {
     files: Box<[SwfsFile]>,
@@ -20,7 +21,8 @@ impl SwfsFileArray {
             files: files.into_boxed_slice(),
         };
         for i in 1..this.files.len() {
-            this.files[i - 1].file.next = std::ptr::from_ref(this.files[i].file()) as *mut SWFSFile;
+            let next_ptr = std::ptr::from_mut(&mut this.files[i].file);
+            this.files[i - 1].file.next = next_ptr;
         }
         this
     }
@@ -39,6 +41,8 @@ impl SwfsFileArray {
 pub struct SwfsFile {
     file: SWFSFile,
 }
+
+unsafe impl Send for SwfsFile {}
 
 impl Drop for SwfsFile {
     fn drop(&mut self) {
@@ -79,33 +83,17 @@ impl SwfsFile {
     pub fn file(&self) -> &SWFSFile {
         &self.file
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use std::ffi::CString;
-    use std::ffi::c_char;
-
-    use crate::fs::filesystem_provider::FileInfo;
-    use crate::fs::swfs::api_interface::swfs_api::SWFSFile;
-    use crate::fs::swfs::file::SwfsFile;
-    use crate::fs::swfs::file::SwfsFileArray;
-
-    #[test]
-    fn swfs_file_sizing() {
-        let files = SwfsFileArray::new(vec![
-            SwfsFile::new(CString::new("a").unwrap(), &FileInfo::NotExist, None).unwrap(),
-            SwfsFile::new(CString::new("b").unwrap(), &FileInfo::NotExist, None).unwrap(),
-        ]);
-        let file_a = files.array_ptr();
-        unsafe {
-            let file_b = (*file_a).next;
-            assert!(std::ptr::addr_eq(file_a.offset(1), file_b));
-            assert_eq!(size_of::<SwfsFile>(), size_of::<SWFSFile>());
-            assert_eq!(*(*file_a).path, 'a' as c_char);
-            assert_eq!(*(*file_a).path.offset(1), '\0' as c_char);
-            assert_eq!(*(*file_b).path, 'b' as c_char);
-            assert_eq!(*(*file_b).path.offset(1), '\0' as c_char);
-        }
+    /// Stamps the create and write times SWFS reports for this entry.
+    ///
+    /// For callers whose [`FileInfo`] carries no time of its own:
+    /// [`FileInfo::Directory`] holds none, so a directory entry built from one
+    /// reports zero for both, and a caller that knows the time has nowhere to
+    /// put it. Takes the value already in SWFS's own units rather than a
+    /// `FileInfo`, because a caller reading the clock gets the platform's file
+    /// time, not the Unix milliseconds a `FileInfo` holds.
+    pub fn set_times(&mut self, time: swfs_u64) {
+        self.file.finfo.time_create = time;
+        self.file.finfo.time_write = time;
     }
 }

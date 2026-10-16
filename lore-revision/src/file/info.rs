@@ -7,7 +7,6 @@ use std::sync::OnceLock;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -38,9 +37,8 @@ use crate::node::NodeFileMetadataBlock;
 use crate::node::NodeID;
 use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
-use crate::repository::DOT_LORE;
-use crate::repository::DOT_URC;
 use crate::repository::RepositoryContext;
+use crate::repository::is_reserved_node_name;
 use crate::revision;
 use crate::state;
 use crate::state::NodeComparison;
@@ -115,7 +113,7 @@ impl EventError for InfoError {
 
 /// Data for the event reporting information about a single file or directory.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileInfoEventData {
     /// Path of the file or directory.
@@ -192,48 +190,44 @@ pub async fn info(
         .await
         .forward::<InfoError>("Failed deserializing revision state")?;
 
-    with_operation(
-        repository.file_system(),
-        false, /* Reads the working tree and leaves it alone */
-        async |operation| {
-            let mut tasks = JoinSet::new();
-            for path in paths.iter() {
-                lore_debug!("Info path: {path}");
+    with_operation(repository.file_system(), async |operation| {
+        let mut tasks = JoinSet::new();
+        for path in paths.iter() {
+            lore_debug!("Info path: {path}");
 
-                let operation = operation.clone();
-                let repository = repository.clone();
-                let state = state.clone();
-                let path = path.clone();
+            let operation = operation.clone();
+            let repository = repository.clone();
+            let state = state.clone();
+            let path = path.clone();
 
-                lore_spawn!(tasks, async move {
-                    info_path(
-                        operation,
-                        repository,
-                        state,
-                        path,
-                        options.local,
-                        options.filtered,
-                    )
-                    .await
-                });
-            }
+            lore_spawn!(tasks, async move {
+                info_path(
+                    operation,
+                    repository,
+                    state,
+                    path,
+                    options.local,
+                    options.filtered,
+                )
+                .await
+            });
+        }
 
-            let mut failure: Option<InfoError> = None;
-            while let Some(result) = tasks.join_next().await {
-                let inner = result
-                    .internal("Internal task failure")
-                    .map_err(InfoError::from)
-                    .flatten();
-                failure = failure.or(inner.err());
-            }
+        let mut failure: Option<InfoError> = None;
+        while let Some(result) = tasks.join_next().await {
+            let inner = result
+                .internal("Internal task failure")
+                .map_err(InfoError::from)
+                .flatten();
+            failure = failure.or(inner.err());
+        }
 
-            if let Some(err) = failure {
-                return Err(err);
-            }
+        if let Some(err) = failure {
+            return Err(err);
+        }
 
-            Ok(())
-        },
-    )
+        Ok(())
+    })
     .await
 }
 
@@ -276,7 +270,9 @@ async fn info_path(
 
         if filtered {
             // We will be iterating the tree, cache the state fragments
-            let _ = state_current.cache_fragments(repository.clone()).await;
+            let _ = state_current
+                .cache_fragments(repository.clone(), false)
+                .await;
         }
 
         lore_debug!("Info local {local} and filtered {filtered}");
@@ -427,7 +423,13 @@ async fn compare_to_node(
     let local_hash = match comparison {
         NodeComparison::Matches => node.address.hash,
         NodeComparison::Differs => {
-            immutable::hash_file(repository.clone(), &operation.content_source(relative_path))
+            let source = operation
+                .content_source(relative_path)
+                .await
+                .forward_with::<InfoError, _>(|| {
+                    format!("naming the content of local file {relative_path}")
+                })?;
+            immutable::hash_file(repository.clone(), &source)
                 .await
                 .forward_with::<InfoError, _>(|| {
                     format!("Failed to hash local file: {relative_path}")
@@ -570,7 +572,7 @@ async fn calculate_local_filtered_size_hash(
 
 /// Whether `path` names the repository's own directory, which no walk measures or descends into.
 fn is_dot_directory(path: &RelativePath) -> bool {
-    path.as_str() == DOT_URC || path.as_str() == DOT_LORE
+    is_reserved_node_name(path.as_str())
 }
 
 /// What the file at `path` adds to the local size, which is nothing where the repository's own
@@ -601,6 +603,7 @@ static LOCAL_SIZE_TASK_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 /// Process-wide rather than per-walk: `file info` measures every path it was given at once, so a
 /// budget owned by one walk would let a run fan out once for every path it names.
+#[lore_macro::test_pub]
 fn local_size_task_semaphore() -> &'static Arc<Semaphore> {
     LOCAL_SIZE_TASK_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_TREE_TASKS)))
 }
@@ -637,6 +640,7 @@ async fn local_size_subtree_dispatch(
 /// `parent_states` is the filter verdict for the directory holding
 /// `relative_path`, which this walk steps once per node rather than folding the
 /// whole path per node.
+#[lore_macro::test_pub]
 fn calculate_local_size_recurse(
     operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
@@ -771,12 +775,15 @@ fn calculate_filtered_size_recurse(
             }
             let sibling = child_node.sibling();
             lore_spawn!(filtered_size_tasks, async move {
-                let name = state
-                    .node_name_ref(repository.clone(), child)
+                let Some(name) = state
+                    .node_name_ref_or_skip(repository.clone(), child)
                     .await
                     .forward::<InfoError>(
                         "Failed to calculate filtered size, encountered an invalid node",
-                    )?;
+                    )?
+                else {
+                    return Ok(0);
+                };
                 let relative_path = relative_path.push_into_buf(name).freeze();
                 calculate_filtered_size_recurse(
                     repository,
@@ -813,97 +820,4 @@ fn calculate_filtered_size_recurse(
 
         Ok(filtered_size)
     })
-}
-
-#[cfg(test)]
-// A fixture builds working-tree state directly, outside any revision; what these test is what the
-// walk measures of it.
-#[allow(clippy::disallowed_methods)]
-mod tests {
-    use std::path::Path;
-
-    use super::*;
-    use crate::fs::filesystem_provider::tests::test_store_create;
-    use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
-    use crate::repository::test_helpers::default_repository_creation_args;
-
-    /// A repository over the working tree at `root`, admitting every path in it.
-    async fn os_repository(root: &Path) -> Arc<RepositoryContext> {
-        let (immutable_store, mutable_store, _context) =
-            test_store_create().await.expect("making test stores");
-        Arc::new(RepositoryContext::new(
-            default_repository_creation_args(immutable_store, mutable_store).with_path(root),
-        ))
-    }
-
-    /// A directory holding two files and a subdirectory holding a third, 175 bytes in all.
-    fn write_tree(root: &Path) {
-        let tree = root.join("tree");
-        std::fs::create_dir_all(tree.join("inner")).expect("create directory");
-        std::fs::write(tree.join("first.txt"), vec![b'a'; 100]).expect("write file");
-        std::fs::write(tree.join("third.txt"), vec![b'c'; 25]).expect("write file");
-        std::fs::write(tree.join("inner").join("second.txt"), vec![b'b'; 50]).expect("write file");
-    }
-
-    /// What the walk measures at `path`, under the working tree at `root`.
-    async fn measure(root: &Path, path: RelativePath) -> u64 {
-        let repository = os_repository(root).await;
-        let operation = repository
-            .file_system()
-            .begin_operation()
-            .await
-            .expect("an operation over the working tree");
-        calculate_local_size_recurse(
-            operation,
-            repository,
-            path,
-            FileInfo::Directory,
-            FilterStates::ROOT,
-        )
-        .await
-        .expect("a measured tree")
-    }
-
-    /// What the walk measures of the tree [`write_tree`] wrote under `root`.
-    async fn measure_tree(root: &Path) -> u64 {
-        measure(
-            root,
-            RelativePath::new_from_initial_path("tree").expect("relative path"),
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn a_directory_measures_every_file_below_it() {
-        let dir = lore_base::test_util::TempDir::new("lore-info-local-size-");
-        write_tree(dir.path());
-
-        assert_eq!(175, measure_tree(dir.path()).await);
-    }
-
-    /// The repository's own directory adds nothing, whatever the working tree holds at its name.
-    #[tokio::test]
-    async fn the_repository_directory_is_not_measured() {
-        let dir = lore_base::test_util::TempDir::new("lore-info-local-size-");
-        write_tree(dir.path());
-        std::fs::write(dir.path().join(DOT_LORE), vec![b'd'; 40]).expect("write file");
-
-        assert_eq!(175, measure(dir.path(), RelativePath::default()).await);
-    }
-
-    /// A subtree is walked inline once the fan-out budget is spent, measuring what a walk of its
-    /// own would have.
-    #[tokio::test]
-    async fn a_subtree_is_measured_inline_once_the_budget_is_spent() {
-        let dir = lore_base::test_util::TempDir::new("lore-info-local-size-");
-        write_tree(dir.path());
-
-        let _permits = local_size_task_semaphore()
-            .clone()
-            .acquire_many_owned(MAX_CONCURRENT_TREE_TASKS as u32)
-            .await
-            .expect("the whole fan-out budget");
-
-        assert_eq!(175, measure_tree(dir.path()).await);
-    }
 }

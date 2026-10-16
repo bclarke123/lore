@@ -170,20 +170,3 @@ impl ThinClientService for LoreThinClientV1Service {
         read_content::handler(request, self.immutable_store.clone()).await
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use lore_proto::lore::thin_client::v1::thin_client_service_server::ThinClientServiceServer;
-
-    use super::*;
-
-    /// Compile-time check that `LoreThinClientV1Service` fully implements
-    /// the generated `ThinClientService` trait — wrapping it in
-    /// `ThinClientServiceServer` requires the trait bound to hold.
-    #[allow(dead_code)]
-    fn assert_implements_trait(
-        service: LoreThinClientV1Service,
-    ) -> ThinClientServiceServer<LoreThinClientV1Service> {
-        ThinClientServiceServer::new(service)
-    }
-}

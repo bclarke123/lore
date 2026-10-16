@@ -143,15 +143,20 @@ impl Default for NameTable {
 }
 
 impl NameTable {
+    /// The name table stored at `hash`.
+    ///
+    /// The header read is boxed. Inline, it would be the largest state of this future and make
+    /// every node block load larger, as a load may convert a version 0 block through the name
+    /// table.
     pub async fn deserialize(
         repository: Arc<RepositoryContext>,
         hash: Hash,
     ) -> Result<NameTable, NameTableError> {
-        let state = NameTableState::read_from_immutable(
+        let state = Box::pin(NameTableState::read_from_immutable(
             repository.clone(),
             Address::zero_context_hash(hash),
             read_options_from_repository(&repository).with_priority(),
-        )
+        ))
         .await
         .forward_any::<NameTableError>("deserializing name table")?;
 

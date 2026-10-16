@@ -45,6 +45,7 @@ use lore_base::types::Context;
 use lore_base::types::Fragment;
 use lore_base::types::Partition;
 
+use crate::immutable_store::CopyBehavior;
 use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
 use crate::immutable_store::query_one;
@@ -769,7 +770,16 @@ async fn the_source_a_match_names_can_be_copied_from(
     ] {
         store
             .clone()
-            .copy(resolved.partition, source, partition, wanted.context, false)
+            .copy(
+                resolved.partition,
+                source,
+                partition,
+                wanted.context,
+                CopyBehavior {
+                    durable: false,
+                    do_not_replicate: false,
+                },
+            )
             .await
             .map_err(|err| {
                 format!("a partition match named {source} as a source, which copy refused: {err:?}")
@@ -985,7 +995,16 @@ async fn a_copied_address_is_servable(
     let source = resolved.source_address(address.hash);
     store
         .clone()
-        .copy(resolved.partition, source, partition, wanted.context, false)
+        .copy(
+            resolved.partition,
+            source,
+            partition,
+            wanted.context,
+            CopyBehavior {
+                durable: false,
+                do_not_replicate: false,
+            },
+        )
         .await
         .map_err(|err| format!("copy from a named source failed: {err:?}"))?;
 
@@ -1019,7 +1038,16 @@ async fn a_copy_leaves_the_source_readable(
     let destination_context = Context::from(rand::random::<[u8; 16]>());
     store
         .clone()
-        .copy(partition, address, partition, destination_context, false)
+        .copy(
+            partition,
+            address,
+            partition,
+            destination_context,
+            CopyBehavior {
+                durable: false,
+                do_not_replicate: false,
+            },
+        )
         .await
         .map_err(|err| {
             format!(

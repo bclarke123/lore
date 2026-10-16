@@ -23,10 +23,11 @@ use clap::Parser;
 use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::LoreTaskLifecycleEvent;
-use lore_base::runtime::LoreTaskSpawnLocation;
+use lore_base::runtime::LoreTaskSpawn;
+use lore_base::runtime::TaskLifecycleObserver;
 use lore_base::runtime::runtime;
 use lore_base::runtime::runtime_with_settings;
-use lore_base::runtime::set_task_lifecycle_callback;
+use lore_base::runtime::set_task_lifecycle_observer;
 use lore_base::version::LORE_LIBRARY_VERSION;
 use lore_revision::cluster::topology::Topology;
 use lore_revision::environment::EnvironmentConfig;
@@ -53,6 +54,8 @@ use lore_transport::quic::storage_service::client::StorageClient;
 use lore_transport::set_fallback_user_agent_product;
 use lore_transport::user_agent_product;
 use opentelemetry::KeyValue;
+use opentelemetry::metrics::Counter;
+use opentelemetry::metrics::UpDownCounter;
 use opentelemetry_sdk::resource::ResourceDetector;
 use rustls::server::NoClientAuth;
 use tokio::runtime::Handle;
@@ -68,9 +71,12 @@ use tracing::warn;
 use crate::auth::jwk::JwkServiceImpl;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::local_auth::LocalAuth;
+use crate::auth::oidc::advertised_oidc;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_catalog::RepositoryCatalog;
 use crate::grpc::GrpcInternalServerBuilder;
 use crate::grpc::GrpcServerBuilder;
+use crate::grpc::GrpcTimeouts;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::forwarded_requests::GrpcForwardedRequests;
 use crate::grpc::notification_service::NotificationService;
@@ -105,14 +111,17 @@ use crate::settings::CompositeStoreSettings;
 use crate::settings::CompositeSubStoreSettings;
 use crate::settings::GrpcSettings;
 use crate::settings::HttpSettings;
+use crate::settings::ImmutableStoreSettings;
 use crate::settings::LocalImmutableStoreSettings;
 use crate::settings::LocalMutableStoreSettings;
+use crate::settings::MutableStoreSettings;
 use crate::settings::NotificationSettings;
 use crate::settings::QuicSettings;
 use crate::settings::RemoteStoreSettings;
 use crate::settings::ReplicatedStoreSettings;
 use crate::settings::ReplicationMode;
 use crate::settings::Settings;
+use crate::settings::default_authorization_timeout_seconds;
 use crate::store::replica_factory::ReplicationStoreTargetFactory;
 use crate::store::replicated_store::ReplicatedStore;
 use crate::store::resolve_plugin_config_with_fallback;
@@ -442,6 +451,7 @@ async fn launch_grpc_server(
     jwt_verifier: Option<JwtVerifier>,
     local_auth: Option<Arc<LocalAuth>>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    repository_catalog: Arc<dyn RepositoryCatalog>,
     settings: Settings,
     notification_sender: Arc<dyn NotificationSender>,
     notification_service: Option<NotificationService>,
@@ -518,12 +528,20 @@ async fn launch_grpc_server(
             grpc_settings
                 .http2_keepalive_timeout_seconds
                 .map(Duration::from_secs),
-            Duration::from_secs(grpc_settings.request_handler_timeout_seconds),
+            GrpcTimeouts {
+                request_handler: Duration::from_secs(grpc_settings.request_handler_timeout_seconds),
+                authorization: Duration::from_secs(grpc_settings.authorization_timeout_seconds),
+            },
             service_settings,
             user_agent_filter,
             forwarded_requests,
         )
-        .with_jwt_verifier(jwt_verifier, local_auth, repository_authorizer)?
+        .with_jwt_verifier(
+            jwt_verifier,
+            local_auth,
+            repository_authorizer,
+            repository_catalog,
+        )?
         .serve(addr, async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
         })
@@ -533,6 +551,7 @@ async fn launch_grpc_server(
 /// Outcome of [`validate_endpoint_security`]: either the endpoint is
 /// locked down with mTLS, or it is starting unauthenticated and the
 /// caller must surface a warning at startup.
+#[lore_macro::test_pub]
 #[derive(Debug, PartialEq, Eq)]
 enum EndpointSecurity {
     Mtls,
@@ -555,6 +574,7 @@ enum EndpointSecurity {
 ///   responsible for emitting a startup warning.
 /// - `Err` when `verify_client_certs = true` but the certificate is
 ///   missing or only partially configured.
+#[lore_macro::test_pub]
 fn validate_endpoint_security(
     label: &str,
     certificate: Option<&crate::tls::CertificateSettings>,
@@ -645,11 +665,13 @@ async fn launch_grpc_internal_server(
         .await
 }
 
+#[lore_macro::test_pub]
 fn build_lore_http_settings(
     http_settings: &HttpSettings,
     user_agent_filter: Arc<UserAgentFilter>,
 ) -> LoreHttpServerSettings {
     LoreHttpServerSettings {
+        health_only: http_settings.health_only,
         port: http_settings.port,
         host: http_settings.host.clone(),
         max_file_size: http_settings.max_file_size,
@@ -1028,34 +1050,209 @@ fn local_store() -> Option<Arc<dyn ImmutableStore>> {
 /// Directory under the system temporary directory where the server keeps
 /// zero-config artifacts (local stores and ephemeral certificates) when no
 /// explicit locations are configured.
+///
+/// `std::env::temp_dir` hands back `TMPDIR` as it stands, which an empty one
+/// makes a relative directory, so the result is resolved against the process
+/// working directory.
+#[lore_macro::test_pub]
 fn local_data_dir() -> PathBuf {
-    std::env::temp_dir().join("lore-server")
+    let dir = std::env::temp_dir().join("lore-server");
+
+    std::path::absolute(&dir).unwrap_or(dir)
 }
 
-/// Resolve the configured local store path, falling back to a directory under
-/// the system temporary directory when none was provided.
+/// Whether the configuration names a local store path.
+#[lore_macro::test_pub]
+fn is_path_configured(configured: &str) -> bool {
+    !configured.trim().is_empty()
+}
+
+/// Where the local store lives, falling back to a directory under the system
+/// temporary directory when the configuration names none.
 ///
-/// The resolved path is logged so operators can see where on-disk state lives.
-/// When no path was configured, the generated temporary path is logged as a
-/// prominent warning because that location is ephemeral and not persisted
-/// across reboots.
-fn resolve_local_store_path(configured: &str, store_label: &str) -> PathBuf {
-    if configured.trim().is_empty() {
-        let path = local_data_dir();
-        warn!(
-            store = store_label,
-            path = %path.display(),
-            "No local store path configured for the '{}' store; generated a path under the system \
-             temporary directory: {}. This data is EPHEMERAL and not persisted across reboots — \
-             configure an explicit path for production.",
-            store_label,
-            path.display(),
-        );
-        path
-    } else {
-        let path = PathBuf::from(configured);
-        info!(store = store_label, path = %path.display(), "Using configured local store path");
-        path
+/// A relative path is resolved against the process working directory, where the
+/// storage layer creates it. The `disallowed_methods` fence on
+/// `std::env::current_dir` guards library calls carrying a caller's directory;
+/// this is the server resolving its own configuration. Resolution is lexical,
+/// so the location is classified before the directory exists.
+#[lore_macro::test_pub]
+fn local_store_path(configured: &str) -> PathBuf {
+    if !is_path_configured(configured) {
+        return local_data_dir();
+    }
+
+    let path = PathBuf::from(configured);
+
+    std::path::absolute(&path).unwrap_or(path)
+}
+
+/// A local store the configuration asks for.
+#[lore_macro::test_pub]
+struct LocalStoreLocation {
+    /// Names the store in the log.
+    label: &'static str,
+    /// Where the store lands.
+    path: PathBuf,
+    /// Whether the configuration named the path.
+    configured: bool,
+    /// Whether the server writes at this path.
+    reaches_disk: bool,
+}
+
+/// Marks which immutable tiers are written at.
+///
+/// Every local tier is handed the store the first one creates, so a tier naming
+/// another path has nothing written at the path it names, and one naming the
+/// same path shares the store standing there.
+fn mark_shared_immutable_tiers(tiers: &mut [LocalStoreLocation]) {
+    let Some((created, shared)) = tiers.split_first_mut() else {
+        return;
+    };
+
+    for tier in shared {
+        tier.reaches_disk = tier.path == created.path;
+    }
+}
+
+/// Adds the local store `mode` names, if it names one.
+fn push_local_store(
+    stores: &mut Vec<LocalStoreLocation>,
+    label: &'static str,
+    mode: &str,
+    configured: Option<&str>,
+) {
+    if mode == store_mode::LOCAL
+        && let Some(configured) = configured
+    {
+        stores.push(LocalStoreLocation {
+            label,
+            path: local_store_path(configured),
+            configured: is_path_configured(configured),
+            reaches_disk: true,
+        });
+    }
+}
+
+/// Every local store the configuration asks for, in the order the server builds
+/// them.
+///
+/// The process holds one local immutable store, in `LOCAL_STORE`, which the
+/// first tier configured as local creates and every later local tier is handed;
+/// see [`mark_shared_immutable_tiers`]. Composite tiers are built in the order
+/// local, durable, replicas. The local mutable store is separate, at its own
+/// path.
+///
+/// A remote or replicated store writes to no local path, so a `[local]` block
+/// left in its configuration is not listed.
+#[lore_macro::test_pub]
+fn local_store_locations(
+    immutable: &ImmutableStoreSettings,
+    mutable: &MutableStoreSettings,
+) -> Vec<LocalStoreLocation> {
+    let mut stores = Vec::new();
+
+    push_local_store(
+        &mut stores,
+        "immutable",
+        &immutable.mode,
+        immutable.local.as_ref().map(|local| local.path.as_str()),
+    );
+
+    if immutable.mode == store_mode::COMPOSITE
+        && let Some(composite) = immutable.composite.as_ref()
+    {
+        let tiers = std::iter::once(("immutable composite local", &composite.local))
+            .chain(
+                composite
+                    .durable
+                    .as_ref()
+                    .map(|tier| ("immutable composite durable", tier)),
+            )
+            .chain(
+                composite
+                    .replica
+                    .iter()
+                    .flatten()
+                    .map(|tier| ("immutable composite replica", tier)),
+            );
+
+        for (label, tier) in tiers {
+            push_local_store(
+                &mut stores,
+                label,
+                &tier.mode,
+                tier.local.as_ref().map(|local| local.path.as_str()),
+            );
+        }
+    }
+
+    mark_shared_immutable_tiers(&mut stores);
+
+    push_local_store(
+        &mut stores,
+        "mutable",
+        &mutable.mode,
+        mutable.local.as_ref().map(|local| local.path.as_str()),
+    );
+
+    stores
+}
+
+/// The store paths the disk space monitor watches.
+#[lore_macro::test_pub]
+fn monitored_local_store_paths(stores: Vec<LocalStoreLocation>) -> Vec<PathBuf> {
+    stores
+        .into_iter()
+        .filter(|store| store.reaches_disk)
+        .map(|store| store.path)
+        .collect()
+}
+
+/// Reports where every local store lands.
+///
+/// A store nothing is written at draws that alone: where the path points says
+/// nothing an operator can act on. The remaining two conditions are independent,
+/// since either can hold without the other: a path the configuration does not
+/// name, and a path inside a system temporary directory.
+fn report_local_store_locations(stores: &[LocalStoreLocation]) {
+    for store in stores {
+        if !store.reaches_disk {
+            warn!(
+                store = store.label,
+                path = %store.path.display(),
+                "The '{}' local store names {}, but every local immutable tier is handed the \
+                 store the first one creates, so nothing is written there. Remove the path, or \
+                 make this the first local tier.",
+                store.label,
+                store.path.display(),
+            );
+            continue;
+        }
+
+        if store.configured {
+            info!(store = store.label, path = %store.path.display(), "Using configured local store path");
+        } else {
+            warn!(
+                store = store.label,
+                path = %store.path.display(),
+                "No local store path is configured for the '{}' store, so the server generated {}. \
+                 Configure an explicit path for production.",
+                store.label,
+                store.path.display(),
+            );
+        }
+
+        if crate::util::local_store_monitor::is_temporary_path(&store.path) {
+            warn!(
+                store = store.label,
+                path = %store.path.display(),
+                "The '{}' local store is at {}, inside a system temporary directory. This data is \
+                 EPHEMERAL and not persisted across reboots. Configure a persistent location for \
+                 production.",
+                store.label,
+                store.path.display(),
+            );
+        }
     }
 }
 
@@ -1125,7 +1322,7 @@ async fn create_local_store(
     flush_background: bool,
 ) -> Result<Arc<dyn ImmutableStore>> {
     let default_settings = lore_storage::local::immutable_store::ImmutableStoreSettings::default();
-    let store_path = resolve_local_store_path(&settings.path, "immutable");
+    let store_path = local_store_path(&settings.path);
 
     let options = ImmutableStoreCreateOptions {
         max_capacity: settings.max_capacity,
@@ -1190,7 +1387,7 @@ async fn configure_local_mutable_store(
 ) -> Result<Arc<dyn MutableStore>> {
     info!("Wiring up local mutable store");
 
-    let store_path = resolve_local_store_path(&settings.path, "mutable");
+    let store_path = local_store_path(&settings.path);
 
     Ok(lore_storage::local::mutable_store::create(
         Some(store_path.as_path()),
@@ -1298,10 +1495,12 @@ async fn configure_composite_store(
 ) -> Result<Arc<dyn ImmutableStore>> {
     info!("Wiring up Composite store");
 
-    let mut composite_store_builder = CompositeStoreBuilder::default().with_cache_metadata(
-        settings.cache_metadata.unwrap_or_default(),
-        settings.cache_metadata_semaphore_size,
-    );
+    let mut composite_store_builder = CompositeStoreBuilder::default()
+        .with_cache_metadata(
+            settings.cache_metadata.unwrap_or_default(),
+            settings.cache_metadata_semaphore_size,
+        )
+        .with_record_copy_out_of_band(settings.record_copy_out_of_band);
 
     let store = Box::pin(configure_composite_substore(
         registry,
@@ -1614,48 +1813,56 @@ async fn seed_local_store(settings: &LocalImmutableStoreSettings) -> Result<(), 
     }
 }
 
-fn observe_task_lifecycles() {
-    let meter = lore_telemetry::meter("lore.runtime");
-    let spawned_tasks = meter
-        .u64_counter("lore.runtime.tasks.spawned.total")
-        .build();
-    let inflight_tasks = meter
-        .i64_up_down_counter("lore.runtime.tasks.running.total")
-        .build();
+/// Counts spawned and in-flight tasks, attributed to where each task was spawned.
+struct TaskLifecycleMetrics {
+    spawned_tasks: Counter<u64>,
+    inflight_tasks: UpDownCounter<i64>,
+}
 
-    let callback = move |event: LoreTaskLifecycleEvent, spawn_location: &LoreTaskSpawnLocation| {
-        let context_label = if let Some(context) = lore_revision::runtime::try_execution_context() {
-            if let Some(lore_state) = context
-                .caller_state()
-                .cloned()
-                .and_then(|any| ::std::sync::Arc::downcast::<ServerExecutionState>(any).ok())
-            {
-                lore_state.context_label
-            } else {
-                "<no server state>"
-            }
-        } else {
-            "<no context>"
+impl TaskLifecycleObserver for TaskLifecycleMetrics {
+    fn context_label(&self) -> &'static str {
+        let Some(context) = lore_revision::runtime::try_execution_context() else {
+            return "<no context>";
         };
 
+        context
+            .caller_state()
+            .cloned()
+            .and_then(|any| Arc::downcast::<ServerExecutionState>(any).ok())
+            .map_or("<no server state>", |state| state.context_label)
+    }
+
+    fn on_event(&self, event: LoreTaskLifecycleEvent, spawn: &LoreTaskSpawn) {
         let labels = [
-            KeyValue::new("context_label", context_label),
-            KeyValue::new("spawn_file", spawn_location.file),
-            KeyValue::new("spawn_line_number", spawn_location.line as i64),
+            KeyValue::new("context_label", spawn.context_label),
+            KeyValue::new("spawn_file", spawn.file),
+            KeyValue::new("spawn_line_number", spawn.line as i64),
         ];
 
         match event {
             LoreTaskLifecycleEvent::Started => {
-                spawned_tasks.add(1, &labels);
-                inflight_tasks.add(1, &labels);
+                self.spawned_tasks.add(1, &labels);
+                self.inflight_tasks.add(1, &labels);
             }
             LoreTaskLifecycleEvent::Completed | LoreTaskLifecycleEvent::Dropped => {
-                inflight_tasks.add(-1, &labels);
+                self.inflight_tasks.add(-1, &labels);
             }
         }
+    }
+}
+
+fn observe_task_lifecycles() {
+    let meter = lore_telemetry::meter("lore.runtime");
+    let observer = TaskLifecycleMetrics {
+        spawned_tasks: meter
+            .u64_counter("lore.runtime.tasks.spawned.total")
+            .build(),
+        inflight_tasks: meter
+            .i64_up_down_counter("lore.runtime.tasks.running.total")
+            .build(),
     };
 
-    if !set_task_lifecycle_callback(Box::new(callback)) {
+    if !set_task_lifecycle_observer(Box::new(observer)) {
         error!("Failed to set task events callback");
     }
 }
@@ -1685,7 +1892,7 @@ impl ResourceDetectorProvider for PluginResourceDetectorProvider<'_> {
 async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> Result<()> {
     // Initialize metrics and tracing telemetry, returns a guard that will cleanup when it falls out
     // of scope
-    let (settings, settings_hash) = settings;
+    let (mut settings, settings_hash) = settings;
     let runtime = runtime();
     let telemetry = settings.telemetry.clone().unwrap_or_default();
     let metrics_config = telemetry.metrics.clone().unwrap_or_default();
@@ -1774,6 +1981,9 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         plugin_registry.list_notification_plugins(),
     );
 
+    let local_stores = local_store_locations(&settings.immutable_store, &settings.mutable_store);
+    report_local_store_locations(&local_stores);
+
     #[cfg(feature = "seeding")]
     {
         let mode = &settings.immutable_store.mode;
@@ -1833,6 +2043,11 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     let mutable_store =
         configure_mutable_store_via_plugin(&plugin_registry, &settings, immutable_store.clone())
             .await?;
+
+    crate::util::local_store_monitor::start_local_store_monitor(
+        monitored_local_store_paths(local_stores),
+        &settings.server.local_store_monitor,
+    );
 
     let lock_store = configure_lock_store_via_plugin(&plugin_registry, &settings)?;
 
@@ -1902,22 +2117,45 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     jwk_service: Arc::new(jwk_service),
                     jwt_issuer: auth.jwt_issuer.clone(),
                     jwt_audience: auth.jwt_audience.clone(),
-                    identity_claim: auth.identity_claim.clone(),
+                    jwt_typ: auth.jwt_typ.clone(),
                 })
             }
             None => None,
         }
     };
 
-    // One shared authorizer, selected by the configuration (D8's four-way
-    // flowchart), threaded into the gRPC, QUIC and HTTP servers.
-    let repository_authorizer = crate::authnz::repository_authorizer::repository_authorizer(
-        settings.server.auth.as_ref(),
-        settings
+    if let Some(auth) = settings.server.auth.as_ref() {
+        let auth_url = settings
             .environment
             .as_ref()
             .and_then(|environment| environment.endpoint.as_ref())
-            .and_then(|endpoint| endpoint.auth_url.clone()),
+            .and_then(|endpoint| endpoint.auth_url.as_deref());
+        // A server that mints its own tokens is its own OIDC issuer: advertise
+        // it from the local settings, since fetching its discovery document
+        // here would ask this server before it listens.
+        let oidc = match local_auth.as_ref() {
+            Some(local_auth) => local_auth.advertised_oidc(auth, auth_url),
+            None => advertised_oidc(auth, auth_url).await?,
+        };
+        settings.environment.get_or_insert_default().oidc = oidc;
+    }
+
+    // One shared authorizer, selected by the configuration (D8's four-way
+    // flowchart), threaded into the gRPC, QUIC and HTTP servers.
+    let auth_url = settings
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.endpoint.as_ref())
+        .and_then(|endpoint| endpoint.auth_url.clone());
+    let repository_authorizer = crate::authnz::repository_authorizer::repository_authorizer(
+        settings.server.auth.as_ref(),
+        auth_url.clone(),
+    )?;
+    let repository_catalog = crate::authnz::repository_catalog::repository_catalog(
+        settings.server.auth.as_ref(),
+        auth_url.as_deref(),
+        immutable_store.clone(),
+        mutable_store.clone(),
     )?;
 
     let forwarded_requests: Option<Arc<dyn ForwardedRequests>> =
@@ -1941,16 +2179,20 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     });
 
     if !is_maintenance {
-        // The subscribe authorization check runs under the same handler
-        // timeout as the gRPC endpoint the service registers on. Without a
-        // gRPC endpoint the service is unreachable and the fallback (the
-        // config default) is moot.
+        // Subscribe authorizes from the request body, so its check is made in
+        // the handler rather than by the partition-access layer. It is the
+        // same kind of check either way, so it answers to the same
+        // authorization budget as that layer rather than to the longer
+        // request-handler budget. Without a gRPC endpoint the service is
+        // unreachable and the fallback is moot.
         let notification_authorization_timeout = Duration::from_secs(
             settings
                 .server
                 .grpc
                 .as_ref()
-                .map_or(50, |grpc| grpc.request_handler_timeout_seconds),
+                .map_or_else(default_authorization_timeout_seconds, |grpc| {
+                    grpc.authorization_timeout_seconds
+                }),
         );
         let (notification, notification_service) = configure_notification(
             &mut endpoints,
@@ -1987,6 +2229,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let jwt_verifier = jwt_verifier.clone();
             let local_auth = local_auth.clone();
             let repository_authorizer = repository_authorizer.clone();
+            let repository_catalog = repository_catalog.clone();
             let settings = settings.clone();
             let notification = notification.clone();
             let user_agent_filter = user_agent_filter.clone();
@@ -2006,6 +2249,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 jwt_verifier,
                 local_auth,
                 repository_authorizer,
+                repository_catalog,
                 settings,
                 notification,
                 notification_service,
@@ -2307,170 +2551,6 @@ fn server_log_dispatch(level: lore_base::log::LoreLogLevel, location: &str, mess
         }
         lore_base::log::LoreLogLevel::Error => {
             error!(correlation_id, target = location, "{}", message);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    /// Covers the `[server.http]` to `LoreHttpServerSettings` mapping, the one seam
-    /// between config deserialization and the HTTP server's own settings.
-    mod http_settings_mapping {
-        use std::sync::Arc;
-
-        use super::super::build_lore_http_settings;
-        use crate::settings::HttpSettings;
-
-        fn http_settings(extra_keys: &str) -> HttpSettings {
-            let config = format!(
-                r#"
-                enabled = true
-                host = "127.0.0.1"
-                max_file_size = 1024
-                port = 8080
-                request_timeout_seconds = 30
-                request_body_timeout_seconds = 30
-                available_interval_seconds = 5
-                available_timeout_seconds = 30
-                store_health_check = false
-                {extra_keys}
-                "#
-            );
-            toml::from_str(&config).expect("[server.http] should deserialize")
-        }
-
-        /// The whole read path: TOML to the policy the allowlist is built from.
-        #[test]
-        fn content_type_policy_is_carried_from_config() {
-            let settings = build_lore_http_settings(
-                &http_settings(
-                    r#"
-                    presigned_url_extra_content_types = ["application/zip"]
-                    presigned_url_denied_content_types = ["application/pdf"]
-                    "#,
-                ),
-                Arc::default(),
-            );
-
-            assert_eq!(
-                settings.presign.content_type_policy.extra,
-                ["application/zip"]
-            );
-            assert_eq!(
-                settings.presign.content_type_policy.denied,
-                ["application/pdf"]
-            );
-        }
-
-        /// Absent keys give an empty policy, which resolves to the built-in set.
-        #[test]
-        fn absent_content_type_keys_give_an_empty_policy() {
-            let settings = build_lore_http_settings(&http_settings(""), Arc::default());
-
-            assert!(settings.presign.content_type_policy.extra.is_empty());
-            assert!(settings.presign.content_type_policy.denied.is_empty());
-        }
-
-        /// Guards against a copy-paste slip putting the wrong source field on a
-        /// neighbouring target field.
-        #[test]
-        fn presign_ttl_and_key_are_carried_from_config() {
-            let settings = build_lore_http_settings(
-                &http_settings(
-                    r#"
-                    presigned_url_hmac_key = "abcdef"
-                    presigned_url_min_ttl_seconds = 5
-                    presigned_url_default_ttl_seconds = 60
-                    presigned_url_max_ttl_seconds = 600
-                    "#,
-                ),
-                Arc::default(),
-            );
-
-            assert_eq!(settings.presign.hmac_key.as_deref(), Some("abcdef"));
-            assert_eq!(settings.presign.min_ttl_seconds, 5);
-            assert_eq!(settings.presign.default_ttl_seconds, 60);
-            assert_eq!(settings.presign.max_ttl_seconds, 600);
-        }
-    }
-
-    mod validate_endpoint_security {
-        use std::path::PathBuf;
-
-        use super::super::EndpointSecurity;
-        use super::super::validate_endpoint_security;
-        use crate::tls::CertificateSettings;
-
-        const LABEL: &str = "[server.test]";
-
-        fn mtls_triple() -> CertificateSettings {
-            CertificateSettings {
-                cert_file: PathBuf::from("cert.pem"),
-                pkey_file: PathBuf::from("key.pem"),
-                cert_chain: Some(PathBuf::from("ca.pem")),
-            }
-        }
-
-        fn no_chain() -> CertificateSettings {
-            CertificateSettings {
-                cert_file: PathBuf::from("cert.pem"),
-                pkey_file: PathBuf::from("key.pem"),
-                cert_chain: None,
-            }
-        }
-
-        #[test]
-        fn full_mtls_triple_with_verify_yields_mtls() {
-            let cert = mtls_triple();
-            let security = validate_endpoint_security(LABEL, Some(&cert), true)
-                .expect("full mTLS triple should be accepted");
-            assert_eq!(security, EndpointSecurity::Mtls);
-        }
-
-        #[test]
-        fn verify_off_yields_untrusted_even_with_full_triple() {
-            // verify_client_certs is the operator's expressed intent; an
-            // explicit `false` opts out regardless of what certs are
-            // sitting on disk. The caller is expected to emit a startup
-            // warning.
-            let cert = mtls_triple();
-            let security = validate_endpoint_security(LABEL, Some(&cert), false)
-                .expect("verify_client_certs=false is always accepted");
-            assert_eq!(security, EndpointSecurity::Untrusted);
-        }
-
-        #[test]
-        fn verify_off_with_no_certs_yields_untrusted() {
-            let security = validate_endpoint_security(LABEL, None, false)
-                .expect("verify_client_certs=false is always accepted");
-            assert_eq!(security, EndpointSecurity::Untrusted);
-        }
-
-        #[test]
-        fn verify_on_with_no_certs_is_rejected() {
-            let err = validate_endpoint_security(LABEL, None, true)
-                .expect_err("default policy must refuse to start without mTLS");
-            let message = err.to_string();
-            assert!(message.contains(LABEL), "label must appear: {message}");
-            assert!(message.contains("requires mTLS"), "got: {message}");
-            assert!(
-                message.contains("verify_client_certs"),
-                "error must name the opt-out flag; got: {message}"
-            );
-        }
-
-        #[test]
-        fn verify_on_with_partial_cert_is_rejected() {
-            // server-only TLS (no client-CA chain) is not mTLS. Don't
-            // silently downgrade — refuse the config and name the missing
-            // field so the operator can fix it.
-            let cert = no_chain();
-            let err = validate_endpoint_security(LABEL, Some(&cert), true)
-                .expect_err("partial mTLS (no CA chain) must be rejected");
-            let message = err.to_string();
-            assert!(message.contains(LABEL), "label must appear: {message}");
-            assert!(message.contains("partially configured"), "got: {message}");
-            assert!(message.contains("cert_chain"), "got: {message}");
         }
     }
 }

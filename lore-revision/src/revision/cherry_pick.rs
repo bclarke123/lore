@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::branch;
@@ -35,7 +34,7 @@ use crate::state::State;
 
 /// Event data reported at the start of a cherry-pick.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCherryPickStartBeginEventData {
     /// Branch identifier.
@@ -48,7 +47,7 @@ pub struct LoreCherryPickStartBeginEventData {
 
 /// Event data reported at the end of a cherry-pick.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCherryPickStartEndEventData {
     /// Progress statistics for the applied changes.
@@ -61,7 +60,7 @@ pub struct LoreCherryPickStartEndEventData {
 
 /// Event data reported at the start of aborting a cherry-pick.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCherryPickAbortBeginEventData {
     /// Identifier of the staged revision being discarded.
@@ -72,7 +71,7 @@ pub struct LoreCherryPickAbortBeginEventData {
 
 /// Event data reported at the end of aborting a cherry-pick.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCherryPickAbortEndEventData {
     /// Unused placeholder field.
@@ -81,7 +80,7 @@ pub struct LoreCherryPickAbortEndEventData {
 
 /// Event data reported for a file in conflict during a cherry-pick.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCherryPickConflictFileEventData {
     /// Path of the file.
@@ -90,7 +89,7 @@ pub struct LoreCherryPickConflictFileEventData {
 
 /// Event data reported when a file is unresolved during a cherry-pick.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCherryPickUnresolveFileEventData {
     /// Path of the file.
@@ -99,7 +98,7 @@ pub struct LoreCherryPickUnresolveFileEventData {
 
 /// Event data reported when a revision is unresolved during a cherry-pick.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCherryPickUnresolveRevisionEventData {
     /// Repository identifier.
@@ -110,7 +109,7 @@ pub struct LoreCherryPickUnresolveRevisionEventData {
 
 /// Event data reported when a file is resolved during a cherry-pick.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCherryPickResolveFileEventData {
     /// Path of the file.
@@ -119,7 +118,7 @@ pub struct LoreCherryPickResolveFileEventData {
 
 /// Event data reported when a revision is resolved during a cherry-pick.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCherryPickResolveRevisionEventData {
     /// Repository identifier.
@@ -139,7 +138,7 @@ pub struct CherryPickOptions {
     pub inherit_metadata: MetadataInherit,
 }
 
-pub async fn cherry_pick(
+pub(crate) async fn cherry_pick(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     revision: Hash,
@@ -257,7 +256,7 @@ pub async fn cherry_pick(
             layer: None,
         };
 
-        Box::pin(commit::commit(repository.clone(), token, commit_options))
+        commit::commit_boxed(repository.clone(), token, commit_options)
             .await
             .forward::<MergeError>("committing cherry-pick")?
     } else {
@@ -267,11 +266,30 @@ pub async fn cherry_pick(
     Ok(signature)
 }
 
-pub async fn cherry_pick_abort(repository: Arc<RepositoryContext>) -> Result<(), MergeError> {
+/// Boxed version of [`cherry_pick`] for cross-crate use.
+pub fn cherry_pick_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    revision: Hash,
+    options: CherryPickOptions,
+) -> crate::BoxFuture<'_, Result<Hash, MergeError>> {
+    Box::pin(cherry_pick(repository, token, revision, options))
+}
+
+pub(crate) async fn cherry_pick_abort(
+    repository: Arc<RepositoryContext>,
+) -> Result<(), MergeError> {
     merge_abort(repository, MergeType::CherryPick).await
 }
 
-pub async fn cherry_pick_restart(
+/// Boxed version of [`cherry_pick_abort`] for cross-crate use.
+pub fn cherry_pick_abort_boxed(
+    repository: Arc<RepositoryContext>,
+) -> crate::BoxFuture<'static, Result<(), MergeError>> {
+    Box::pin(cherry_pick_abort(repository))
+}
+
+pub(crate) async fn cherry_pick_restart(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
@@ -321,7 +339,16 @@ pub async fn cherry_pick_restart(
     .await
 }
 
-pub async fn cherry_pick_unresolve(
+/// Boxed version of [`cherry_pick_restart`] for cross-crate use.
+pub fn cherry_pick_restart_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    paths: LoreArray<LoreString>,
+) -> crate::BoxFuture<'_, Result<(), MergeError>> {
+    Box::pin(cherry_pick_restart(repository, token, paths))
+}
+
+pub(crate) async fn cherry_pick_unresolve(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
@@ -329,7 +356,16 @@ pub async fn cherry_pick_unresolve(
     branch::merge::merge_unresolve(repository, token, paths, MergeType::CherryPick).await
 }
 
-pub async fn cherry_pick_resolve(
+/// Boxed version of [`cherry_pick_unresolve`] for cross-crate use.
+pub fn cherry_pick_unresolve_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    paths: LoreArray<LoreString>,
+) -> crate::BoxFuture<'_, Result<(), MergeError>> {
+    Box::pin(cherry_pick_unresolve(repository, token, paths))
+}
+
+pub(crate) async fn cherry_pick_resolve(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
@@ -337,25 +373,16 @@ pub async fn cherry_pick_resolve(
     branch::merge::merge_resolve(repository, token, paths, MergeType::CherryPick).await
 }
 
-pub async fn cherry_pick_resolve_mine(
+/// Boxed version of [`cherry_pick_resolve`] for cross-crate use.
+pub fn cherry_pick_resolve_boxed(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
-) -> Result<(), StageError> {
-    validate_merge_type(repository.clone(), None, MergeType::CherryPick)
-        .await
-        .forward::<StageError>("Failed to deserialize revision state")?;
-
-    Box::pin(stage::stage_from_parent_revision(
-        repository,
-        token,
-        paths,
-        stage::MergeParent::Mine,
-    ))
-    .await
+) -> crate::BoxFuture<'_, Result<(), MergeError>> {
+    Box::pin(cherry_pick_resolve(repository, token, paths))
 }
 
-pub async fn cherry_pick_resolve_theirs(
+pub(crate) async fn cherry_pick_resolve_mine(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
@@ -364,11 +391,36 @@ pub async fn cherry_pick_resolve_theirs(
         .await
         .forward::<StageError>("Failed to deserialize revision state")?;
 
-    Box::pin(stage::stage_from_parent_revision(
-        repository,
-        token,
-        paths,
-        stage::MergeParent::CherryPick,
-    ))
-    .await
+    stage::stage_from_parent_revision(repository, token, paths, stage::MergeParent::Mine).await
+}
+
+/// Boxed version of [`cherry_pick_resolve_mine`] for cross-crate use.
+pub fn cherry_pick_resolve_mine_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    paths: LoreArray<LoreString>,
+) -> crate::BoxFuture<'_, Result<(), StageError>> {
+    Box::pin(cherry_pick_resolve_mine(repository, token, paths))
+}
+
+pub(crate) async fn cherry_pick_resolve_theirs(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    paths: LoreArray<LoreString>,
+) -> Result<(), StageError> {
+    validate_merge_type(repository.clone(), None, MergeType::CherryPick)
+        .await
+        .forward::<StageError>("Failed to deserialize revision state")?;
+
+    stage::stage_from_parent_revision(repository, token, paths, stage::MergeParent::CherryPick)
+        .await
+}
+
+/// Boxed version of [`cherry_pick_resolve_theirs`] for cross-crate use.
+pub fn cherry_pick_resolve_theirs_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    paths: LoreArray<LoreString>,
+) -> crate::BoxFuture<'_, Result<(), StageError>> {
+    Box::pin(cherry_pick_resolve_theirs(repository, token, paths))
 }

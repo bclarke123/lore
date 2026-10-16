@@ -10,12 +10,16 @@ never surfaces.
 Run as a script, this module is the driver a test invokes as a subprocess:
 
     python lore_ffi.py auth-user-info <library-path> <repository-path> [user-id...]
+    python lore_ffi.py branch-latest-list <library-path> <repository-path> <keep-store-alive-seconds>
     python lore_ffi.py service-start <library-path>
     python lore_ffi.py service-stop <library-path>
+    python lore_ffi.py service-status <library-path>
+    python lore_ffi.py repository-delete <library-path> <repository-path> <repository-url>
+    python lore_ffi.py revision-sync <library-path> <repository-path> <view-file>
+    python lore_ffi.py revision-bisect <library-path> <repository-path> <start> <end> <keep-store-alive-seconds>
 
-exiting with the call's FFI code. Tests go through
-`Lore.auth_user_info_capi()` and `Lore.service_capi()` rather than importing
-`LoreLibrary` directly:
+exiting with the call's FFI code. Tests go through `Lore`'s `*_capi` methods
+rather than importing `LoreLibrary` directly:
 loading the library into the pytest process would leak its global state
 (connection and authz caches, the tokio runtime, a panic hook) across every
 test sharing that xdist worker, let a panic in the library take the worker
@@ -107,6 +111,8 @@ class LoreGlobalArgs(Structure):
         ("access_token", LoreString),
         ("stats", c_uint32),
         ("event_interval_ms", c_uint64),
+        ("auth_mode", c_int),
+        ("trust_remote", c_uint8),
     ]
 
 
@@ -120,6 +126,13 @@ class LoreAuthUserInfoArgs(Structure):
     """`lore_auth_user_info_args_t`."""
 
     _fields_ = [("user_ids", LoreStringArray)]
+
+
+class LoreBranchLatestListArgs(Structure):
+    """`lore_branch_latest_list_args_t`. An empty `branch` lists the current
+    branch, a zero `limit` the default number of entries."""
+
+    _fields_ = [("branch", LoreString), ("limit", c_uint32)]
 
 
 class LoreServiceStartArgs(Structure):
@@ -138,6 +151,41 @@ class LoreServiceStopArgs(Structure):
     _fields_ = [("_unused", c_int)]
 
 
+class LoreServiceStatusArgs(Structure):
+    """`lore_service_status_args_t`. Carries no arguments of its own."""
+
+    _fields_ = [("_unused", c_int)]
+
+
+class LoreRepositoryDeleteArgs(Structure):
+    """`lore_repository_delete_args_t`."""
+
+    _fields_ = [("repository_url", LoreString)]
+
+
+class LoreRevisionSyncArgs(Structure):
+    """`lore_revision_sync_args_t`. `view` names the view filter file the
+    working tree is left materialized under, empty to keep the instance's own."""
+
+    _fields_ = [
+        ("revision", LoreString),
+        ("forward_changes", c_uint8),
+        ("reset", c_uint8),
+        ("root_files", LoreStringArray),
+        ("dependency_tags", LoreStringArray),
+        ("dependency_recursive", c_uint8),
+        ("dependency_depth_limit", c_uint32),
+        ("view", LoreString),
+    ]
+
+
+class LoreRevisionBisectArgs(Structure):
+    """`lore_revision_bisect_args_t`. `start` is the latest revision known not to
+    hold the change, `end` the earliest known to hold it."""
+
+    _fields_ = [("start", LoreString), ("end", LoreString)]
+
+
 # Every struct above, paired with the header type it mirrors. A struct bound
 # here belongs in this list: it is what test_lore_ffi.py checks the mirrors
 # against, so a field added to the C API is reported as a named mismatch rather
@@ -148,8 +196,13 @@ MIRRORED_STRUCTS = [
     ("lore_global_args_t", LoreGlobalArgs),
     ("lore_event_callback_config_t", LoreEventCallbackConfig),
     ("lore_auth_user_info_args_t", LoreAuthUserInfoArgs),
+    ("lore_branch_latest_list_args_t", LoreBranchLatestListArgs),
     ("lore_service_start_args_t", LoreServiceStartArgs),
     ("lore_service_stop_args_t", LoreServiceStopArgs),
+    ("lore_service_status_args_t", LoreServiceStatusArgs),
+    ("lore_repository_delete_args_t", LoreRepositoryDeleteArgs),
+    ("lore_revision_sync_args_t", LoreRevisionSyncArgs),
+    ("lore_revision_bisect_args_t", LoreRevisionBisectArgs),
 ]
 
 # One field per line, either a function pointer (`void (*func)(...)`) or a plain
@@ -194,6 +247,12 @@ class LoreLibrary:
             POINTER(LoreAuthUserInfoArgs),
             LoreEventCallbackConfig,
         ]
+        self._lib.lore_branch_latest_list.restype = c_int32
+        self._lib.lore_branch_latest_list.argtypes = [
+            POINTER(LoreGlobalArgs),
+            POINTER(LoreBranchLatestListArgs),
+            LoreEventCallbackConfig,
+        ]
         self._lib.lore_service_start.restype = c_int32
         self._lib.lore_service_start.argtypes = [
             POINTER(LoreGlobalArgs),
@@ -204,6 +263,30 @@ class LoreLibrary:
         self._lib.lore_service_stop.argtypes = [
             POINTER(LoreGlobalArgs),
             POINTER(LoreServiceStopArgs),
+            LoreEventCallbackConfig,
+        ]
+        self._lib.lore_service_status.restype = c_int32
+        self._lib.lore_service_status.argtypes = [
+            POINTER(LoreGlobalArgs),
+            POINTER(LoreServiceStatusArgs),
+            LoreEventCallbackConfig,
+        ]
+        self._lib.lore_repository_delete.restype = c_int32
+        self._lib.lore_repository_delete.argtypes = [
+            POINTER(LoreGlobalArgs),
+            POINTER(LoreRepositoryDeleteArgs),
+            LoreEventCallbackConfig,
+        ]
+        self._lib.lore_revision_sync.restype = c_int32
+        self._lib.lore_revision_sync.argtypes = [
+            POINTER(LoreGlobalArgs),
+            POINTER(LoreRevisionSyncArgs),
+            LoreEventCallbackConfig,
+        ]
+        self._lib.lore_revision_bisect.restype = c_int32
+        self._lib.lore_revision_bisect.argtypes = [
+            POINTER(LoreGlobalArgs),
+            POINTER(LoreRevisionBisectArgs),
             LoreEventCallbackConfig,
         ]
 
@@ -226,6 +309,25 @@ class LoreLibrary:
         no_callback = LoreEventCallbackConfig(0, None)
         return self._lib.lore_auth_user_info(
             ctypes.byref(globals_args), ctypes.byref(args), no_callback
+        )
+
+    def branch_latest_list(
+            self, repository_path: str, keep_store_alive_seconds: int
+    ) -> int:
+        """Call `lore_branch_latest_list` for the current branch, returning its
+        FFI code. The stores stay open for `keep_store_alive_seconds` after the
+        call, none if `0`."""
+        path_bytes = repository_path.encode()
+
+        globals_args = LoreGlobalArgs()
+        globals_args.repository_path = LoreString(path_bytes, len(path_bytes))
+        globals_args.store_keep_alive = keep_store_alive_seconds != 0
+        globals_args.store_keep_alive_seconds = keep_store_alive_seconds
+
+        return self._lib.lore_branch_latest_list(
+            ctypes.byref(globals_args),
+            ctypes.byref(LoreBranchLatestListArgs()),
+            LoreEventCallbackConfig(0, None),
         )
 
     def service_start(self) -> int:
@@ -252,21 +354,122 @@ class LoreLibrary:
             LoreEventCallbackConfig(0, None),
         )
 
+    def service_status(self) -> int:
+        """Call `lore_service_status`, returning its FFI code.
+        `0` whether or not one is running: nothing listening is an answer to
+        what was asked rather than a failure to reach anything.
+        """
+        return self._lib.lore_service_status(
+            ctypes.byref(LoreGlobalArgs()),
+            ctypes.byref(LoreServiceStatusArgs()),
+            LoreEventCallbackConfig(0, None),
+        )
+
+    def repository_delete(self, repository_path: str, repository_url: str) -> int:
+        """Call `lore_repository_delete` for `repository_url`, returning its FFI
+        code."""
+        # Encoded buffers must outlive the call; keep references on the stack.
+        path_bytes = repository_path.encode()
+        url_bytes = repository_url.encode()
+
+        globals_args = LoreGlobalArgs()
+        globals_args.repository_path = LoreString(path_bytes, len(path_bytes))
+
+        args = LoreRepositoryDeleteArgs(LoreString(url_bytes, len(url_bytes)))
+
+        return self._lib.lore_repository_delete(
+            ctypes.byref(globals_args),
+            ctypes.byref(args),
+            LoreEventCallbackConfig(0, None),
+        )
+
+    def revision_sync(self, repository_path: str, view: str) -> int:
+        """Call `lore_revision_sync` with `view` and nothing else set, returning
+        its FFI code.
+        The entry point an SDK consumer reaches a view change through. `view`
+        empty is the call every consumer that does not want one makes, and has
+        to leave the instance's own view standing.
+        """
+        # Encoded buffers must outlive the call; keep references on the stack.
+        path_bytes = repository_path.encode()
+        view_bytes = view.encode()
+
+        globals_args = LoreGlobalArgs()
+        globals_args.repository_path = LoreString(path_bytes, len(path_bytes))
+
+        args = LoreRevisionSyncArgs()
+        args.view = LoreString(view_bytes, len(view_bytes))
+
+        return self._lib.lore_revision_sync(
+            ctypes.byref(globals_args),
+            ctypes.byref(args),
+            LoreEventCallbackConfig(0, None),
+        )
+
+    def revision_bisect(
+            self, repository_path: str, start: str, end: str, keep_store_alive_seconds: int
+    ) -> int:
+        """Call `lore_revision_bisect` over the range from `start` to `end`,
+        returning its FFI code. The stores stay open for
+        `keep_store_alive_seconds` after the call, none if `0`."""
+        # Encoded buffers must outlive the call; keep references on the stack.
+        path_bytes = repository_path.encode()
+        start_bytes = start.encode()
+        end_bytes = end.encode()
+
+        globals_args = LoreGlobalArgs()
+        globals_args.repository_path = LoreString(path_bytes, len(path_bytes))
+        globals_args.store_keep_alive = keep_store_alive_seconds != 0
+        globals_args.store_keep_alive_seconds = keep_store_alive_seconds
+
+        args = LoreRevisionBisectArgs(
+            LoreString(start_bytes, len(start_bytes)),
+            LoreString(end_bytes, len(end_bytes)),
+        )
+
+        return self._lib.lore_revision_bisect(
+            ctypes.byref(globals_args),
+            ctypes.byref(args),
+            LoreEventCallbackConfig(0, None),
+        )
+
 
 USAGE = """usage:
   lore_ffi.py auth-user-info <library-path> <repository-path> [user-id...]
+  lore_ffi.py branch-latest-list <library-path> <repository-path> <keep-store-alive-seconds>
   lore_ffi.py service-start <library-path>
-  lore_ffi.py service-stop <library-path>"""
+  lore_ffi.py service-stop <library-path>
+  lore_ffi.py service-status <library-path>
+  lore_ffi.py revision-sync <library-path> <repository-path> <view-file>
+  lore_ffi.py repository-delete <library-path> <repository-path> <repository-url>
+  lore_ffi.py revision-sync <library-path> <repository-path> <view-file>
+  lore_ffi.py revision-bisect <library-path> <repository-path> <start> <end> <keep-store-alive-seconds>"""
 
 
 def main(argv: list[str]) -> int:
     match argv:
         case ["auth-user-info", library_path, repository_path, *user_ids]:
             return LoreLibrary(library_path).auth_user_info(repository_path, user_ids)
+        case ["branch-latest-list", library_path, repository_path, keep_alive]:
+            return LoreLibrary(library_path).branch_latest_list(
+                repository_path, int(keep_alive)
+            )
         case ["service-start", library_path]:
             return LoreLibrary(library_path).service_start()
         case ["service-stop", library_path]:
             return LoreLibrary(library_path).service_stop()
+        case ["service-status", library_path]:
+            return LoreLibrary(library_path).service_status()
+        case ["repository-delete", library_path, repository_path, repository_url]:
+            return LoreLibrary(library_path).repository_delete(
+                repository_path, repository_url
+            )
+        case ["revision-sync", library_path, repository_path, view]:
+            return LoreLibrary(library_path).revision_sync(repository_path, view)
+        case ["revision-bisect", library_path, repository_path, start, end, keep_alive]:
+            return LoreLibrary(library_path).revision_bisect(
+                repository_path, start, end, int(keep_alive)
+            )
         case _:
             print(USAGE, file=sys.stderr)
             return 2

@@ -11,6 +11,7 @@ Contributor and maintainer docs, organized by purpose. Four subfolders: `interna
 - **Writing a Lore doc?** Start at [`doc-standards/writing-a-doc.md`](doc-standards/writing-a-doc.md).
 - **Reviewing or self-validating a doc?** Open [`doc-standards/operational/review-checklist.md`](doc-standards/operational/review-checklist.md).
 - **Looking for a coding convention?** See [`code-standards/`](code-standards/README.md).
+- **Reviewing a code change?** Follow [`code-standards/code-review.md`](code-standards/code-review.md).
 - **Looking for a past architectural decision?** See [`decisions/`](decisions/README.md).
 - **Looking for implementation detail (byte layouts, internal protocols)?** See [`internals/`](internals/README.md).
 

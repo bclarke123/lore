@@ -21,7 +21,7 @@ We welcome code contributions — bug fixes, features, performance improvements.
 You need the following tools installed:
 
 - **Rust** — install via [rustup](https://rustup.rs/). Lore requires the stable toolchain plus nightly for formatting.
-- **Python 3.13+** — required for smoke tests, with [uv](https://github.com/astral-sh/uv) for dependency management.
+- **Python 3.13 or 3.14** — required for smoke tests, with [uv](https://github.com/astral-sh/uv) for dependency management.
 
 Install the Rust toolchains:
 
@@ -43,6 +43,18 @@ pre-commit install
 cargo build
 cargo test
 ```
+
+`cargo build -p lore-capi` builds the C library, `liblore.so` and `liblore.a`, and its header `lore.h`; building only the `lore` crate, the CLI or the server does not.
+
+A build reports its version as `<package version>+local`. No build compiles a per-build version in, so a changing build number never invalidates the build cache. To give finished artifacts a build version, stamp them after building and before signing:
+
+```sh
+cargo run --release -p lore-base --bin lore-stamp -- --build <name> \
+    target/release/lore target/release/loreserver \
+    target/release/liblore.so target/release/liblore.a
+```
+
+Each binary and library then reports `<package version>+<name>`. `lore-stamp` writes only the name, so each file reports the package version it was built with. `scripts/stamp-artifacts.sh` stamps the number of the revision the working tree is at, into the files it is given or, given none, into every artifact of a full release build. The build name is limited to letters, digits, and ``!#$%&'*+-.^_`|~``. `lore-stamp` writes no file unless every file holds exactly one version slot, and a stamped file can be stamped again. On macOS the library is `liblore.dylib`; on Windows the files are `lore.exe`, `loreserver.exe`, `lore.dll`, and `lore.lib`. Stamp macOS artifacts on macOS, where `lore-stamp` signs ad-hoc again each file the linker signed ad-hoc and refuses a file signed with an identity.
 
 To run the same lint and format checks that CI enforces:
 

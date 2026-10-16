@@ -1,0 +1,745 @@
+// SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-License-Identifier: MIT
+use std::sync::Arc;
+
+use lore_base::runtime::LORE_CONTEXT;
+use lore_base::types::Hash;
+use lore_proto::lore::revision::v1::BranchPushRequest;
+use lore_revision::branch;
+use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
+use lore_revision::lore::BranchId;
+use lore_revision::lore::RepositoryId;
+use lore_revision::repository::RepositoryContext;
+use lore_revision::state;
+use lore_server::grpc::get_write_token;
+use lore_server::grpc::revision::v1::branch_push::*;
+use lore_server::hooks::HookDispatcher;
+use lore_telemetry::InstrumentProvider;
+use lore_transport::grpc::REPOSITORY_ID_KEY;
+use opentelemetry::KeyValue;
+use rand::random;
+use tonic::Request;
+
+use crate::notification::testing::MockNotificationSender;
+use crate::store::test_support::test_store_create;
+
+struct TestInstrumentProvider {}
+
+impl InstrumentProvider for TestInstrumentProvider {
+    fn namespace(&self) -> &'static str {
+        "test"
+    }
+    fn labels(&self) -> &[KeyValue] {
+        &[]
+    }
+}
+
+async fn create_root_branch(repository_context: &Arc<RepositoryContext>, name: &str) -> BranchId {
+    let write_token = get_write_token();
+    lore_revision::branch::create(
+        repository_context.clone(),
+        &write_token,
+        BranchId::from(uuid::Uuid::now_v7()),
+        name,
+        branch::default_category(),
+        "test-creator",
+        1,
+        vec![],
+        false,
+        false,
+    )
+    .await
+    .expect("Could not create root branch")
+}
+
+/// Builds a state revision rooted at `parent_self` with `revision_number`,
+/// serializes it, and returns the new revision hash.
+async fn build_revision(
+    repository_context: &Arc<RepositoryContext>,
+    parent_self: Hash,
+    revision_number: u64,
+) -> Hash {
+    build_state_revision(
+        repository_context,
+        parent_self,
+        Hash::default(),
+        revision_number,
+    )
+    .await
+}
+
+/// Like `build_revision` but lets the caller set `parent_other`, which
+/// distinguishes the resulting state hash from a sibling revision
+/// with the same `parent_self` / `revision_number`.
+async fn build_state_revision(
+    repository_context: &Arc<RepositoryContext>,
+    parent_self: Hash,
+    parent_other: Hash,
+    revision_number: u64,
+) -> Hash {
+    let write_token = get_write_token();
+    let state = state::State::new();
+    state.set_parent_self(parent_self);
+    if !parent_other.is_zero() {
+        state.set_parent_other(parent_other);
+    }
+    state.set_revision_number(revision_number);
+    state
+        .serialize(repository_context.clone(), &write_token)
+        .await
+        .expect("Failed to serialize state")
+}
+
+fn make_request(
+    repository: RepositoryId,
+    branch: BranchId,
+    revision: Hash,
+    force: bool,
+    fast_forward_merge: bool,
+) -> Request<BranchPushRequest> {
+    let mut request = Request::new(BranchPushRequest {
+        id: branch.into(),
+        revision_signature: revision.into(),
+        force,
+        fast_forward_merge,
+    });
+    request.metadata_mut().insert_bin(
+        REPOSITORY_ID_KEY,
+        tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+    );
+    request
+}
+
+fn make_service_account_request(
+    repository: RepositoryId,
+    branch: BranchId,
+    revision: Hash,
+) -> Request<BranchPushRequest> {
+    let mut request = make_request(repository, branch, revision, false, false);
+    request
+        .extensions_mut()
+        .insert(lore_server::auth::jwt::AuthorizationToken {
+            user_id: "service-bot".into(),
+            is_service_account: Some(true),
+            ..lore_server::auth::jwt::AuthorizationToken::default()
+        });
+    request
+}
+
+#[tokio::test]
+async fn push_advances_branch_latest() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    let mut notification_sender = MockNotificationSender::new();
+    notification_sender
+        .expect_branch_pushed()
+        .return_once(|_, _, _, _, _| ());
+    let notification_sender = Arc::new(notification_sender);
+    let instrument_provider = TestInstrumentProvider {};
+
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let main = create_root_branch(&repository_context, "main").await;
+        let revision = build_revision(&repository_context, Hash::default(), 1).await;
+
+        let hook_dispatcher = HookDispatcher::empty();
+        let response = handler(
+            make_request(repository, main, revision, false, false),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect("Request failed");
+
+        let inner = response.into_inner();
+        assert_eq!(inner.revision_signature, bytes::Bytes::from(revision));
+        assert_eq!(inner.revision_number, 1);
+        assert!(!inner.fast_forward_merged);
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn push_zero_revision_returns_invalid_argument() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    let notification_sender = Arc::new(MockNotificationSender::new());
+    let instrument_provider = TestInstrumentProvider {};
+
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let main = create_root_branch(&repository_context, "main").await;
+
+        let hook_dispatcher = HookDispatcher::empty();
+        let err = handler(
+            make_request(repository, main, Hash::default(), false, false),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect_err("zero revision should fail");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn push_with_stale_parent_returns_failed_precondition() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    // First push fires; second is rejected before notification.
+    let mut notification_sender = MockNotificationSender::new();
+    notification_sender
+        .expect_branch_pushed()
+        .return_once(|_, _, _, _, _| ());
+    let notification_sender = Arc::new(notification_sender);
+    let instrument_provider = TestInstrumentProvider {};
+
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let main = create_root_branch(&repository_context, "main").await;
+        let first = build_revision(&repository_context, Hash::default(), 1).await;
+
+        let hook_dispatcher = HookDispatcher::empty();
+        handler(
+            make_request(repository, main, first, false, false),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect("first push should succeed");
+
+        // Build a revision whose parent_self is still Hash::default() —
+        // doesn't descend from the branch's current latest.
+        let stale = build_revision(&repository_context, Hash::default(), 2).await;
+        let err = handler(
+            make_request(repository, main, stale, false, false),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect_err("stale parent push should fail");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn force_push_overrides_stale_parent() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    let mut notification_sender = MockNotificationSender::new();
+    notification_sender
+        .expect_branch_pushed()
+        .times(2)
+        .returning(|_, _, _, _, _| ());
+    let notification_sender = Arc::new(notification_sender);
+    let instrument_provider = TestInstrumentProvider {};
+
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let main = create_root_branch(&repository_context, "main").await;
+        let first = build_revision(&repository_context, Hash::default(), 1).await;
+
+        let hook_dispatcher = HookDispatcher::empty();
+        handler(
+            make_request(repository, main, first, false, false),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect("first push should succeed");
+
+        let stale = build_revision(&repository_context, Hash::default(), 2).await;
+        let response = handler(
+            make_request(repository, main, stale, true, false),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect("force push should succeed");
+        let inner = response.into_inner();
+        // push() may rewrite the revision number, so the returned
+        // latest can differ from the supplied hash; verify the push
+        // landed by reading the new branch latest.
+        assert!(!inner.revision_signature.is_empty());
+        assert!(!inner.fast_forward_merged);
+        let new_latest = branch::load_latest(repository_context.clone(), main)
+            .await
+            .expect("load_latest after force push");
+        assert_eq!(inner.revision_signature, bytes::Bytes::from(new_latest));
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn push_to_protected_branch_returns_permission_denied() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    let notification_sender = Arc::new(MockNotificationSender::new());
+    let instrument_provider = TestInstrumentProvider {};
+
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let main = create_root_branch(&repository_context, "main").await;
+        // Protect the branch — non-service-account pushes must be denied.
+        branch::protect(repository_context.clone(), main)
+            .await
+            .expect("should protect");
+
+        let revision = build_revision(&repository_context, Hash::default(), 1).await;
+
+        let hook_dispatcher = HookDispatcher::empty();
+        let err = handler(
+            make_request(repository, main, revision, false, false),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect_err("protected push should fail");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn push_idempotent_on_current_latest() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    // Notification fires once on the actual push; the no-op repush
+    // hits the early-return path inside `push()` (branch latest == incoming)
+    // which still reports success but doesn't re-publish the
+    // notification — see push() body.
+    let mut notification_sender = MockNotificationSender::new();
+    notification_sender
+        .expect_branch_pushed()
+        .times(2)
+        .returning(|_, _, _, _, _| ());
+    let notification_sender = Arc::new(notification_sender);
+    let instrument_provider = TestInstrumentProvider {};
+
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let main = create_root_branch(&repository_context, "main").await;
+        let revision = build_revision(&repository_context, Hash::default(), 1).await;
+
+        let hook_dispatcher = HookDispatcher::empty();
+        handler(
+            make_request(repository, main, revision, false, false),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect("first push should succeed");
+
+        // Re-pushing the same revision returns success with the same latest.
+        let response = handler(
+            make_request(repository, main, revision, false, false),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect("idempotent re-push should succeed");
+        let inner = response.into_inner();
+        assert_eq!(inner.revision_signature, bytes::Bytes::from(revision));
+        assert!(!inner.fast_forward_merged);
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn unknown_branch_returns_not_found() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    let notification_sender = Arc::new(MockNotificationSender::new());
+    let instrument_provider = TestInstrumentProvider {};
+
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let unknown = BranchId::from(uuid::Uuid::now_v7());
+        let revision = Hash::from([1u8; 32].as_slice());
+
+        let hook_dispatcher = HookDispatcher::empty();
+        let err = handler(
+            make_request(repository, unknown, revision, false, false),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect_err("unknown branch should fail");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn service_account_bypasses_protection() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    let mut notification_sender = MockNotificationSender::new();
+    notification_sender
+        .expect_branch_pushed()
+        .return_once(|_, _, _, _, _| ());
+    let notification_sender = Arc::new(notification_sender);
+    let instrument_provider = TestInstrumentProvider {};
+
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let main = create_root_branch(&repository_context, "main").await;
+        branch::protect(repository_context.clone(), main)
+            .await
+            .expect("should protect");
+        let revision = build_revision(&repository_context, Hash::default(), 1).await;
+
+        let hook_dispatcher = HookDispatcher::empty();
+        let response = handler(
+            make_service_account_request(repository, main, revision),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect("service account should bypass protection");
+        assert_eq!(
+            response.into_inner().revision_signature,
+            bytes::Bytes::from(revision)
+        );
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn push_to_deleted_branch_reinstates_name() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    let mut notification_sender = MockNotificationSender::new();
+    notification_sender
+        .expect_branch_pushed()
+        .times(2)
+        .returning(|_, _, _, _, _| ());
+    let notification_sender = Arc::new(notification_sender);
+    let instrument_provider = TestInstrumentProvider {};
+
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let main = create_root_branch(&repository_context, "main").await;
+        let main_latest = build_revision(&repository_context, Hash::default(), 1).await;
+
+        let hook_dispatcher = HookDispatcher::empty();
+        handler(
+            make_request(repository, main, main_latest, false, false),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect("seed push should succeed");
+
+        // Create a child of main, then delete it. Pushing to the
+        // deleted id should reinstate the name → id mapping.
+        let child = create_child_branch(&repository_context, "feature", main, main_latest).await;
+        branch::delete(repository_context.clone(), child)
+            .await
+            .expect("delete should succeed");
+
+        // Confirm deleted: name lookup fails (the mutable store
+        // treats zero-valued entries as missing).
+        assert!(
+            branch::load_name_to_id_local(repository_context.clone(), "feature")
+                .await
+                .is_err(),
+            "feature name should be deleted",
+        );
+
+        let child_revision = build_revision(&repository_context, main_latest, 2).await;
+        let response = handler(
+            make_request(repository, child, child_revision, false, false),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect("push to deleted branch should reinstate and succeed");
+        assert!(!response.into_inner().revision_signature.is_empty());
+
+        // Name now points back to the original branch id.
+        let restored = branch::load_name_to_id_local(repository_context.clone(), "feature")
+            .await
+            .expect("name lookup after reinstate");
+        assert_eq!(BranchId::from(restored), child);
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn push_to_deleted_branch_fails_when_name_taken() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    let mut notification_sender = MockNotificationSender::new();
+    notification_sender
+        .expect_branch_pushed()
+        .return_once(|_, _, _, _, _| ());
+    let notification_sender = Arc::new(notification_sender);
+    let instrument_provider = TestInstrumentProvider {};
+
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let main = create_root_branch(&repository_context, "main").await;
+        let main_latest = build_revision(&repository_context, Hash::default(), 1).await;
+
+        let hook_dispatcher = HookDispatcher::empty();
+        handler(
+            make_request(repository, main, main_latest, false, false),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect("seed push should succeed");
+
+        let original = create_child_branch(&repository_context, "feature", main, main_latest).await;
+        branch::delete(repository_context.clone(), original)
+            .await
+            .expect("delete should succeed");
+
+        // Recycle the name with a new branch id.
+        create_child_branch(&repository_context, "feature", main, main_latest).await;
+
+        let stale_revision = build_revision(&repository_context, main_latest, 2).await;
+        let err = handler(
+            make_request(repository, original, stale_revision, false, false),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect_err("push to deleted branch with claimed name should fail");
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn fast_forward_merge_succeeds_for_clean_diff() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    let mut notification_sender = MockNotificationSender::new();
+    notification_sender
+        .expect_branch_pushed()
+        .times(3)
+        .returning(|_, _, _, _, _| ());
+    let notification_sender = Arc::new(notification_sender);
+    let instrument_provider = TestInstrumentProvider {};
+
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let main = create_root_branch(&repository_context, "main").await;
+
+        // Push r1 then r2 to advance main's latest.
+        let r1 = build_revision(&repository_context, Hash::default(), 1).await;
+        let r2 = build_revision(&repository_context, r1, 2).await;
+
+        let hook_dispatcher = HookDispatcher::empty();
+        for rev in [r1, r2] {
+            handler(
+                make_request(repository, main, rev, false, false),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &hook_dispatcher,
+                DEFAULT_HISTORY_STEP_SIZE,
+                lore_server::grpc::server::RevisionListAcceleration::default(),
+                &instrument_provider,
+            )
+            .await
+            .expect("seed push should succeed");
+        }
+
+        // Build a divergent revision rooted at r1 (parent_self=r1)
+        // — main is now at r2, so parent_self != current latest and
+        // the server must fast-forward merge. Set parent_other to
+        // r1 to differentiate the state hash from r2 (which has the
+        // same parent_self / revision_number).
+        let divergent = build_state_revision(&repository_context, r1, r1, 2).await;
+
+        let response = handler(
+            make_request(repository, main, divergent, false, true),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect("fast-forward merge with clean diff should succeed");
+        let inner = response.into_inner();
+        assert!(inner.fast_forward_merged);
+        // Resulting latest is the new server-created merge revision,
+        // not the supplied divergent revision.
+        assert_ne!(inner.revision_signature, bytes::Bytes::from(divergent));
+        assert!(!inner.revision_signature.is_empty());
+    }))
+    .await;
+}
+
+/// Helper for fast-forward-merge tests: creates a child branch with
+/// `parent` at `parent_revision` in its stack so the parent
+/// validator inside `branch::create` accepts it.
+async fn create_child_branch(
+    repository_context: &Arc<RepositoryContext>,
+    name: &str,
+    parent: BranchId,
+    parent_revision: Hash,
+) -> BranchId {
+    let write_token = get_write_token();
+    lore_revision::branch::create(
+        repository_context.clone(),
+        &write_token,
+        BranchId::from(uuid::Uuid::now_v7()),
+        name,
+        branch::personal_category(),
+        "test-creator",
+        1,
+        vec![lore_base::types::BranchPoint {
+            branch: parent,
+            revision: parent_revision,
+        }],
+        false,
+        false,
+    )
+    .await
+    .expect("Could not create child branch")
+}

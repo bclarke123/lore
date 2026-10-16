@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::branch;
@@ -34,7 +33,7 @@ use crate::state::State;
 
 /// Event data reported at the start of a revert.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevertStartBeginEventData {
     /// Branch identifier.
@@ -47,7 +46,7 @@ pub struct LoreRevertStartBeginEventData {
 
 /// Event data reported at the end of a revert.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevertStartEndEventData {
     /// Progress statistics for the applied changes.
@@ -60,7 +59,7 @@ pub struct LoreRevertStartEndEventData {
 
 /// Event data reported at the start of aborting a revert.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevertAbortBeginEventData {
     /// Identifier of the staged revision being discarded.
@@ -71,7 +70,7 @@ pub struct LoreRevertAbortBeginEventData {
 
 /// Event data reported at the end of aborting a revert.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevertAbortEndEventData {
     /// Unused placeholder field.
@@ -80,7 +79,7 @@ pub struct LoreRevertAbortEndEventData {
 
 /// Event data reported when a file is resolved during a revert.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevertResolveFileEventData {
     /// Path of the file.
@@ -89,7 +88,7 @@ pub struct LoreRevertResolveFileEventData {
 
 /// Event data reported when a revision is resolved during a revert.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevertResolveRevisionEventData {
     /// Repository identifier.
@@ -100,7 +99,7 @@ pub struct LoreRevertResolveRevisionEventData {
 
 /// Event data reported for a file in conflict during a revert.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevertConflictFileEventData {
     /// Path of the file.
@@ -109,7 +108,7 @@ pub struct LoreRevertConflictFileEventData {
 
 /// Event data reported when a file is unresolved during a revert.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevertUnresolveFileEventData {
     /// Path of the file.
@@ -118,7 +117,7 @@ pub struct LoreRevertUnresolveFileEventData {
 
 /// Event data reported when a revision is unresolved during a revert.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevertUnresolveRevisionEventData {
     /// Repository identifier.
@@ -135,7 +134,7 @@ pub struct RevertOptions {
     pub no_commit: bool,
 }
 
-pub async fn revert(
+pub(crate) async fn revert(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     revision: Hash,
@@ -244,7 +243,7 @@ pub async fn revert(
             layer: None,
         };
 
-        Box::pin(commit::commit(repository.clone(), token, commit_options))
+        commit::commit_boxed(repository.clone(), token, commit_options)
             .await
             .forward::<MergeError>("committing revert")?
     } else {
@@ -254,11 +253,23 @@ pub async fn revert(
     Ok(signature)
 }
 
-pub async fn revert_abort(repository: Arc<RepositoryContext>) -> Result<(), MergeError> {
-    merge_abort(repository, MergeType::Revert).await
+/// Boxed version of [`revert`] for cross-crate use.
+pub fn revert_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    revision: Hash,
+    options: RevertOptions,
+) -> crate::BoxFuture<'_, Result<Hash, MergeError>> {
+    Box::pin(revert(repository, token, revision, options))
 }
 
-pub async fn revert_restart(
+pub fn revert_abort_boxed(
+    repository: Arc<RepositoryContext>,
+) -> crate::BoxFuture<'static, Result<(), MergeError>> {
+    Box::pin(merge_abort(repository, MergeType::Revert))
+}
+
+pub(crate) async fn revert_restart(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
@@ -304,54 +315,66 @@ pub async fn revert_restart(
     .await
 }
 
-pub async fn revert_unresolve(
+/// Boxed version of [`revert_restart`] for cross-crate use.
+pub fn revert_restart_boxed(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
-) -> Result<(), MergeError> {
-    branch::merge::merge_unresolve(repository, token, paths, MergeType::Revert).await
+) -> crate::BoxFuture<'_, Result<(), MergeError>> {
+    Box::pin(revert_restart(repository, token, paths))
 }
 
-pub async fn revert_resolve(
+pub fn revert_unresolve_boxed(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
-) -> Result<(), MergeError> {
-    branch::merge::merge_resolve(repository, token, paths, MergeType::Revert).await
-}
-
-pub async fn revert_resolve_mine(
-    repository: Arc<RepositoryContext>,
-    token: &RepositoryWriteToken,
-    paths: LoreArray<LoreString>,
-) -> Result<(), StageError> {
-    validate_merge_type(repository.clone(), None, MergeType::Revert)
-        .await
-        .forward::<StageError>("Failed to deserialize revision state")?;
-
-    Box::pin(stage::stage_from_parent_revision(
+) -> crate::BoxFuture<'_, Result<(), MergeError>> {
+    Box::pin(branch::merge::merge_unresolve(
         repository,
         token,
         paths,
-        stage::MergeParent::Mine,
+        MergeType::Revert,
     ))
-    .await
 }
 
-pub async fn revert_resolve_theirs(
+pub fn revert_resolve_boxed(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
-) -> Result<(), StageError> {
-    validate_merge_type(repository.clone(), None, MergeType::Revert)
-        .await
-        .forward::<StageError>("Failed to deserialize revision state")?;
-
-    Box::pin(stage::stage_from_parent_revision(
+) -> crate::BoxFuture<'_, Result<(), MergeError>> {
+    Box::pin(branch::merge::merge_resolve(
         repository,
         token,
         paths,
-        stage::MergeParent::Revert,
+        MergeType::Revert,
     ))
-    .await
+}
+
+pub fn revert_resolve_mine_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    paths: LoreArray<LoreString>,
+) -> crate::BoxFuture<'_, Result<(), StageError>> {
+    Box::pin(async move {
+        validate_merge_type(repository.clone(), None, MergeType::Revert)
+            .await
+            .forward::<StageError>("Failed to deserialize revision state")?;
+
+        stage::stage_from_parent_revision(repository, token, paths, stage::MergeParent::Mine).await
+    })
+}
+
+pub fn revert_resolve_theirs_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    paths: LoreArray<LoreString>,
+) -> crate::BoxFuture<'_, Result<(), StageError>> {
+    Box::pin(async move {
+        validate_merge_type(repository.clone(), None, MergeType::Revert)
+            .await
+            .forward::<StageError>("Failed to deserialize revision state")?;
+
+        stage::stage_from_parent_revision(repository, token, paths, stage::MergeParent::Revert)
+            .await
+    })
 }

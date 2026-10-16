@@ -100,8 +100,11 @@ impl QuinnServer {
                 .send_window(send_window as u64)
                 .datagram_receive_buffer_size(None)
                 .datagram_send_buffer_size(0);
-            transport_config
-                .congestion_controller_factory(Arc::new(congestion::BbrConfig::default()));
+            let mut bbr = congestion::BbrConfig::default();
+            // quinn never has more than the send window unacknowledged, so a larger congestion
+            // window would only raise the pacing rate.
+            bbr.max_window(send_window as u64);
+            transport_config.congestion_controller_factory(Arc::new(bbr));
             transport_config
                 .datagram_receive_buffer_size(None)
                 .datagram_send_buffer_size(0);
@@ -297,12 +300,16 @@ async fn handle_conn(
         ));
     };
 
-    let _stats_guard =
-        track_connection_stats(service_name, &connection, connection_metrics_interval);
-
     let context = Arc::new(AttributeMap::default());
     context.insert(conn_span.clone());
     context.insert(ConnectionId(connection_id));
+
+    let _stats_guard = track_connection_stats(
+        service_name,
+        &connection,
+        context.clone(),
+        connection_metrics_interval,
+    );
 
     // Create the stream handler once per connection so per-connection state
     // (e.g. SessionMap in StorageServiceV4) is shared across all streams.

@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use lore_base::env::CallEnvironment;
 use lore_base::error::InvalidArguments;
 use lore_base::runtime::runtime_shutdown_timeout;
 use lore_base::text::TextNotUtf8;
@@ -21,11 +22,11 @@ pub use lore_credential::user_info;
 pub use lore_transport::drop_connections;
 use serde::Deserialize;
 use serde::Serialize;
-use serde::de;
 use serde::ser::SerializeSeq;
 use tokio::sync::Mutex;
 use zerocopy::IntoBytes;
 
+use crate::auth::AuthMode;
 use crate::change::FileAction;
 use crate::event::LoreBytes;
 use crate::event::LoreBytesMut;
@@ -38,7 +39,8 @@ use crate::lore::Hash;
 use crate::relay::EventDispatcher;
 use crate::revision::ResolveSearchLocation;
 use crate::util::path::RelativePath;
-use crate::util::serde::u8_as_bool;
+
+mod encoding;
 
 /// A block of raw bytes described by a pointer and a length.
 ///
@@ -59,12 +61,14 @@ unsafe impl Send for LoreBinary {}
 unsafe impl Sync for LoreBinary {}
 
 impl LoreBinary {
+    /// A NULL pointer is empty whatever the length field says, as for
+    /// [`LoreString::is_empty`].
     pub fn is_empty(&self) -> bool {
-        self.length == 0
+        self.payload.is_null() || self.length == 0
     }
 
     pub fn len(&self) -> usize {
-        self.length
+        if self.is_empty() { 0 } else { self.length }
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -77,8 +81,10 @@ impl LoreBinary {
         }
     }
 
-    /// Build an owning `LoreBinary` from raw bytes, copied into a freshly
-    /// allocated buffer that `Drop` frees with the matching layout.
+    /// Build an owning `LoreBinary` from raw bytes. Non-empty bytes are copied
+    /// into a freshly allocated buffer that `Drop` frees with the matching
+    /// layout. Empty bytes allocate nothing and answer the NULL pointer of
+    /// length 0 the type documents.
     pub fn from_bytes(source: &[u8]) -> Self {
         if source.is_empty() {
             return Self::default();
@@ -161,22 +167,6 @@ impl Serialize for LoreBinary {
     }
 }
 
-impl<'de> Deserialize<'de> for LoreBinary {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        if deserializer.is_human_readable() {
-            let text = String::deserialize(deserializer)?;
-            let value = BASE64.decode(text.as_bytes()).map_err(de::Error::custom)?;
-            Ok(LoreBinary::from_bytes(&value))
-        } else {
-            let value: Vec<u8> = serde_bytes::deserialize(deserializer)?;
-            Ok(LoreBinary::from_bytes(&value))
-        }
-    }
-}
-
 /// A string described by a pointer to its character data and a length, holding
 /// text as a sequence of bytes.
 ///
@@ -203,12 +193,16 @@ impl std::fmt::Debug for LoreString {
 }
 
 impl LoreString {
+    /// A NULL pointer is empty whatever the length field says. The library
+    /// answers NULL for every empty string it emits, so a caller can hand one
+    /// back in an argument struct beside a length it filled in itself, and the
+    /// pointer alone says whether there are bytes to read.
     pub fn is_empty(&self) -> bool {
-        self.length == 0
+        self.string.is_null() || self.length == 0
     }
 
     pub fn len(&self) -> usize {
-        self.length
+        if self.is_empty() { 0 } else { self.length }
     }
 
     /// The text as `&str`, assuming it is valid UTF-8.
@@ -245,10 +239,14 @@ impl LoreString {
         Self::from_str(source.as_str())
     }
 
-    /// Build an owning `LoreString` from raw bytes, copied into a freshly
-    /// allocated NUL-terminated buffer. The bytes need not be valid UTF-8;
-    /// `Drop` frees the buffer with the matching layout.
+    /// Build an owning `LoreString` from raw bytes. Non-empty bytes are copied
+    /// into a freshly allocated NUL-terminated buffer that `Drop` frees with the
+    /// matching layout. Empty bytes allocate nothing and answer the NULL pointer
+    /// of length 0 the type documents. The bytes need not be valid UTF-8.
     pub fn from_bytes(source: &[u8]) -> Self {
+        if source.is_empty() {
+            return Self::default();
+        }
         unsafe {
             let length = source.len();
             let layout = std::alloc::Layout::from_size_align_unchecked(length + 1, 1);
@@ -289,25 +287,11 @@ impl Default for LoreString {
 }
 
 impl Clone for LoreString {
-    /// Copies the raw bytes, like [`Self::clone_from`]. Cloning must not read
-    /// the text as `&str`: every call clones its arguments before anything has
-    /// checked them, so this runs on whatever the caller passed in.
+    /// Copies the raw bytes. Cloning must not read the text as `&str`: every
+    /// call clones its arguments before anything has checked them, so this runs
+    /// on whatever the caller passed in.
     fn clone(&self) -> Self {
         Self::from_bytes(self.as_bytes())
-    }
-
-    fn clone_from(&mut self, source: &Self) {
-        self.free();
-
-        unsafe {
-            let length = source.len();
-            let layout = std::alloc::Layout::from_size_align_unchecked(length + 1, 1);
-            let buffer = std::alloc::alloc(layout);
-            std::ptr::copy_nonoverlapping(source.string.cast::<u8>(), buffer, length);
-            *buffer.add(length) = 0;
-            self.string = buffer as *const std::os::raw::c_char;
-            self.length = length;
-        }
     }
 }
 
@@ -449,12 +433,9 @@ impl From<RelativePath> for LoreString {
     }
 }
 
-/// Serializes as a string, failing on bytes that are not UTF-8.
-///
-/// Serialization is how a command reaches the Lore service, so substituting
-/// replacement characters here would let the service accept text the in-process
-/// path rejects, storing a mangled name instead of reporting a bad argument.
-/// Failing keeps both paths refusing the same input.
+/// Serializes as a string, failing on bytes that are not UTF-8 rather than
+/// substituting replacement characters, which would report a name that was
+/// never stored.
 impl Serialize for LoreString {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -462,16 +443,6 @@ impl Serialize for LoreString {
     {
         let text = std::str::from_utf8(self.as_bytes()).map_err(serde::ser::Error::custom)?;
         serializer.serialize_str(text)
-    }
-}
-
-impl<'de> Deserialize<'de> for LoreString {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value: String = Deserialize::deserialize(deserializer)?;
-        Ok(LoreString::from_str(&value))
     }
 }
 
@@ -532,6 +503,7 @@ impl ValidateText for LoreGlobalArgs {
 
 /// A contiguous array of elements described by a pointer and a count.
 /// Holds zero or more values of the element type laid out one after another.
+#[lore_macro::test_pub]
 #[repr(C)]
 #[derive(PartialEq)]
 pub struct LoreArray<T> {
@@ -555,6 +527,7 @@ impl<T> Default for LoreArray<T> {
 
 /// Elements a `Debug` rendering prints before it reports the count alone.
 /// Arguments are logged whole, and a caller's path list runs to thousands.
+#[lore_macro::test_pub]
 const DEBUG_ELEMENT_LIMIT: usize = 16;
 
 impl<T> Debug for LoreArray<T>
@@ -572,7 +545,7 @@ where
 
 impl<T> LoreArray<T> {
     pub fn as_slice(&self) -> &[T] {
-        // SAFETY: ptr is always valid, either from a clone, or from `from_vec`
+        // SAFETY: ptr addresses count elements, of a boxed slice or of an array a caller lent
         unsafe {
             if !self.ptr.is_null() && self.count > 0 {
                 std::slice::from_raw_parts(self.ptr, self.count)
@@ -582,27 +555,9 @@ impl<T> LoreArray<T> {
         }
     }
 
-    /// Moves the strings from the vec in the string array
+    /// Takes over the vec's elements, and its allocation unless it has spare capacity.
     pub fn from_vec(vec: Vec<T>) -> Self {
-        // `from_raw_parts_mut` below requires a non-null pointer even for a zero length, and
-        // `new` returns null for a zero count.
-        if vec.is_empty() {
-            return Self::default();
-        }
-        let target = LoreArray::<T>::new(vec.len());
-
-        // SAFETY: target is created to the same count as the vec and we're going to initialise
-        // every element.
-        unsafe {
-            let to_slice = std::slice::from_raw_parts_mut(target.ptr.cast_mut(), target.count);
-
-            for (from, to) in vec.into_iter().zip(to_slice.iter_mut()) {
-                // Needed to ensure drop is not called on *to, which is uninitialised right now
-                std::ptr::write(to, from);
-            }
-        }
-
-        target
+        vec.into_boxed_slice().into()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -612,61 +567,26 @@ impl<T> LoreArray<T> {
     pub fn len(&self) -> usize {
         self.count
     }
+}
 
-    /// Room for `count` uninitialised elements.
-    ///
-    /// `Layout::array` is zero-sized for a zero count and for any count of a zero-sized type, and
-    /// `std::alloc::alloc` is undefined behaviour for a zero-sized layout, so neither case
-    /// allocates. A zero count returns the null pointer. A zero-sized type returns a dangling
-    /// aligned pointer and keeps the count, because `as_slice` must still answer that many
-    /// elements and a slice needs a non-null aligned pointer to start from.
-    fn new(count: usize) -> Self {
-        if count == 0 {
+/// Takes over the slice's allocation, which has the layout `Drop` frees: `Layout::array` of its
+/// length, and none at all for an empty slice or a zero-sized type.
+impl<T> From<Box<[T]>> for LoreArray<T> {
+    fn from(elements: Box<[T]>) -> Self {
+        if elements.is_empty() {
             return Self::default();
         }
-        if std::mem::size_of::<T>() == 0 {
-            return Self {
-                ptr: std::ptr::NonNull::<T>::dangling().as_ptr(),
-                count,
-            };
-        }
-        let layout =
-            std::alloc::Layout::array::<T>(count).expect("layout overflow in LoreArray<T>::new");
-        unsafe {
-            let ptr = std::alloc::alloc(layout).cast::<T>();
-            if ptr.is_null() {
-                panic!("unable to alloc for LoreArray<T>::new");
-            }
-
-            Self { ptr, count }
+        let count = elements.len();
+        Self {
+            ptr: Box::into_raw(elements).cast::<T>(),
+            count,
         }
     }
 }
 
 impl<T: Clone> Clone for LoreArray<T> {
     fn clone(&self) -> Self {
-        if self.is_empty() {
-            return Self {
-                ptr: std::ptr::null(),
-                count: 0,
-            };
-        }
-        unsafe {
-            let mut clone = Self::new(self.count);
-
-            // Deep clone the contained strings
-            let from_slice = std::slice::from_raw_parts(self.ptr, self.count);
-            let to_slice = std::slice::from_raw_parts_mut(clone.ptr.cast_mut(), self.count);
-
-            for (from, to) in from_slice.iter().zip(to_slice.iter_mut()) {
-                // Needed to ensure drop is not called on *to, which is uninitialised right now
-                std::ptr::write(to, from.clone());
-            }
-
-            clone.count = self.count;
-
-            clone
-        }
+        Self::from_vec(self.as_slice().to_vec())
     }
 }
 
@@ -676,8 +596,8 @@ impl<T> Drop for LoreArray<T> {
             unsafe {
                 let items = std::ptr::slice_from_raw_parts_mut(self.ptr.cast_mut(), self.count);
                 std::ptr::drop_in_place(items);
-                // A zero-sized type took no heap in `new`, which handed back a dangling pointer
-                // rather than an allocation. Every element still drops, above.
+                // A boxed slice of a zero-sized type holds a dangling pointer rather than an
+                // allocation. Every element still drops, above.
                 if std::mem::size_of::<T>() != 0 {
                     let layout = std::alloc::Layout::array::<T>(self.count)
                         .expect("layout overflow in LoreArray<T>::drop");
@@ -706,19 +626,6 @@ where
     }
 }
 
-impl<'de, T> Deserialize<'de> for LoreArray<T>
-where
-    T: serde::Deserialize<'de>,
-{
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value: Vec<T> = Deserialize::deserialize(deserializer)?;
-        Ok(LoreArray::from_vec(value))
-    }
-}
-
 /// Selects which configuration sources are loaded. The values are flags
 /// that can be combined.
 /// cbindgen:prefix-with-name
@@ -744,8 +651,13 @@ pub enum LoreLoadConfig {
 pub const DEFAULT_EVENT_INTERVAL_MS: u64 = 100;
 
 /// Common options shared by repository operations.
+///
+/// Zero every byte of it, padding included, before setting the fields a call
+/// uses, as every structure passed to the library: a field left zero selects
+/// its default, and a field a release adds in its padding is left unset by
+/// code built against an earlier header.
 #[repr(C)]
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, bitcode::Encode, bitcode::Decode)]
 pub struct LoreGlobalArgs {
     /// Repository path
     pub repository_path: LoreString,
@@ -769,7 +681,8 @@ pub struct LoreGlobalArgs {
     pub remote: u8,
     /// Dry run mode, only report what would have been changed and perform no changes to local file system
     pub dry_run: u8,
-    /// Maximum number of parallel connections for bulk data transfer
+    /// Number of parallel storage connections for bulk data transfer, 0 for the default of 1.
+    /// At most 10 are opened
     pub max_connections: u32,
     /// Search limit when iterating revisions
     pub search_limit: u32,
@@ -825,7 +738,20 @@ pub struct LoreGlobalArgs {
     /// whatever `stats` is set to, statistics being reported once at the end
     /// rather than on an interval. Zero takes [`DEFAULT_EVENT_INTERVAL_MS`].
     pub event_interval_ms: u64,
+    /// Which authentication path to take if the server advertises both its
+    /// gRPC auth service and an OIDC issuer.
+    pub auth_mode: AuthMode,
+    /// Treat the remote as a trusted source, for a caller within its
+    /// infrastructure where performance comes first: payloads fetched from it
+    /// have only their sizes checked against their length, are never hashed,
+    /// and are decompressed only where their content is read. A storage handle
+    /// takes it from the globals it is opened with. Any non-zero value trusts
+    /// the remote, so a caller zeroes the whole struct, padding included
+    pub trust_remote: u8,
 }
+
+// Lock the C ABI size of `LoreGlobalArgs` (`lore_global_args_t`), which callers zero-initialize.
+const _: () = assert!(std::mem::size_of::<LoreGlobalArgs>() == 192);
 
 impl LoreGlobalArgs {
     pub fn repository_path(&self) -> &str {
@@ -955,6 +881,11 @@ impl LoreGlobalArgs {
         self.cache != 0
     }
 
+    /// Whether the command trusts its remote.
+    pub fn trust_remote(&self) -> bool {
+        self.trust_remote != 0
+    }
+
     /// Whether an operation should emit statistics events at all.
     pub fn stats(&self) -> bool {
         self.stats > 0
@@ -1064,6 +995,12 @@ fn execution_initialize() {
         }
 
         let _ = install_crypto_provider();
+        lore_base::env::find_context_environment_with(|context| {
+            context
+                .downcast_ref::<ExecutionContext>()?
+                .environment
+                .as_ref()
+        });
     });
 }
 
@@ -1099,6 +1036,9 @@ pub struct ExecutionContext {
     /// Kept whatever the statistics level: the per-revision progress event reads
     /// its share out of these, so they are load-bearing rather than diagnostic.
     push_stats: OnceLock<Arc<crate::branch::push::PushStats>>,
+    /// The environment of the process that relayed this call, read in place of this process's
+    /// through [`lore_base::env::var`]. `None` for a call made in this process.
+    environment: Option<CallEnvironment>,
 }
 
 impl ExecutionContext {
@@ -1153,6 +1093,14 @@ impl ExecutionContext {
         Self::new(globals, dispatcher, user_id, ExecutionMode::Server)
     }
 
+    /// This context, for a call relayed from a process with `environment`.
+    pub fn with_environment(self, environment: CallEnvironment) -> Self {
+        Self {
+            environment: Some(environment),
+            ..self
+        }
+    }
+
     pub fn globals(&self) -> &LoreGlobalArgs {
         &self.globals
     }
@@ -1199,6 +1147,7 @@ impl Default for ExecutionContext {
             caller_state: None,
             fragment_stats: OnceLock::new(),
             push_stats: OnceLock::new(),
+            environment: None,
         }
     }
 }
@@ -1267,7 +1216,7 @@ pub enum LoreError {
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C, u32)]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, bitcode::Encode, bitcode::Decode)]
 pub enum LoreMetadata {
     /// An address value.
     Address(Address) = LoreMetadataType::Address as u32,
@@ -1295,7 +1244,7 @@ pub enum LoreMetadata {
 ///
 /// There is deliberately no zero value: a zero-initialized field has not chosen
 /// a type and must not be passed as one.
-#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreMetadataType {
     /// A content address: 48 bytes, the 32-byte hash followed by the 16-byte
@@ -1315,105 +1264,32 @@ pub enum LoreMetadataType {
     Binary = 255,
 }
 
-/// Adjacent tagging (`{"tagName": …, "data": …}`) for self-describing formats,
-/// external tagging for the rest.
-///
-/// The derive cannot express both, and one representation will not do: adjacent
-/// tagging needs `deserialize_identifier`, which the binary format used between
-/// a client and the service does not implement, while switching everything to
-/// external tagging would change the JSON that existing clients already read.
-/// The split is the same one [`crate::lore::Address`] makes.
+/// Adjacent tagging (`{"tagName": …, "data": …}`), with a boolean written as one.
 mod metadata_repr {
-    use serde::Deserialize;
     use serde::Serialize;
 
-    use super::*;
-
-    pub(super) const ADDRESS: (u32, &str) = (0, "address");
-    pub(super) const BOOLEAN: (u32, &str) = (1, "boolean");
-    pub(super) const BINARY: (u32, &str) = (2, "binary");
-    pub(super) const CONTEXT: (u32, &str) = (3, "context");
-    pub(super) const HASH: (u32, &str) = (4, "hash");
-    pub(super) const NUMERIC: (u32, &str) = (5, "numeric");
-    pub(super) const STRING: (u32, &str) = (6, "string");
+    pub(super) const ADDRESS: &str = "address";
+    pub(super) const BOOLEAN: &str = "boolean";
+    pub(super) const BINARY: &str = "binary";
+    pub(super) const CONTEXT: &str = "context";
+    pub(super) const HASH: &str = "hash";
+    pub(super) const NUMERIC: &str = "numeric";
+    pub(super) const STRING: &str = "string";
 
     pub(super) fn emit<S, T>(
         serializer: S,
-        variant: (u32, &'static str),
+        name: &'static str,
         value: &T,
     ) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
         T: Serialize + ?Sized,
     {
-        let (index, name) = variant;
-        if serializer.is_human_readable() {
-            use serde::ser::SerializeStruct;
-            let mut tagged = serializer.serialize_struct("LoreMetadata", 2)?;
-            tagged.serialize_field("tagName", name)?;
-            tagged.serialize_field("data", value)?;
-            tagged.end()
-        } else {
-            serializer.serialize_newtype_variant("LoreMetadata", index, name, value)
-        }
-    }
-
-    /// Mirrors [`LoreMetadata`]'s variants so the derive can do the reading.
-    ///
-    /// The order here is not [`LoreMetadata`]'s and need not be: what matters is
-    /// that it matches the indices the constants above carry, since the external
-    /// form is read by position. Move a variant in one and the other has to move
-    /// with it, or a value is written under one kind and read back as another.
-    #[derive(Deserialize)]
-    #[serde(tag = "tagName", content = "data", rename_all = "camelCase")]
-    pub(super) enum Tagged {
-        Address(Address),
-        Boolean(#[serde(with = "u8_as_bool")] u8),
-        Binary(LoreBinary),
-        Context(Context),
-        Hash(Hash),
-        Numeric(u64),
-        String(LoreString),
-    }
-
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    pub(super) enum External {
-        Address(Address),
-        Boolean(#[serde(with = "u8_as_bool")] u8),
-        Binary(LoreBinary),
-        Context(Context),
-        Hash(Hash),
-        Numeric(u64),
-        String(LoreString),
-    }
-
-    impl From<Tagged> for LoreMetadata {
-        fn from(value: Tagged) -> Self {
-            match value {
-                Tagged::Address(inner) => LoreMetadata::Address(inner),
-                Tagged::Boolean(inner) => LoreMetadata::Boolean(inner),
-                Tagged::Binary(inner) => LoreMetadata::Binary(inner),
-                Tagged::Context(inner) => LoreMetadata::Context(inner),
-                Tagged::Hash(inner) => LoreMetadata::Hash(inner),
-                Tagged::Numeric(inner) => LoreMetadata::Numeric(inner),
-                Tagged::String(inner) => LoreMetadata::String(inner),
-            }
-        }
-    }
-
-    impl From<External> for LoreMetadata {
-        fn from(value: External) -> Self {
-            match value {
-                External::Address(inner) => LoreMetadata::Address(inner),
-                External::Boolean(inner) => LoreMetadata::Boolean(inner),
-                External::Binary(inner) => LoreMetadata::Binary(inner),
-                External::Context(inner) => LoreMetadata::Context(inner),
-                External::Hash(inner) => LoreMetadata::Hash(inner),
-                External::Numeric(inner) => LoreMetadata::Numeric(inner),
-                External::String(inner) => LoreMetadata::String(inner),
-            }
-        }
+        use serde::ser::SerializeStruct;
+        let mut tagged = serializer.serialize_struct("LoreMetadata", 2)?;
+        tagged.serialize_field("tagName", name)?;
+        tagged.serialize_field("data", value)?;
+        tagged.end()
     }
 }
 
@@ -1431,19 +1307,6 @@ impl Serialize for LoreMetadata {
             LoreMetadata::Hash(value) => emit(serializer, HASH, value),
             LoreMetadata::Numeric(value) => emit(serializer, NUMERIC, value),
             LoreMetadata::String(value) => emit(serializer, STRING, value),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for LoreMetadata {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        if deserializer.is_human_readable() {
-            metadata_repr::Tagged::deserialize(deserializer).map(LoreMetadata::from)
-        } else {
-            metadata_repr::External::deserialize(deserializer).map(LoreMetadata::from)
         }
     }
 }
@@ -1501,7 +1364,7 @@ impl ValidateText for LoreMetadata {
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
 /// The kind of a tracked node.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreNodeType {
     /// A directory.
@@ -1540,7 +1403,7 @@ pub enum LoreNodeStagedAction {
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
 /// The change applied to a file.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreFileAction {
     /// The file is unchanged.
@@ -1559,7 +1422,7 @@ pub enum LoreFileAction {
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
 /// Where a branch is located.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreBranchLocation {
     /// A branch held locally.
@@ -1579,7 +1442,7 @@ impl Display for LoreBranchLocation {
 
 /// A branch paired with a revision on that branch.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 pub struct LoreBranchPoint {
     /// The branch.
     pub branch: BranchId,
@@ -1648,550 +1511,5 @@ pub fn shutdown() {
         }
 
         rpmalloc_finalize();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// An empty array holds a null pointer whichever constructor built it. `Drop` frees only a
-    /// non-null pointer with a count above zero, so any other pairing leaks.
-    #[test]
-    fn an_empty_array_holds_no_buffer() {
-        let from_empty_vec = LoreArray::<u32>::from_vec(Vec::new());
-
-        assert!(
-            from_empty_vec.ptr.is_null(),
-            "from_vec allocated for an empty vec, and Drop's `count > 0` guard skips that buffer"
-        );
-        assert_eq!(from_empty_vec.count, 0);
-        assert_eq!(from_empty_vec, LoreArray::default());
-    }
-
-    /// A zero-sized element type gives a zero-sized layout at every count, so nothing is
-    /// allocated, yet the count and the elements must survive.
-    #[test]
-    fn a_zero_sized_element_type_keeps_its_count_without_allocating() {
-        let array = LoreArray::<()>::from_vec(vec![(); 3]);
-
-        // The dangling pointer is the observable proof that nothing was allocated: an allocator
-        // would not answer the alignment as an address. A slice also needs it non-null.
-        assert_eq!(
-            array.ptr,
-            std::ptr::NonNull::<()>::dangling().as_ptr(),
-            "a zero-sized type must take a dangling pointer, not an allocation"
-        );
-        assert_eq!(array.len(), 3);
-        assert_eq!(array.as_slice(), [(), (), ()]);
-        assert_eq!(array.clone().as_slice(), [(), (), ()]);
-    }
-
-    /// Skipping the allocation must not skip the elements: `Drop` still runs each one.
-    #[test]
-    fn a_zero_sized_element_type_still_drops_every_element() {
-        static DROPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-        struct Counted;
-        impl Drop for Counted {
-            fn drop(&mut self) {
-                DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-
-        drop(LoreArray::from_vec(vec![Counted, Counted, Counted]));
-
-        assert_eq!(
-            DROPPED.load(std::sync::atomic::Ordering::Relaxed),
-            3,
-            "every element must drop even though nothing was allocated"
-        );
-    }
-
-    /// Deserializing an empty sequence routes through `from_vec`.
-    #[test]
-    fn a_deserialized_empty_array_holds_no_buffer() {
-        let decoded: LoreArray<u32> =
-            serde_json::from_str("[]").expect("an empty sequence deserializes");
-
-        assert!(
-            decoded.ptr.is_null(),
-            "deserializing an empty array allocated a buffer Drop will not free"
-        );
-    }
-
-    /// Arguments are logged whole, so a rendering that named every element of a
-    /// caller's path list would be the bulk of a log.
-    #[test]
-    fn a_long_array_renders_as_its_count() {
-        let at_limit = LoreArray::from_vec(vec![7u32; DEBUG_ELEMENT_LIMIT]);
-        assert_eq!(
-            format!("{at_limit:?}"),
-            format!("{:?}", [7u32; DEBUG_ELEMENT_LIMIT])
-        );
-
-        let over_limit = LoreArray::from_vec(vec![7u32; DEBUG_ELEMENT_LIMIT + 1]);
-        assert_eq!(
-            format!("{over_limit:?}"),
-            format!("[{} items...]", DEBUG_ELEMENT_LIMIT + 1)
-        );
-    }
-
-    /// `{"iss":"lore","sub":"alice","name":"Alice","exp":2000000000,"aud":["example.com"]}`
-    const ALICE_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
-
-    /// The tokens cross the C boundary as raw bytes and `validate` reads them as
-    /// text, so they have to be checked like every other string a call carries.
-    #[test]
-    fn a_token_that_is_not_utf8_is_reported_by_field() {
-        let globals = LoreGlobalArgs {
-            identity_token: LoreString::from_bytes(&[b'a', 0xff, 0xfe]),
-            ..Default::default()
-        };
-        assert_eq!(
-            globals
-                .validate_text()
-                .expect_err("invalid text must be reported")
-                .field(),
-            "identity_token"
-        );
-
-        let globals = LoreGlobalArgs {
-            access_token: LoreString::from_bytes(&[b'a', 0xff, 0xfe]),
-            ..Default::default()
-        };
-        assert_eq!(
-            globals
-                .validate_text()
-                .expect_err("invalid text must be reported")
-                .field(),
-            "access_token"
-        );
-    }
-
-    #[test]
-    fn no_credential_arguments_is_valid() {
-        let mut globals = LoreGlobalArgs::default();
-        assert!(globals.validate().is_ok());
-        assert!(globals.identity.is_empty());
-    }
-
-    #[test]
-    fn identity_alone_is_valid_and_untouched() {
-        let mut globals = LoreGlobalArgs {
-            identity: "bob".into(),
-            ..Default::default()
-        };
-        assert!(globals.validate().is_ok());
-        assert_eq!(globals.identity.as_str(), "bob");
-    }
-
-    #[test]
-    fn identity_token_resolves_the_identity_it_names() {
-        let mut globals = LoreGlobalArgs {
-            identity_token: ALICE_TOKEN.into(),
-            ..Default::default()
-        };
-        assert!(globals.validate().is_ok());
-        assert_eq!(globals.identity.as_str(), "alice");
-    }
-
-    #[test]
-    fn access_token_alone_resolves_the_identity_it_names() {
-        // Mode 2: only an access token. It names the identity, and operations
-        // that need an authentication token fail later rather than reading one
-        // out of the store.
-        let mut globals = LoreGlobalArgs {
-            access_token: ALICE_TOKEN.into(),
-            ..Default::default()
-        };
-        assert!(globals.validate().is_ok());
-        assert_eq!(globals.identity.as_str(), "alice");
-    }
-
-    #[test]
-    fn both_tokens_take_the_identity_from_the_identity_token() {
-        // Mode 3: both supplied. The authentication token is the authority on
-        // identity.
-        let mut globals = LoreGlobalArgs {
-            identity_token: ALICE_TOKEN.into(),
-            access_token: "authz-token".into(),
-            ..Default::default()
-        };
-        assert!(globals.validate().is_ok());
-        assert_eq!(globals.identity.as_str(), "alice");
-    }
-
-    #[test]
-    fn access_token_naming_no_identity_is_rejected() {
-        // With no identity token to fall back on, an access token that names no
-        // subject leaves the call with no identity to act as.
-        let mut globals = LoreGlobalArgs {
-            access_token: "not-a-jwt".into(),
-            ..Default::default()
-        };
-        assert!(globals.validate().is_err());
-        assert!(globals.identity.is_empty());
-    }
-
-    #[test]
-    fn identity_and_access_token_are_mutually_exclusive() {
-        let mut globals = LoreGlobalArgs {
-            identity: "alice".into(),
-            access_token: ALICE_TOKEN.into(),
-            ..Default::default()
-        };
-        assert!(globals.validate().is_err());
-    }
-
-    #[test]
-    fn identity_and_identity_token_are_mutually_exclusive() {
-        let mut globals = LoreGlobalArgs {
-            identity: "alice".into(),
-            identity_token: ALICE_TOKEN.into(),
-            ..Default::default()
-        };
-        // Rejected even when they agree: one of them has to be the authority.
-        assert!(globals.validate().is_err());
-    }
-
-    #[test]
-    fn identity_token_naming_no_identity_is_rejected() {
-        let mut globals = LoreGlobalArgs {
-            identity_token: "not-a-jwt".into(),
-            ..Default::default()
-        };
-        assert!(globals.validate().is_err());
-        assert!(globals.identity.is_empty());
-    }
-
-    /// A name arriving across the C boundary can hold any byte sequence. The
-    /// formatting paths run on every dispatched command, so they must render
-    /// such a string instead of assuming UTF-8.
-    #[test]
-    fn lore_string_renders_invalid_utf8_as_replacement_characters() {
-        let value = LoreString::from_bytes(&[b'a', 0xff, 0xfe, b'b']);
-
-        assert_eq!(value.as_bytes(), &[b'a', 0xff, 0xfe, b'b']);
-        assert_eq!(format!("{value}"), "a\u{fffd}\u{fffd}b");
-        assert_eq!(format!("{value:?}"), "a\u{fffd}\u{fffd}b");
-    }
-
-    /// Unlike formatting, serialization must not substitute: it carries the
-    /// command to the service, where a replacement-character name would be
-    /// accepted as valid text that the in-process path would have rejected.
-    #[test]
-    fn lore_string_serialization_rejects_invalid_utf8() {
-        let value = LoreString::from_bytes(&[b'a', 0xff, 0xfe, b'b']);
-        assert!(
-            serde_json::to_string(&value).is_err(),
-            "serializing non-UTF-8 text must fail rather than substitute"
-        );
-
-        let valid = LoreString::from_str("doc.md");
-        assert_eq!(
-            serde_json::to_string(&valid).expect("valid text must serialize"),
-            "\"doc.md\""
-        );
-    }
-
-    /// Equality compares the raw bytes, so strings that differ only in an
-    /// invalid sequence stay distinguishable.
-    #[test]
-    fn lore_string_equality_compares_bytes() {
-        assert_eq!(LoreString::from_str("same"), LoreString::from_str("same"));
-        assert_ne!(
-            LoreString::from_bytes(&[0xff]),
-            LoreString::from_bytes(&[0xfe])
-        );
-    }
-
-    /// Every call clones its arguments before anything checks them, so cloning
-    /// must copy the bytes rather than read them as text.
-    #[test]
-    fn lore_string_clone_copies_bytes_that_are_not_utf8() {
-        let value = LoreString::from_bytes(&[b'a', 0xff, 0xfe, b'b']);
-
-        let cloned = value.clone();
-        assert_eq!(cloned.as_bytes(), &[b'a', 0xff, 0xfe, b'b']);
-
-        let mut assigned = LoreString::from_str("replaced");
-        assigned.clone_from(&value);
-        assert_eq!(assigned.as_bytes(), &[b'a', 0xff, 0xfe, b'b']);
-    }
-
-    #[test]
-    fn validate_text_accepts_valid_utf8_and_empty_strings() {
-        assert!(LoreString::from_str("doc.md").validate_text().is_ok());
-        assert!(LoreString::default().validate_text().is_ok());
-        assert!(LoreString::from_str("ünïcøde").validate_text().is_ok());
-    }
-
-    #[test]
-    fn validate_text_rejects_bytes_that_are_not_utf8() {
-        assert!(
-            LoreString::from_bytes(&[b'a', 0xff])
-                .validate_text()
-                .is_err()
-        );
-    }
-
-    /// An array reports which element failed, so the rejection points at one
-    /// entry rather than the whole field.
-    #[test]
-    fn validate_text_names_the_array_element_that_failed() {
-        let strings = LoreArray::from_vec(vec![
-            LoreString::from_str("first"),
-            LoreString::from_str("second"),
-            LoreString::from_bytes(&[0xff]),
-        ]);
-
-        let error = strings
-            .validate_text()
-            .map_err(|error| error.inside("paths"))
-            .expect_err("the element must fail");
-
-        assert_eq!(error.field(), "paths[2]");
-    }
-
-    #[test]
-    fn validate_text_passes_arguments_that_hold_no_text() {
-        assert!(LoreArray::<LoreString>::default().validate_text().is_ok());
-        assert!(LoreGlobalArgs::default().validate_text().is_ok());
-    }
-
-    #[test]
-    fn validate_text_names_the_failing_field_of_the_global_arguments() {
-        let globals = LoreGlobalArgs {
-            identity: LoreString::from_bytes(&[b'i', 0xff]),
-            ..LoreGlobalArgs::default()
-        };
-
-        let error = globals
-            .validate_text()
-            .map_err(|error| error.inside("globals"))
-            .expect_err("the identity must fail");
-        assert_eq!(error.field(), "globals.identity");
-    }
-}
-
-#[cfg(test)]
-mod metadata_repr_tests {
-    use super::LoreBinary;
-    use super::LoreMetadata;
-    use super::LoreString;
-
-    /// The JSON shape is a published wire format that existing clients read, and
-    /// the serializer producing it is hand-written rather than derived, so the
-    /// exact bytes are the contract — not just that a round trip works. Every
-    /// kind is pinned, because each reaches JSON by its own route: a bool for a
-    /// byte, hex text for the identifiers, and base64 for a block of raw bytes.
-    #[test]
-    fn json_keeps_the_adjacently_tagged_shape() {
-        let hash = super::Hash::from([0xabu8; 32]);
-        let context = super::Context::from([0xcdu8; 16]);
-        let cases = [
-            (
-                LoreMetadata::String(LoreString::from_str("hi")),
-                r#"{"tagName":"string","data":"hi"}"#.to_string(),
-            ),
-            (
-                LoreMetadata::Numeric(4207),
-                r#"{"tagName":"numeric","data":4207}"#.to_string(),
-            ),
-            (
-                LoreMetadata::Boolean(1),
-                r#"{"tagName":"boolean","data":true}"#.to_string(),
-            ),
-            (
-                LoreMetadata::Boolean(0),
-                r#"{"tagName":"boolean","data":false}"#.to_string(),
-            ),
-            (
-                LoreMetadata::Binary(LoreBinary::from_bytes(&[0x00, 0xff, 0x01])),
-                r#"{"tagName":"binary","data":"AP8B"}"#.to_string(),
-            ),
-            (
-                LoreMetadata::Hash(hash),
-                format!(r#"{{"tagName":"hash","data":"{}"}}"#, "ab".repeat(32)),
-            ),
-            (
-                LoreMetadata::Context(context),
-                format!(r#"{{"tagName":"context","data":"{}"}}"#, "cd".repeat(16)),
-            ),
-            (
-                LoreMetadata::Address(super::Address { hash, context }),
-                format!(
-                    r#"{{"tagName":"address","data":"{}-{}"}}"#,
-                    "ab".repeat(32),
-                    "cd".repeat(16)
-                ),
-            ),
-        ];
-
-        for (value, want) in cases {
-            let json = serde_json::to_string(&value).expect("serialize");
-            assert_eq!(json, want, "the published shape must not drift");
-            let back: LoreMetadata = serde_json::from_str(&json).expect("deserialize");
-            assert_eq!(back, value);
-        }
-    }
-
-    /// A boolean is a JSON bool but a byte in the C union, and the two must not
-    /// disagree: any non-zero byte is true, and true reads back as exactly 1.
-    #[test]
-    fn a_non_zero_boolean_byte_normalizes_through_json() {
-        let json = serde_json::to_string(&LoreMetadata::Boolean(37)).expect("serialize");
-        assert_eq!(json, r#"{"tagName":"boolean","data":true}"#);
-        let back: LoreMetadata = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back, LoreMetadata::Boolean(1));
-    }
-
-    /// Every variant has to survive the format used between a client and the
-    /// service, which cannot read the tagged shape at all.
-    #[test]
-    fn every_variant_survives_the_compact_format() {
-        let values = [
-            LoreMetadata::Address(super::Address::default()),
-            LoreMetadata::Boolean(1),
-            LoreMetadata::Binary(LoreBinary::from_bytes(&[0x00, 0xff])),
-            LoreMetadata::Context(super::Context::default()),
-            LoreMetadata::Hash(super::Hash::default()),
-            LoreMetadata::Numeric(u64::MAX),
-            LoreMetadata::String(LoreString::from_str("hi")),
-        ];
-
-        for value in values {
-            let encoded = bitcode::serialize(&value).expect("serialize");
-            let decoded: LoreMetadata = bitcode::deserialize(&encoded).expect("deserialize");
-            assert_eq!(decoded, value, "{value:?} must survive the compact format");
-        }
-    }
-}
-
-#[cfg(test)]
-mod binary_tests {
-    use super::LoreBinary;
-
-    /// `LoreBinary` owns its payload, so a clone survives the original being
-    /// dropped. Before it owned anything, the clone was a copy of a pointer and
-    /// this read freed memory.
-    #[test]
-    fn a_clone_outlives_the_value_it_came_from() {
-        let clone = {
-            let original = LoreBinary::from_bytes(&[0xde, 0xad, 0xbe, 0xef]);
-            original.clone()
-        };
-        assert_eq!(clone.as_bytes(), &[0xde, 0xad, 0xbe, 0xef]);
-    }
-
-    #[test]
-    fn an_empty_block_is_a_null_pointer_of_zero_length() {
-        let empty = LoreBinary::from_bytes(&[]);
-        assert!(empty.is_empty());
-        assert_eq!(empty.len(), 0);
-        assert!(empty.payload.is_null());
-        assert_eq!(empty.as_bytes(), &[] as &[u8]);
-        assert_eq!(empty, LoreBinary::default());
-    }
-
-    /// An event carrying a binary metadata value reaches an out-of-process
-    /// caller as a serialized value, so it has to deserialize. It used to panic
-    /// outright: the impl was `unimplemented!()`, which is why the revision-tree
-    /// read verb refused binary values rather than delivering one.
-    ///
-    /// Both a self-describing format and a non-self-describing one are covered,
-    /// because the two take different paths through the impl.
-    #[test]
-    fn a_binary_value_survives_serialization() {
-        let block = LoreBinary::from_bytes(b"raw\x00bytes");
-
-        let json = serde_json::to_vec(&block).expect("json serialize");
-        let from_json: LoreBinary = serde_json::from_slice(&json).expect("json deserialize");
-        assert_eq!(from_json, block, "json must round-trip a binary block");
-
-        let encoded = bitcode::serialize(&block).expect("bitcode serialize");
-        let from_bitcode: LoreBinary = bitcode::deserialize(&encoded).expect("bitcode deserialize");
-        assert_eq!(
-            from_bitcode, block,
-            "bitcode must round-trip a binary block"
-        );
-    }
-
-    /// Equality is by content, not by length or by pointer identity: two blocks
-    /// of the same size holding different bytes are different values.
-    #[test]
-    fn blocks_of_equal_length_compare_by_content() {
-        let block = LoreBinary::from_bytes(&[1, 2, 3, 4]);
-        assert_eq!(block, LoreBinary::from_bytes(&[1, 2, 3, 4]));
-        assert_ne!(block, LoreBinary::from_bytes(&[1, 2, 3, 5]));
-        assert_ne!(block, LoreBinary::from_bytes(&[1, 2, 3]));
-    }
-
-    /// An empty block still has to survive a round trip: the deserializer has to
-    /// produce the null-pointer form rather than a dangling allocation. Both
-    /// formats are covered, since an empty block is the one input where the
-    /// text encoding carries no characters at all.
-    #[test]
-    fn an_empty_block_survives_serialization() {
-        let empty = LoreBinary::from_bytes(&[]);
-
-        let json = serde_json::to_string(&empty).expect("json serialize");
-        assert_eq!(json, r#""""#);
-        let from_json: LoreBinary = serde_json::from_str(&json).expect("json deserialize");
-        assert_eq!(from_json, empty);
-        assert!(from_json.payload.is_null());
-
-        let encoded = bitcode::serialize(&empty).expect("bitcode serialize");
-        let decoded: LoreBinary = bitcode::deserialize(&encoded).expect("bitcode deserialize");
-        assert_eq!(decoded, empty);
-        assert!(decoded.payload.is_null());
-    }
-
-    /// Text that is not base64 is a malformed payload, not an empty block: a
-    /// reader that quietly produced one would hand a caller a value the sender
-    /// never wrote.
-    #[test]
-    fn json_text_that_is_not_base64_fails_to_read() {
-        let result: Result<LoreBinary, _> = serde_json::from_str(r#""not base64!""#);
-        assert!(result.is_err());
-    }
-}
-
-#[cfg(test)]
-mod event_interval_tests {
-    use super::*;
-
-    fn globals(event_interval_ms: u64) -> LoreGlobalArgs {
-        LoreGlobalArgs {
-            event_interval_ms,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn an_unset_interval_takes_the_default() {
-        assert_eq!(
-            globals(0).event_interval(),
-            std::time::Duration::from_millis(DEFAULT_EVENT_INTERVAL_MS)
-        );
-    }
-
-    /// A caller asking for a sub-millisecond tick would spend more on reporting
-    /// than on the commit, so the floor holds regardless of what was asked.
-    #[test]
-    fn an_interval_below_the_floor_is_raised_to_it() {
-        assert_eq!(
-            globals(1).event_interval(),
-            std::time::Duration::from_millis(10)
-        );
-    }
-
-    #[test]
-    fn an_explicit_interval_is_used_as_given() {
-        assert_eq!(
-            globals(2500).event_interval(),
-            std::time::Duration::from_millis(2500)
-        );
     }
 }

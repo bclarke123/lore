@@ -22,18 +22,24 @@ mod tests {
     use std::sync::Arc;
     use std::sync::LazyLock;
     use std::sync::Mutex;
+    use std::sync::mpsc;
     use std::time::Duration;
     use std::time::Instant;
 
+    use lore::interface::LoreArray;
     use lore::interface::LoreEvent;
     use lore::interface::LoreEventCallback;
     use lore::interface::LoreString;
+    use lore::revision::LoreRevisionCherryPickArgs;
     use lore::service::LoreServiceSetExecutableArgs;
     use lore::service::LoreServiceSetUseAutomaticallyArgs;
     use lore::service::LoreServiceStartArgs;
+    use lore::service::LoreServiceStatusArgs;
     use lore::service::LoreServiceStopArgs;
+    use lore::shared_store::LoreSharedStoreListArgs;
     use lore_base::error::ServiceUnavailable;
     use lore_error_set::FfiError;
+    use lore_revision::interface::LoreEventCallbackConfig;
     use lore_revision::interface::LoreGlobalArgs;
     use rand::distr::Alphanumeric;
     use rand::distr::SampleString;
@@ -158,6 +164,10 @@ mod tests {
         lore::service::start(globals(), LoreServiceStartArgs {}, callback).await
     }
 
+    async fn status(callback: LoreEventCallback) -> i32 {
+        lore::service::status(globals(), LoreServiceStatusArgs {}, callback).await
+    }
+
     /// The code a caller branches on when a call did not run because no service
     /// could be reached or started.
     fn unavailable_code() -> i32 {
@@ -167,29 +177,108 @@ mod tests {
         .ffi_code()
     }
 
-    /// Collects the failure messages a call reports, so a test can assert on
-    /// what a reader is told and not only on the code they branch on.
-    ///
-    /// A local call reports through the detail on its `Complete` event; a routed
-    /// one also emits `Error`. Both are collected, so the text reads the same
-    /// either way.
+    /// Collects the failure message a call reports on its `Complete` event, so a
+    /// test can assert on what a reader is told and not only on the code they
+    /// branch on.
     fn capturing() -> (Arc<Mutex<Vec<String>>>, LoreEventCallback) {
         let collected: Arc<Mutex<Vec<String>>> = Arc::default();
         let recorder = Arc::clone(&collected);
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
-            let message = match event {
-                LoreEvent::Error(data) => data.error_inner.to_string(),
-                LoreEvent::Complete(data) => data.error.message.to_string(),
-                _ => return,
-            };
-            if !message.is_empty() {
+            if let LoreEvent::Complete(data) = event
+                && !data.error.message.is_empty()
+            {
                 recorder
                     .lock()
                     .expect("the collector lock is not poisoned")
-                    .push(message);
+                    .push(data.error.message.to_string());
             }
         }));
         (collected, callback)
+    }
+
+    /// An event a C callback received, reduced to what a caller reads from it.
+    #[derive(Debug, PartialEq)]
+    enum Delivered {
+        Error,
+        Complete {
+            status: i32,
+            error_code: i32,
+            has_message: bool,
+            has_trace: bool,
+        },
+        End,
+    }
+
+    /// Where [`record`] sends what it receives. Set by [`delivered`], which the
+    /// `#[serial]` lock every test here holds keeps to one caller at a time.
+    static RECORDED: Mutex<Option<mpsc::Sender<Delivered>>> = Mutex::new(None);
+
+    unsafe extern "C" fn record(event: &LoreEvent, _user_context: u64) {
+        let delivered = match event {
+            LoreEvent::Error(_) => Delivered::Error,
+            LoreEvent::Complete(data) => Delivered::Complete {
+                status: data.status,
+                error_code: data.error.error_code,
+                has_message: !data.error.message.is_empty(),
+                has_trace: !data.error.trace_locations.as_slice().is_empty(),
+            },
+            LoreEvent::End(_) => Delivered::End,
+            _ => return,
+        };
+        if let Some(sender) = RECORDED
+            .lock()
+            .expect("the sender lock is not poisoned")
+            .as_ref()
+        {
+            let _ = sender.send(delivered);
+        }
+    }
+
+    /// Runs `call` with a C callback and returns what the callback received, up
+    /// to and including `End`.
+    fn delivered(call: impl FnOnce(LoreEventCallbackConfig)) -> Vec<Delivered> {
+        let (sender, receiver) = mpsc::channel();
+        *RECORDED.lock().expect("the sender lock is not poisoned") = Some(sender);
+        call(LoreEventCallbackConfig {
+            user_context: 0,
+            func: Some(record),
+        });
+
+        let mut received = Vec::new();
+        while received.last() != Some(&Delivered::End) {
+            received.push(
+                receiver
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("every call ends with an End event"),
+            );
+        }
+        received
+    }
+
+    /// What a call that failed with `code` delivers: one `Complete` carrying the
+    /// code and the detail, then `End`.
+    fn failed_with(code: i32) -> [Delivered; 2] {
+        [
+            Delivered::Complete {
+                status: code,
+                error_code: code,
+                has_message: true,
+                has_trace: true,
+            },
+            Delivered::End,
+        ]
+    }
+
+    /// Turns relaying on and names an executable that does not exist, so a
+    /// relayed call reaches no service and none is started.
+    fn relaying_to_no_service(prefix: &str) -> TempDir {
+        let settings = machine_settings(prefix);
+        let missing = settings.path().join("no-such-lore");
+        lore::runtime().block_on(async {
+            assert_eq!(set_use_automatically(true).await, 0);
+            assert_eq!(set_executable(&missing.to_string_lossy()).await, 0);
+        });
+        settings
     }
 
     /// An executable that exits at once rather than listening, which is what a
@@ -220,25 +309,21 @@ mod tests {
         );
     }
 
-    /// Both settings are stored, and both are read back by the decision the
-    /// dispatch makes. Written through the API rather than into the file, since
-    /// what an embedder can set is the point.
+    /// The `use_automatically` setting alone turns relaying on. An executable is
+    /// only needed to start a service when none is running; a running service can
+    /// be used without one configured.
     #[test]
     #[serial]
-    fn both_settings_together_turn_relaying_on() {
-        let _settings = machine_settings("service-api-both-settings-");
+    fn use_automatically_alone_turns_relaying_on() {
+        let _settings = machine_settings("service-api-use-automatically-");
 
         lore::runtime().block_on(async {
             assert_eq!(set_use_automatically(true).await, 0);
             assert!(
-                !lore::will_use_service(),
-                "the setting alone must not relay: the executable is unnamed, so \
-                 the version serving the machine would be whichever program \
-                 relayed first"
+                lore::will_use_service(),
+                "the setting alone must relay: a running service can be used \
+                 without an executable configured"
             );
-
-            assert_eq!(set_executable("/opt/lore/1.9/bin/lore").await, 0);
-            assert!(lore::will_use_service(), "with both named, calls relay");
         });
     }
 
@@ -255,26 +340,58 @@ mod tests {
         });
     }
 
-    /// Clearing the executable turns relaying off again, and the setter forgets
-    /// the decision this process already made so that the change takes effect
-    /// without it being restarted.
+    /// Clearing the executable does not turn relaying off. An executable is only
+    /// needed to start a service; relaying stays on so that a running service can
+    /// still be used.
     #[test]
     #[serial]
-    fn clearing_the_executable_turns_relaying_off_within_the_process() {
+    fn clearing_the_executable_does_not_turn_relaying_off() {
         let _settings = machine_settings("service-api-clear-executable-");
 
         lore::runtime().block_on(async {
             assert_eq!(set_use_automatically(true).await, 0);
             assert_eq!(set_executable("/opt/lore/1.9/bin/lore").await, 0);
-            assert!(lore::will_use_service(), "both are named");
+            assert!(lore::will_use_service(), "relaying is on");
 
             assert_eq!(set_executable("").await, 0);
             assert!(
-                !lore::will_use_service(),
-                "clearing the executable must take effect in this process, not \
-                 only in the next one"
+                lore::will_use_service(),
+                "clearing the executable must not turn relaying off: a running \
+                 service can still be used without an executable configured"
             );
         });
+    }
+
+    /// `lore_link_list_staged` decides at the entry whether to relay, so with
+    /// relaying on it goes to the service, which holds the repository, rather
+    /// than opening the repository here.
+    ///
+    /// No service can be reached, and the directory named holds no repository, so
+    /// a call that ran here would fail differently.
+    #[test]
+    #[serial]
+    fn the_link_list_staged_entry_point_relays_to_the_service() {
+        let settings = machine_settings("service-api-link-list-staged-");
+        let missing = settings.path().join("no-such-lore");
+        lore::runtime().block_on(async {
+            assert_eq!(set_use_automatically(true).await, 0);
+            assert_eq!(set_executable(&missing.to_string_lossy()).await, 0);
+        });
+
+        let globals = LoreGlobalArgs {
+            repository_path: settings.path().display().to_string().into(),
+            ..LoreGlobalArgs::default()
+        };
+
+        assert_eq!(
+            lore::interface::lore_link_list_staged(
+                &globals,
+                &lore::link::LoreLinkListStagedArgs {},
+                no_callback()
+            ),
+            unavailable_code(),
+            "the entry point must relay the call rather than run it here"
+        );
     }
 
     /// Turning the setting off turns relaying off within the process, for the
@@ -292,6 +409,32 @@ mod tests {
             assert_eq!(set_use_automatically(false).await, 0);
             assert!(!lore::will_use_service());
         });
+    }
+
+    /// `lore_shared_store_list` decides at the entry whether to relay, so with
+    /// relaying on it goes to the service rather than reading the registry here.
+    ///
+    /// No service can be reached, and the registry here is empty, so a call that
+    /// ran here would succeed.
+    #[test]
+    #[serial]
+    fn the_shared_store_list_entry_point_relays_to_the_service() {
+        let settings = machine_settings("service-api-shared-store-list-");
+        let missing = settings.path().join("no-such-lore");
+        lore::runtime().block_on(async {
+            assert_eq!(set_use_automatically(true).await, 0);
+            assert_eq!(set_executable(&missing.to_string_lossy()).await, 0);
+        });
+
+        assert_eq!(
+            lore::interface::lore_shared_store_list(
+                &globals(),
+                &LoreSharedStoreListArgs::default(),
+                no_callback()
+            ),
+            unavailable_code(),
+            "the entry point must relay the call rather than run it here"
+        );
     }
 
     /// A relayed call that reaches no service fails with the code that says so,
@@ -332,6 +475,40 @@ mod tests {
             unavailable_code(),
             "an unreachable service must report as one, not as the call having \
              run and failed"
+        );
+    }
+
+    /// `lore_revision_cherry_pick` decides at the entry whether to relay, so with
+    /// relaying on it goes to the service rather than cherry-picking here.
+    ///
+    /// No service can be reached, and the directory named holds no repository, so
+    /// a call that ran here would fail differently.
+    #[test]
+    #[serial]
+    fn the_cherry_pick_entry_point_relays_to_the_service() {
+        let settings = machine_settings("service-api-cherry-pick-");
+        let missing = settings.path().join("no-such-lore");
+        lore::runtime().block_on(async {
+            assert_eq!(set_use_automatically(true).await, 0);
+            assert_eq!(set_executable(&missing.to_string_lossy()).await, 0);
+        });
+
+        let globals = LoreGlobalArgs {
+            repository_path: settings.path().display().to_string().into(),
+            offline: 1,
+            ..LoreGlobalArgs::default()
+        };
+        let args = LoreRevisionCherryPickArgs {
+            revision: LoreString::from("main@1"),
+            message: LoreString::default(),
+            no_commit: 0,
+            inherit_metadata: LoreArray::default(),
+        };
+
+        assert_eq!(
+            lore::interface::lore_revision_cherry_pick(&globals, &args, no_callback()),
+            unavailable_code(),
+            "the entry point must relay the call rather than run it here"
         );
     }
 
@@ -400,5 +577,97 @@ mod tests {
             reported.contains("no-such-lore"),
             "the failure must name the executable it could not start: {reported}"
         );
+    }
+
+    /// A status with no service running succeeds with running=false, rather than
+    /// failing with a connection error. This is the expected behavior when the
+    /// service is not started.
+    #[test]
+    #[serial]
+    fn status_without_service_returns_not_running() {
+        let _settings = machine_settings("service-api-status-none-");
+
+        let status_events: Arc<Mutex<Vec<lore_revision::event::LoreServiceStatusEventData>>> =
+            Arc::default();
+        let recorder = Arc::clone(&status_events);
+        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+            if let LoreEvent::ServiceStatus(data) = event {
+                recorder
+                    .lock()
+                    .expect("the collector lock is not poisoned")
+                    .push(data.clone());
+            }
+        }));
+
+        let exit_code = lore::runtime().block_on(status(callback));
+
+        assert_eq!(
+            exit_code, 0,
+            "status with no service running should succeed"
+        );
+
+        let events = status_events
+            .lock()
+            .expect("the collector lock is not poisoned");
+        assert_eq!(events.len(), 1, "exactly one ServiceStatus event expected");
+        assert_eq!(
+            events[0].running, 0,
+            "running should be 0 when service is not running"
+        );
+        assert!(
+            events[0].binary_path.is_empty(),
+            "binary_path should be empty when not running"
+        );
+        assert_eq!(
+            events[0].uptime_ms, 0,
+            "uptime_ms should be 0 when not running"
+        );
+        assert_eq!(
+            events[0].connection_count, 0,
+            "connection_count should be 0 when not running"
+        );
+        assert_eq!(
+            events[0].swfs_mount_count, 0,
+            "swfs_mount_count should be 0 when not running"
+        );
+    }
+
+    /// A relayed call that reaches no service reports as a failing command does:
+    /// the code on the return value and on one `Complete` carrying the detail,
+    /// then `End`, with no legacy `Error` event.
+    #[test]
+    #[serial]
+    fn a_relayed_call_that_reaches_no_service_completes_with_the_failure() {
+        let _settings = relaying_to_no_service("service-api-relay-complete-");
+
+        let mut status = 0;
+        let received = delivered(|callback| {
+            status = lore::interface::lore_revision_info(
+                &globals(),
+                &lore::revision::LoreRevisionInfoArgs::default(),
+                callback,
+            );
+        });
+
+        assert_eq!(received, failed_with(unavailable_code()));
+        assert_eq!(status, unavailable_code(), "the return value is the status");
+    }
+
+    /// The asynchronous entry point returns nothing, so `Complete` is the only
+    /// place a relayed call's failure reaches its caller.
+    #[test]
+    #[serial]
+    fn an_asynchronous_relayed_call_that_reaches_no_service_completes_with_the_failure() {
+        let _settings = relaying_to_no_service("service-api-relay-complete-async-");
+
+        let received = delivered(|callback| {
+            lore::interface::lore_revision_info_async(
+                &globals(),
+                &lore::revision::LoreRevisionInfoArgs::default(),
+                callback,
+            );
+        });
+
+        assert_eq!(received, failed_with(unavailable_code()));
     }
 }

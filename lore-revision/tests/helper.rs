@@ -183,6 +183,170 @@ pub async fn test_repository_create(
     }
 }
 
+/// A context over `instance` whose view holds `globs` and whose ignore slot is empty, a leading
+/// `!` re-including as it does in a view file.
+///
+/// Each call mints its own filter, so two contexts hold different ones whether or not their
+/// rules agree -- which is what a diff reads as two views.
+#[allow(dead_code)]
+pub fn test_view_context(
+    instance: &TestRepository,
+    immutable_store: std::sync::Arc<dyn lore_storage::ImmutableStore>,
+    mutable_store: std::sync::Arc<dyn lore_storage::MutableStore>,
+    globs: &[&str],
+) -> std::sync::Arc<lore_revision::repository::RepositoryContext> {
+    test_filter_context(instance, immutable_store, mutable_store, &[], globs)
+}
+
+/// [`test_view_context`] with `ignore` in the ignore slot, for a test that has to tell the two
+/// slots apart. A repository opened for real holds rules in both.
+#[allow(dead_code)]
+pub fn test_filter_context(
+    instance: &TestRepository,
+    immutable_store: std::sync::Arc<dyn lore_storage::ImmutableStore>,
+    mutable_store: std::sync::Arc<dyn lore_storage::MutableStore>,
+    ignore: &[&str],
+    view: &[&str],
+) -> std::sync::Arc<lore_revision::repository::RepositoryContext> {
+    let mut filter = lore_revision::filter::Filter::default();
+    for (slot, globs) in [(&mut filter.ignore, ignore), (&mut filter.view, view)] {
+        for glob in globs {
+            match glob.strip_prefix('!') {
+                Some(inclusion) => slot.add_inclusion(inclusion).expect("Filter inclusion"),
+                None => slot.add_exclusion(glob).expect("Filter exclusion"),
+            }
+        }
+    }
+    std::sync::Arc::new(lore_revision::repository::RepositoryContext::new(
+        default_repository_creation_args(immutable_store, mutable_store)
+            .with_path(&instance.path)
+            .with_id(instance.repository.id)
+            .with_instance_id(instance.repository.instance_id)
+            .with_filter(std::sync::Arc::new(filter)),
+    ))
+}
+
+/// An OS filesystem that holds its state in a `State` as far as a command asks it
+/// ([`lore_revision::fs::filesystem_provider::FilesystemProvider::holds_state`]), as its
+/// operations do, while they read and write the files themselves. Counts the operations begun on
+/// it.
+#[allow(dead_code)]
+pub struct HoldingFilesystem {
+    pub inner: lore_revision::fs::os::OsFilesystem,
+    pub begins: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl lore_revision::fs::filesystem_provider::FilesystemProvider for HoldingFilesystem {
+    async fn begin_operation(
+        &self,
+    ) -> Result<
+        std::sync::Arc<lore_revision::fs::filesystem_provider::InstanceOperationImpl>,
+        lore_revision::fs::filesystem_provider::FsError,
+    > {
+        self.begins
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(std::sync::Arc::new(
+            lore_revision::fs::filesystem_provider::InstanceOperationImpl::new(
+                lore_revision::fs::filesystem_provider::StaticDispatchInstanceOperation::Os(
+                    self.inner.begin_operation(),
+                ),
+                self.holds_state(),
+            ),
+        ))
+    }
+
+    fn holds_state(&self) -> bool {
+        true
+    }
+}
+
+/// `repository`, with its stores, filter and write token, reading its working tree through the
+/// [`HoldingFilesystem`] answered beside it.
+#[allow(dead_code)]
+pub fn test_holding_context(
+    repository: &lore_revision::repository::RepositoryContext,
+) -> (
+    std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    std::sync::Arc<HoldingFilesystem>,
+) {
+    let path = repository.require_path().expect("A repository on disk");
+    let filesystem = std::sync::Arc::new(HoldingFilesystem {
+        inner: lore_revision::fs::os::OsFilesystem::new(path),
+        begins: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let context = std::sync::Arc::new(
+        lore_revision::repository::RepositoryContext::new(
+            default_repository_creation_args(
+                repository.immutable_store(),
+                repository.mutable_store.clone(),
+            )
+            .with_path(path)
+            .with_id(repository.id)
+            .with_instance_id(repository.instance_id)
+            .with_filter(repository.filter.clone())
+            .with_filesystem_provider(filesystem.clone()),
+        )
+        .with_write_token(
+            repository
+                .try_write_token()
+                .expect("A repository opened for writing")
+                .share(),
+        ),
+    );
+    (context, filesystem)
+}
+
+/// Stages the whole working tree of `instance` and commits it, answering the state of the
+/// revision that produced.
+///
+/// Scans rather than reading dirty flags, so a fixture that wrote its files directly is staged
+/// whole.
+#[allow(dead_code)]
+pub async fn test_commit_tree(
+    instance: &TestRepository,
+    message: &str,
+) -> std::sync::Arc<lore_revision::state::State> {
+    lore_revision::file::stage::stage(
+        instance.repository.clone(),
+        &instance.write_token,
+        lore_revision::interface::LoreArray::from_vec(vec![
+            lore_revision::interface::LoreString::from(&instance.path),
+        ]),
+        lore_revision::stage::StageOptions {
+            scan: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("Failed to stage the fixture");
+    test_commit(instance, message).await
+}
+
+/// Commits what `instance` holds staged, answering the state of the revision that produced.
+///
+/// For a fixture that staged something narrower than the whole tree, such as a move.
+#[allow(dead_code)]
+pub async fn test_commit(
+    instance: &TestRepository,
+    message: &str,
+) -> std::sync::Arc<lore_revision::state::State> {
+    lore_revision::commit::commit_boxed(
+        instance.repository.clone(),
+        &instance.write_token,
+        lore_revision::commit::CommitOptions::new(message.to_string()),
+    )
+    .await
+    .expect("Commit failed");
+    let (revision, _branch) =
+        lore_revision::instance::load_current_anchor_boxed(&instance.repository)
+            .await
+            .expect("Failed to load current anchor");
+    lore_revision::state::State::deserialize(instance.repository.clone(), revision)
+        .await
+        .expect("Failed to deserialize the committed state")
+}
+
 /// Creates (or truncates) the file at `path` and writes `contents` to it.
 ///
 /// Panics on failure, since a fixture the test cannot write invalidates what it
@@ -258,7 +422,8 @@ pub async fn test_scan_path_with_intent(
     .collect()
     .await
     .expect("Failed to diff filesystem");
-    lore_revision::fs::filesystem_provider::InstanceOperation::finalize(operation.as_ref(), false)
+    operation
+        .finalize()
         .await
         .expect("Failed to finish filesystem operation");
     changes
@@ -302,7 +467,8 @@ pub async fn test_scan_streaming(
         changes.push(change);
     }
     stream.finish().await.expect("Failed to diff filesystem");
-    lore_revision::fs::filesystem_provider::InstanceOperation::finalize(operation.as_ref(), false)
+    operation
+        .finalize()
         .await
         .expect("Failed to finish filesystem operation");
     changes
@@ -317,7 +483,7 @@ pub async fn test_anchor_states(
     std::sync::Arc<lore_revision::state::State>,
     std::sync::Arc<lore_revision::state::State>,
 ) {
-    let (revision, _branch) = lore_revision::instance::load_current_anchor(repository)
+    let (revision, _branch) = lore_revision::instance::load_current_anchor_boxed(repository)
         .await
         .expect("Failed to load current anchor");
     let current = lore_revision::state::State::deserialize(repository.clone(), revision)
@@ -337,4 +503,182 @@ pub fn setup_test_execution() -> std::sync::Arc<lore_revision::interface::Execut
             "test-user".to_string(),
         ),
     )
+}
+
+/// The action letter against the path for each change, as a walk's consumers read it.
+///
+/// The action is carried because two sides route a path by which of them admits it, and a path
+/// alone does not say which route it took.
+#[allow(dead_code)]
+pub fn test_reported(changes: &[lore_revision::change::NodeChange]) -> Vec<(String, String)> {
+    changes
+        .iter()
+        .map(|change| {
+            (
+                change.action.as_string_short().to_string(),
+                change.path().as_str().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The children of `parent` in `state` named `name`.
+#[allow(dead_code)]
+pub async fn children_named(
+    repository: &std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    state: &std::sync::Arc<lore_revision::state::State>,
+    parent: lore_revision::node::NodeID,
+    name: &str,
+) -> Vec<lore_revision::node::NodeID> {
+    let name_hash = lore_storage::hash::hash_string(name);
+    let mut named = Vec::new();
+    for child in state
+        .node_children(repository.clone(), parent)
+        .await
+        .expect("Failed to list the children")
+    {
+        let node = state
+            .node(repository.clone(), child)
+            .await
+            .expect("Failed to read a child");
+        if node.name_hash == name_hash {
+            named.push(child);
+        }
+    }
+    named
+}
+
+/// Fixtures for revisions built in memory, on a path-less repository writing through an in-memory
+/// token, which is the shape the memory-based revision tree handle runs on.
+#[allow(dead_code)]
+pub mod in_memory {
+    use std::sync::Arc;
+
+    use lore_base::types::Address;
+    use lore_base::types::BranchId;
+    use lore_base::types::Context;
+    use lore_base::types::Hash;
+    use lore_revision::commit::commit_in_memory_revision;
+    use lore_revision::metadata::Metadata;
+    use lore_revision::node::Node;
+    use lore_revision::node::NodeFlags;
+    use lore_revision::node::NodeID;
+    use lore_revision::repository::InMemoryContext;
+    use lore_revision::repository::RepositoryContext;
+    use lore_revision::repository::RepositoryWriteToken;
+    use lore_revision::state::State;
+    use lore_storage::hash::hash_string;
+
+    struct Marker;
+    impl InMemoryContext for Marker {}
+    const MARKER: Marker = Marker;
+
+    pub fn token() -> RepositoryWriteToken {
+        RepositoryWriteToken::in_memory(&MARKER)
+    }
+
+    /// A path-less repository on the stores, writing through [`token`].
+    pub fn repository(
+        immutable: Arc<dyn lore_storage::ImmutableStore>,
+        mutable: Arc<dyn lore_storage::MutableStore>,
+    ) -> Arc<RepositoryContext> {
+        Arc::new(
+            RepositoryContext::new(super::default_repository_creation_args(immutable, mutable))
+                .with_write_token(token()),
+        )
+    }
+
+    pub fn file(name: &str) -> Node {
+        Node {
+            flags: NodeFlags::File.bits(),
+            mode: 0o644,
+            size: 10,
+            address: Address {
+                hash: Hash::from_u64(0x5a),
+                context: Context::from(uuid::Uuid::now_v7()),
+            },
+            name_hash: hash_string(name),
+            ..Default::default()
+        }
+    }
+
+    pub fn directory(name: &str) -> Node {
+        Node {
+            flags: NodeFlags::NoFlags.bits(),
+            mode: 0o755,
+            name_hash: hash_string(name),
+            ..Default::default()
+        }
+    }
+
+    pub fn branch_id() -> BranchId {
+        Context::from(uuid::Uuid::now_v7())
+    }
+
+    /// Adds `node` as `name` under `parent`, staged as an add. Every write verb marks its staged
+    /// action and dirties the ancestors, which is what the freeze walks; `node_add` alone leaves
+    /// neither.
+    pub async fn add(
+        state: &State,
+        repository: Arc<RepositoryContext>,
+        parent: NodeID,
+        node: Node,
+        name: &str,
+    ) -> NodeID {
+        add_staged(state, repository, parent, node, name, NodeFlags::StagedAdd).await
+    }
+
+    /// Adds `node` as `name` under `parent`, staged with `staged`, such as an add a merge takes
+    /// from its other side.
+    pub async fn add_staged(
+        state: &State,
+        repository: Arc<RepositoryContext>,
+        parent: NodeID,
+        node: Node,
+        name: &str,
+        staged: NodeFlags,
+    ) -> NodeID {
+        let node_id = state
+            .node_add(repository.clone(), parent, node, name)
+            .await
+            .expect("adding the node must succeed");
+        state
+            .node_mark_staged(repository, node_id, staged, NodeFlags::DirtyAdd)
+            .await
+            .expect("marking the addition must succeed");
+        node_id
+    }
+
+    pub fn metadata_on(branch: BranchId) -> Metadata {
+        let mut metadata = Metadata::new();
+        metadata
+            .set_branch(branch)
+            .expect("setting the branch must succeed");
+        metadata
+    }
+
+    /// Commits `state` on top of `current` on `branch`.
+    pub async fn commit(
+        repository: &Arc<RepositoryContext>,
+        state: &Arc<State>,
+        current: Hash,
+        branch: BranchId,
+    ) -> Hash {
+        commit_in_memory_revision(
+            repository.clone(),
+            &token(),
+            state.clone(),
+            metadata_on(branch),
+            current,
+            branch,
+        )
+        .await
+        .expect("committing the revision must succeed")
+    }
+
+    pub async fn revision_state(repository: &Arc<RepositoryContext>, revision: Hash) -> Arc<State> {
+        State::deserialize(repository.clone(), revision)
+            .await
+            .expect("deserializing the revision must succeed")
+    }
 }

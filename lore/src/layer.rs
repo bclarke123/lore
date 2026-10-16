@@ -10,8 +10,6 @@ use lore_revision::layer::LayerError;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::util::path::RelativePath;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call::repository_call_read;
 use crate::call::repository_call_write;
@@ -23,7 +21,7 @@ mod list;
 mod remove;
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(layer_add_local)]
 /// Arguments for adding a layer from a source repository into the current repository.
 pub struct LoreLayerAddArgs {
@@ -65,11 +63,11 @@ pub async fn layer_add(
     dispatch_call(globals, args, callback, layer_add_local).await
 }
 
-async fn layer_add_local(
+fn layer_add_local(
     globals: LoreGlobalArgs,
     args: LoreLayerAddArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -77,7 +75,6 @@ async fn layer_add_local(
         layer_add,
         |repository, token, args| async move { layer_add_impl(repository, &token, args).await },
     )
-    .await
 }
 
 async fn layer_add_impl(
@@ -103,7 +100,7 @@ async fn layer_add_impl(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(layer_remove_local)]
 /// Arguments for removing a layer from the repository at the specified path.
 pub struct LoreLayerRemoveArgs {
@@ -150,11 +147,11 @@ pub async fn layer_remove(
     dispatch_call(globals, args, callback, layer_remove_local).await
 }
 
-async fn layer_remove_local(
+fn layer_remove_local(
     globals: LoreGlobalArgs,
     args: LoreLayerRemoveArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -162,7 +159,6 @@ async fn layer_remove_local(
         layer_remove,
         |repository, token, args| async move { layer_remove_impl(repository, &token, args).await },
     )
-    .await
 }
 
 async fn layer_remove_impl(
@@ -185,7 +181,7 @@ async fn layer_remove_impl(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(layer_list_local)]
 /// Arguments for listing all layers configured in the repository (no parameters).
 pub struct LoreLayerListArgs {}
@@ -218,11 +214,11 @@ pub async fn layer_list(
     dispatch_call(globals, args, callback, layer_list_local).await
 }
 
-async fn layer_list_local(
+fn layer_list_local(
     globals: LoreGlobalArgs,
     args: LoreLayerListArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
@@ -230,11 +226,10 @@ async fn layer_list_local(
         layer_list,
         move |repository, _args| list::list(repository),
     )
-    .await
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(layer_list_staged_local)]
 /// Arguments for listing configured layers that have staged changes (no parameters).
 pub struct LoreLayerListStagedArgs {}
@@ -270,20 +265,19 @@ pub async fn layer_list_staged(
     dispatch_call(globals, args, callback, layer_list_staged_local).await
 }
 
-async fn layer_list_staged_local(
+fn layer_list_staged_local(
     globals: LoreGlobalArgs,
     args: LoreLayerListStagedArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
         args,
         layer_list_staged,
         move |repository, _args| async move {
-            lore_revision::layer::list_staged(repository).await?;
+            lore_revision::layer::list_staged_boxed(repository).await?;
             Ok::<(), LayerError>(())
         },
     )
-    .await
 }

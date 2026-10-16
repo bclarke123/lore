@@ -16,7 +16,6 @@ use std::sync::Arc;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use lore_transport::RevisionListIdentifier;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::join;
 use tokio::sync::mpsc;
@@ -41,8 +40,10 @@ use crate::lore_debug;
 use crate::lore_warn;
 use crate::metadata;
 use crate::metadata::Metadata;
+use crate::node::Node;
 use crate::node::NodeFileMetadata;
 use crate::node::NodeFileMetadataBlock;
+use crate::node::NodeFlags;
 use crate::node::NodeIDExt;
 use crate::repository::RepositoryContext;
 use crate::state;
@@ -422,6 +423,12 @@ pub async fn diff3_with_source_cap(
     lore_debug!("Sorting {} source changes", source_changes.len());
     change::sort_by_path(&mut source_changes);
 
+    // The subtree moves between repositories along with a mount either side replaced, so a change
+    // the other side made below one cannot be applied on its own.
+    let source_mounts = replaced_mount_paths(&source_changes);
+    let mut target_mounts: Vec<RelativePath> = Vec::new();
+    let mut conflicting_mounts: Vec<RelativePath> = Vec::new();
+
     let target_filter = if source_changes.len() < SOURCE_FILTER_THRESHOLD
         && let Some(filter) = filter_from_source_changes(&source_changes)
     {
@@ -435,12 +442,13 @@ pub async fn diff3_with_source_cap(
     let walker_repo = target_repository.clone();
     let walker_state_base = state_base.clone();
     let walker_path = path.clone();
+    let walker_state_target = state_target.clone();
     let mut target_walk = state::ChangeStream::spawn(async move |changes| {
         state::diff(
             walker_repo.clone(),
             walker_state_base,
             walker_repo,
-            state_target,
+            walker_state_target,
             walker_path,
             // Adoption is a source-side decision.
             None,
@@ -461,6 +469,15 @@ pub async fn diff3_with_source_cap(
             && target_change.from.address.hash == target_change.to.address.hash;
         if is_file_id_only_churn {
             continue;
+        }
+        if change::is_link_replacement(&target_change) {
+            push_unique_path(&mut target_mounts, target_change.path());
+        }
+        if let Some(mount) = source_mounts
+            .iter()
+            .find(|mount| is_below(mount, target_change.path()))
+        {
+            push_unique_path(&mut conflicting_mounts, mount);
         }
         match source_changes
             .binary_search_by(|c| c.path().as_str().cmp(target_change.path().as_str()))
@@ -491,6 +508,15 @@ pub async fn diff3_with_source_cap(
     for (idx, consumed) in source_consumed.iter().enumerate() {
         if !*consumed {
             joined_changes.push(source_changes[idx].clone());
+        }
+    }
+
+    for mount in target_mounts.iter() {
+        if source_changes
+            .iter()
+            .any(|change| is_below(mount, change.path()))
+        {
+            push_unique_path(&mut conflicting_mounts, mount);
         }
     }
 
@@ -629,6 +655,24 @@ pub async fn diff3_with_source_cap(
             );
         }
     }
+    for mount in conflicting_mounts.iter() {
+        lore_debug!("Mount {mount} was replaced and changed below, conflict at the mount");
+        joined_changes.retain(|change| !mount.covers(change.path()));
+        final_conflicts.retain(|(source_conflict, target_conflict)| {
+            !mount.covers(source_conflict.path()) && !mount.covers(target_conflict.path())
+        });
+        final_conflicts.push(
+            mount_replacement_conflict(
+                &repository,
+                &state_base,
+                &state_source,
+                &state_target,
+                mount,
+            )
+            .await,
+        );
+    }
+
     if !final_conflicts.is_empty() {
         lore_debug!("Final {} conflicts", final_conflicts.len());
     }
@@ -640,19 +684,102 @@ pub async fn diff3_with_source_cap(
     };
 
     for change in joined_changes {
-        tx.send(Ok(DiffItem::Change(change)))
+        let permit = tx
+            .reserve()
             .await
-            .map_err(|_send_err| StateError::internal("3-way diff receiver dropped"))?;
+            .map_err(|_closed| StateError::internal("3-way diff receiver dropped"))?;
+        permit.send(Ok(DiffItem::Change(change)));
     }
     for (source_change, target_change) in final_conflicts {
-        tx.send(Ok(DiffItem::Conflict(Box::new((
+        let permit = tx
+            .reserve()
+            .await
+            .map_err(|_closed| StateError::internal("3-way diff receiver dropped"))?;
+        permit.send(Ok(DiffItem::Conflict(Box::new((
             source_change,
             target_change,
-        )))))
-        .await
-        .map_err(|_send_err| StateError::internal("3-way diff receiver dropped"))?;
+        )))));
     }
     Ok(summary)
+}
+
+#[lore_macro::test_pub]
+fn is_below(mount: &RelativePath, path: &RelativePath) -> bool {
+    mount.covers(path) && mount != path
+}
+
+#[lore_macro::test_pub]
+fn push_unique_path(paths: &mut Vec<RelativePath>, path: &RelativePath) {
+    if !paths.contains(path) {
+        paths.push(path.clone());
+    }
+}
+
+/// A replacement is walked as a delete of the old node and an add of the new one, so both changes
+/// name the same path and it is collected once.
+fn replaced_mount_paths(changes: &[NodeChange]) -> Vec<RelativePath> {
+    let mut paths: Vec<RelativePath> = Vec::new();
+    for change in changes.iter().filter(|c| change::is_link_replacement(c)) {
+        push_unique_path(&mut paths, change.path());
+    }
+    paths
+}
+
+async fn mount_replacement_conflict(
+    repository: &Arc<RepositoryContext>,
+    state_base: &Arc<State>,
+    state_source: &Arc<State>,
+    state_target: &Arc<State>,
+    path: &RelativePath,
+) -> (NodeChange, NodeChange) {
+    let base = mount_node_change_state(repository, state_base, path).await;
+    let source = mount_node_change_state(repository, state_source, path).await;
+    let target = mount_node_change_state(repository, state_target, path).await;
+    (
+        mount_conflict_change(base.clone(), source),
+        mount_conflict_change(base, target),
+    )
+}
+
+/// The node `state` holds at `path`, which is the link node itself where the path ends at a mount
+/// rather than anything the linked repository holds. A side that holds nothing there is the side
+/// that deleted the path.
+async fn mount_node_change_state(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    path: &RelativePath,
+) -> change::NodeChangeState {
+    let mapping = state::NodeMapping::root(repository.clone(), state.clone());
+    let link = mapping.node_at(path).await;
+    let node = if link.node.is_valid_node_id() {
+        state
+            .node(repository.clone(), link.node)
+            .await
+            .unwrap_or_default()
+    } else {
+        Node::default()
+    };
+    change::NodeChangeState {
+        mapping: state::NodeMapping {
+            repository: repository.clone(),
+            state: state.clone(),
+            path: path.clone(),
+            node: link.node,
+        },
+        observed: None,
+        flags: NodeFlags::from_bits_retain(node.flags),
+        address: node.address,
+        mode: node.mode,
+    }
+}
+
+fn mount_conflict_change(from: change::NodeChangeState, to: change::NodeChangeState) -> NodeChange {
+    NodeChange {
+        action: FileAction::Keep,
+        flags: change::Flags::Conflict,
+        from,
+        to,
+    }
 }
 
 /// Resolves `Move + other-change-at-from-path` interactions per the
@@ -936,13 +1063,20 @@ async fn find_last_modified_revision(
     Ok((last_modified_revision, last_modified_revision_number))
 }
 
+/// Finds the last revision of `source_branch` that the target branch merged the file of `change`
+/// from, walking the file's history back from the target side of `change` to the branch point.
+///
+/// Each step reads the earlier revision's history at the node ID the history records for the file
+/// there, as a revision need not number the file as its first parent does. The walk ends at a
+/// revision that [adds the file without a merge](added_without_merge), the start revision included.
+#[lore_macro::test_pub]
 async fn find_last_merged_revision(
     change: &NodeChange,
     source_branch: BranchId,
     target_branch: BranchId,
     state_branch_point: Arc<State>,
 ) -> Result<Option<(Hash, u64)>, StateError> {
-    let (state_start, node_current) = if change.to.mapping.node.is_valid_node_id() {
+    let (state_start, mut node_current) = if change.to.mapping.node.is_valid_node_id() {
         (change.to.mapping.state.clone(), change.to.mapping.node)
     } else {
         // TODO(mjansson): Figure out a better way to store this metadata around file deletions
@@ -1000,6 +1134,14 @@ async fn find_last_merged_revision(
     // see if we arrive on source branch along any merge, and if that target revision
     // is later than the last modified revision we identified from the source branch file history
     let repository = change.to.mapping.repository.clone();
+    if node_current.is_valid_node_id()
+        && let Some(delta) = state_start
+            .node_delta(repository.clone(), node_current)
+            .await?
+        && added_without_merge(delta.action, delta.flags)
+    {
+        return Ok(None);
+    }
     let mut state_current = state_start.clone();
     while state_current.revision_number() > state_branch_point.revision_number()
         && node_current.is_valid_node_id()
@@ -1017,8 +1159,8 @@ async fn find_last_merged_revision(
                     "{} branch {} revision {} node {} history is a merge, {:?} check if other parent {} is from branch {}",
                     change.path().as_str(),
                     target_branch,
-                    node_current,
                     state_current.revision(),
+                    node_current,
                     node,
                     node.revision[1],
                     source_branch
@@ -1069,6 +1211,10 @@ async fn find_last_merged_revision(
                 );
             }
 
+            if added_without_merge(node.action[0], node.flags[0]) {
+                break;
+            }
+
             if let Ok(state_previous) =
                 state::State::deserialize(repository.clone(), node.revision[0]).await
             {
@@ -1088,6 +1234,7 @@ async fn find_last_merged_revision(
                         state_previous.revision()
                     );
                     state_current = state_previous;
+                    node_current = node.node[0];
                 }
             } else {
                 lore_warn!("Failed to deserialize state when walking source branch file history");
@@ -1102,6 +1249,13 @@ async fn find_last_merged_revision(
     }
 
     Ok(None)
+}
+
+/// Whether `action` and `flags` record a file added in its revision without a merge, which leaves
+/// no history of the file before that revision: a node reused for the file still holds the history
+/// of the file that had it before.
+fn added_without_merge(action: u16, flags: u16) -> bool {
+    action == FileAction::Add as u16 && flags & change::Flags::Merge.bits() == 0
 }
 
 pub struct TreeResult {
@@ -1131,7 +1285,7 @@ pub async fn tree(
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreRevisionResolveTarget {
     /// A revision by its number on the branch.
@@ -1148,7 +1302,7 @@ pub enum LoreRevisionResolveTarget {
 /// a long stretch of history. A specifier that names no branch resolves to
 /// itself and reports nothing.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionResolveEventData {
     /// Repository identifier in which repository
@@ -1497,17 +1651,6 @@ async fn resolve_revision_number(
     )
     .await?;
 
-    event::LoreEvent::RevisionResolve(LoreRevisionResolveEventData {
-        repository: repository.id,
-        branch,
-        target: LoreRevisionResolveTarget::Number,
-        revision_number,
-        revision: Hash::default(),
-        remote: should_search_remote.into(),
-        local: should_search_local.into(),
-    })
-    .send();
-
     let mut revision = Hash::default();
 
     if should_search_remote
@@ -1569,7 +1712,7 @@ async fn resolve_revision_number(
 /// See [`resolve_in_branch`] for the specifier forms. This reads nothing of the
 /// revision itself, so a caller that only needs the revision does not pay for
 /// the branch it is taken on.
-pub async fn resolve(
+pub(crate) async fn resolve(
     repository: Arc<RepositoryContext>,
     signature: impl AsRef<str>,
     search_location: ResolveSearchLocation,
@@ -1577,6 +1720,16 @@ pub async fn resolve(
     resolve_revision(repository, signature, search_location)
         .await
         .map(|(revision, _named_branch)| revision)
+}
+
+/// Boxed version of [`resolve`] for cross-crate use.
+pub fn resolve_boxed(
+    repository: Arc<RepositoryContext>,
+    signature: impl AsRef<str> + Send,
+    search_location: ResolveSearchLocation,
+) -> crate::BoxFuture<'static, Result<Hash, StateError>> {
+    let signature = signature.as_ref().to_owned();
+    Box::pin(resolve(repository, signature, search_location))
 }
 
 /// Resolves a revision specifier to the revision it names and the branch it is
@@ -1687,6 +1840,16 @@ async fn resolve_revision(
                 .await?;
             }
             BranchTarget::Number(revision_number) => {
+                event::LoreEvent::RevisionResolve(LoreRevisionResolveEventData {
+                    repository: repository.id,
+                    branch,
+                    target: LoreRevisionResolveTarget::Number,
+                    revision_number,
+                    revision: Hash::default(),
+                    remote: should_search_remote.into(),
+                    local: should_search_local.into(),
+                })
+                .send();
                 revision = resolve_revision_number(
                     repository.clone(),
                     branch,

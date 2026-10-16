@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::errors::*;
@@ -22,7 +21,7 @@ use crate::util::serde::u8_as_bool;
 
 /// Progress of a bisect search across a range of revisions.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionBisectEventData {
     /// Revision number at the start of the search range.
@@ -106,15 +105,16 @@ pub struct BisectOptions {
     pub start: String,
     pub end: String,
 }
-pub async fn bisect(
+/// Boxed version of [`bisect`] for cross-crate use.
+pub fn bisect_boxed(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: BisectOptions,
-) -> Result<(), BisectError> {
-    Box::pin(bisect_impl(repository, token, options)).await
+) -> crate::BoxFuture<'_, Result<(), BisectError>> {
+    Box::pin(bisect(repository, token, options))
 }
 
-async fn bisect_impl(
+pub(crate) async fn bisect(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: BisectOptions,

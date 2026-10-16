@@ -21,13 +21,6 @@ pub(crate) use zerocopy::IntoBytes;
 // Re-export runtime items
 pub use crate::runtime::*;
 
-pub(crate) unsafe fn extend_lifetime<'a, T>(data: &'a T) -> &'static T
-where
-    T: ?Sized,
-{
-    unsafe { std::mem::transmute::<&'a T, &'static T>(data) }
-}
-
 /// In the URC domain, a Partition is the repository identifier.
 pub type RepositoryId = lore_base::types::Partition;
 

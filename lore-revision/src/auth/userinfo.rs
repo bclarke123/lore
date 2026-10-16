@@ -3,10 +3,13 @@
 use std::sync::Arc;
 
 use lore_credential::get_domain_or_empty;
+use lore_credential::insecure_decode_token;
 use lore_credential::token_store::vulnerable_all_tokens;
+use lore_credential::verify_jwt_usage_for_remote;
 use lore_error_set::prelude::*;
-use lore_transport::auth::authentication;
-use serde::Deserialize;
+use lore_transport::Connection;
+use lore_transport::UserService;
+use lore_transport::auth::user_service;
 use serde::Serialize;
 
 use crate::errors::*;
@@ -15,6 +18,7 @@ use crate::event::LoreEvent;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
+use crate::lore::RepositoryId;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::repository::RepositoryContext;
@@ -46,7 +50,7 @@ impl EventError for UserInfoError {
 
 /// Event data resolving a user identity to a display name.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreAuthUserInfoEventData {
     /// User identity
@@ -57,7 +61,7 @@ pub struct LoreAuthUserInfoEventData {
 
 /// Event data describing a stored authentication identity.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreAuthIdentityEventData {
     /// Auth service URL
@@ -74,29 +78,94 @@ pub struct LoreAuthIdentityEventData {
     pub token: LoreString,
 }
 
+struct UserServiceAccess {
+    service: Arc<dyn UserService>,
+    user_url: String,
+    token: String,
+}
+
+/// Exchanges the caller's authentication token for a repository-scoped one
+/// and looks up the service behind the connection's `user_url`.
+async fn open_user_service(
+    remote: &Connection,
+    repository: RepositoryId,
+    identity: &str,
+) -> Result<UserServiceAccess, UserInfoError> {
+    let auth_endpoint = remote.auth_endpoint();
+    let user_url = remote.user_url().to_string();
+    let execution = execution_context();
+    let globals = execution.globals();
+
+    if user_url.is_empty() {
+        lore_debug!("No user service advertised, resolving from the supplied token only");
+        // Either supplied credential describes the bearer, and the token-only
+        // service decodes it locally without sending it anywhere. The identity
+        // token comes first, as it does in the token store.
+        let supplied = if globals.identity_token().is_empty() {
+            globals.access_token()
+        } else {
+            globals.identity_token()
+        };
+        return Ok(UserServiceAccess {
+            service: user_service::find(&user_url),
+            user_url,
+            token: supplied.to_string(),
+        });
+    }
+
+    lore_debug!(
+        "Get authorization token for identity {identity} using auth url {auth_endpoint} for service {user_url}"
+    );
+    let user_domain = get_domain_or_empty(&user_url);
+    let token = lore_transport::auth::exchange::exchange(
+        auth_endpoint,
+        identity,
+        repository,
+        user_domain.clone(),
+        globals.identity_token(),
+        globals.access_token(),
+    )
+    .await
+    .forward::<UserInfoError>("Failed authorization token exchange")?;
+
+    let claims = insecure_decode_token(&token)
+        .map_err(|err| {
+            UserInfoError::internal_with_context(err, "decoding the user service token")
+        })?
+        .claims;
+    verify_jwt_usage_for_remote(&claims, &user_domain)
+        .forward::<UserInfoError>("The token is not suitable for the user service")?;
+
+    Ok(UserServiceAccess {
+        service: user_service::find(&user_url),
+        user_url,
+        token,
+    })
+}
+
 /// Resolves user IDs to display names.
 ///
 /// Requires a repository context. If the current user's id is in the input
 /// list and a local JWT token is cached for that identity, emits that single
 /// event from the decoded local token (no network call). All other ids — and
 /// the current user id if no local token is present — are resolved via the
-/// auth service `GetUserInfo` gRPC endpoint, which performs a
-/// repository-scoped authorization token exchange with domain validation
-/// before sending the authorization token as a Bearer header.
+/// `UserService` the connection advertises. Against a server with no auth
+/// service and no directory, that is the token-only service, which answers
+/// every id with itself (see [`open_user_service`]).
 ///
 /// Emits an [`LoreEvent::AuthUserInfo`] event per resolved user. The event's
 /// `id` field always echoes the requested id; the `name` field comes from
 /// the decoded token's `preferred_username` (falling back to `name`, then
-/// `id`) for the local fast path, or from the auth service response for the
-/// remote path. Because the local path reads a cached token captured at
-/// login, a name change made server-side since then is not reflected until
-/// the token is refreshed.
+/// `id`) for the local fast path, or from the service for the remote path.
+/// Because the local path reads a cached token captured at login, a name
+/// change made server-side since then is not reflected until the token is
+/// refreshed.
 ///
 /// An offline or local-only call emits an event for the current user alone, and
 /// only from an identity token supplied to the call: both the auth service and
 /// the auth URL the token store is keyed by come from the connection. Every
 /// other id is left for the caller to display raw.
-pub async fn resolve_user_info(
+pub(crate) async fn resolve_user_info(
     repository: Arc<RepositoryContext>,
     ids: LoreArray<LoreString>,
 ) -> Result<(), UserInfoError> {
@@ -105,17 +174,21 @@ pub async fn resolve_user_info(
     let current_user_id = execution.user_id().await;
 
     let local_only = globals.offline_or_local();
-    let auth_url = if local_only {
+    let remote = if local_only {
         lore_debug!("Resolving user info from local tokens only");
-        String::new()
+        None
     } else {
-        repository
-            .remote()
-            .await
-            .forward::<UserInfoError>("Not connected")?
-            .auth_url()
-            .to_string()
+        Some(
+            repository
+                .remote()
+                .await
+                .forward::<UserInfoError>("Not connected")?,
+        )
     };
+    let auth_url = remote
+        .as_ref()
+        .map(|remote| remote.auth_url().to_string())
+        .unwrap_or_default();
 
     let user_ids_vec: Vec<String> = ids
         .as_slice()
@@ -162,42 +235,29 @@ pub async fn resolve_user_info(
         }
     }
 
-    if remaining_ids.is_empty() || local_only {
+    let Some(remote) = remote.filter(|_| !remaining_ids.is_empty()) else {
         return Ok(());
-    }
+    };
 
-    // Obtain an authorization token from the authentication token
-    lore_debug!("Get authorization token for identity {current_user_id} using auth url {auth_url}");
-    let token_for_auth_service = lore_transport::auth::exchange::exchange(
-        auth_url.as_str(),
-        current_user_id.as_str(),
-        repository.id,
-        get_domain_or_empty(&auth_url),
-        globals.identity_token(),
-        globals.access_token(),
-    )
-    .await
-    .forward::<UserInfoError>("Failed authorization token exchange")?;
-
-    let auth_impl = authentication::find(&auth_url)
-        .forward::<UserInfoError>("Unable to connect to auth info endpoint")?;
-    let correlation_id = execution_context().globals().correlation_id.to_string();
+    let service_access = open_user_service(&remote, repository.id, &current_user_id).await?;
+    let correlation_id = globals.correlation_id.to_string();
 
     lore_debug!(
         "Start user info request on repository {} for {} unresolved id(s)",
         repository.id,
         remaining_ids.len()
     );
-    let resolved = auth_impl
+    let resolved = service_access
+        .service
         .get_user_info(
-            &auth_url,
-            &token_for_auth_service,
+            &service_access.user_url,
+            &service_access.token,
             repository.id,
             &remaining_ids,
             &correlation_id,
         )
         .await
-        .forward::<UserInfoError>("Failed auth service request")?;
+        .forward::<UserInfoError>("Failed user service request")?;
 
     for user in resolved {
         LoreEvent::AuthUserInfo(LoreAuthUserInfoEventData {
@@ -210,6 +270,14 @@ pub async fn resolve_user_info(
     lore_debug!("User info query successful");
 
     Ok(())
+}
+
+/// Boxed version of [`resolve_user_info`] for cross-crate use.
+pub fn resolve_user_info_boxed(
+    repository: Arc<RepositoryContext>,
+    ids: LoreArray<LoreString>,
+) -> crate::BoxFuture<'static, Result<(), UserInfoError>> {
+    Box::pin(resolve_user_info(repository, ids))
 }
 
 /// Emits the authorization (access) token for the repository as an
@@ -230,7 +298,7 @@ pub async fn repository_access_token(
 
     lore_debug!("Get authorization token for identity {user_id} using auth url {auth_url}");
     let token = lore_transport::auth::exchange::exchange(
-        auth_url.as_str(),
+        remote.auth_endpoint(),
         user_id.as_str(),
         repository.id,
         remote_domain,
@@ -266,6 +334,7 @@ pub async fn repository_access_token(
 /// Strip every occurrence of the current-user id from the input list.
 /// Returns whether the current user was present (so the fast path should
 /// run once) and the remaining ids (preserving input order).
+#[lore_macro::test_pub]
 fn strip_current_user(ids: Vec<String>, current_user_id: &str) -> (bool, Vec<String>) {
     let mut has_current = false;
     let mut remaining = Vec::with_capacity(ids.len());
@@ -279,119 +348,9 @@ fn strip_current_user(ids: Vec<String>, current_user_id: &str) -> (bool, Vec<Str
     (has_current, remaining)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn strip_pulls_current_user_out_and_preserves_other_order() {
-        let ids = vec![
-            "other-a".to_string(),
-            "self-id".to_string(),
-            "other-b".to_string(),
-        ];
-        let (has_current, remaining) = strip_current_user(ids, "self-id");
-        assert!(has_current);
-        assert_eq!(
-            remaining,
-            vec!["other-a".to_string(), "other-b".to_string()]
-        );
-    }
-
-    #[test]
-    fn strip_reports_absent_current_user() {
-        let ids = vec!["other-a".to_string(), "other-b".to_string()];
-        let (has_current, remaining) = strip_current_user(ids, "self-id");
-        assert!(!has_current);
-        assert_eq!(
-            remaining,
-            vec!["other-a".to_string(), "other-b".to_string()]
-        );
-    }
-
-    #[test]
-    fn strip_with_only_current_user_leaves_remaining_empty() {
-        let ids = vec!["self-id".to_string()];
-        let (has_current, remaining) = strip_current_user(ids, "self-id");
-        assert!(has_current);
-        assert!(
-            remaining.is_empty(),
-            "current-only list yields empty remaining; got {remaining:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn supplied_token_describes_only_the_identity_the_call_acts_as() {
-        use std::sync::Arc;
-
-        use lore_base::runtime::LORE_CONTEXT;
-
-        use crate::interface::ExecutionContext;
-        use crate::interface::LoreGlobalArgs;
-        use crate::relay::EventDispatcher;
-
-        /// `{"iss":"lore","sub":"alice","name":"Alice","exp":2000000000,"aud":["example.com"]}`
-        const ALICE_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
-
-        // `identity` is what `LoreGlobalArgs::validate` derives from the token.
-        let globals = LoreGlobalArgs {
-            identity: "alice".into(),
-            identity_token: ALICE_TOKEN.into(),
-            ..Default::default()
-        };
-        let execution = Arc::new(ExecutionContext::new_client(
-            globals,
-            EventDispatcher::no_dispatch(),
-        ));
-
-        // An empty auth URL keeps the token store out of this: a lookup there
-        // fails before it reads anything, so whatever comes back can only have
-        // come from the supplied token.
-        let resolved = LORE_CONTEXT
-            .scope(execution, async {
-                resolve_local_user_info("", &["alice".to_string(), "bob".to_string()]).await
-            })
-            .await;
-
-        assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].id, "alice");
-        assert_eq!(
-            resolved[0]
-                .local_user_info
-                .as_ref()
-                .map(|info| info.token.as_str()),
-            Some(ALICE_TOKEN),
-            "the identity the call acts as is described by the supplied token"
-        );
-        assert_eq!(resolved[1].id, "bob");
-        assert!(
-            resolved[1].local_user_info.is_none(),
-            "another user must not be described by this call's token"
-        );
-    }
-
-    #[test]
-    fn strip_removes_every_occurrence_of_current_user() {
-        // The fast path emits one event for the current user; the remote
-        // call must not see any self-id so it cannot emit a duplicate.
-        let ids = vec![
-            "self-id".to_string(),
-            "other".to_string(),
-            "self-id".to_string(),
-        ];
-        let (has_current, remaining) = strip_current_user(ids, "self-id");
-        assert!(has_current);
-        assert_eq!(
-            remaining,
-            vec!["other".to_string()],
-            "every occurrence of the current user must be stripped"
-        );
-    }
-}
-
 /// Event data carrying a user token along with the identity it belongs to.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreAuthUserTokenEventData {
     /// User identity
@@ -446,7 +405,11 @@ fn display_name(info: &lore_credential::UserInfo) -> String {
 /// For remote resolution of user IDs (e.g. other users), use
 /// [`resolve_user_info`] or [`user_display_name`] which perform a proper
 /// authorization exchange scoped to a repository.
-pub async fn resolve_local_user_info(auth_url: &str, user_ids: &[String]) -> Vec<ResolvedIdentity> {
+#[lore_macro::test_pub]
+pub(crate) async fn resolve_local_user_info(
+    auth_url: &str,
+    user_ids: &[String],
+) -> Vec<ResolvedIdentity> {
     let mut results = vec![];
     let execution = execution_context();
     let globals = execution.globals();
@@ -487,14 +450,22 @@ pub async fn resolve_local_user_info(auth_url: &str, user_ids: &[String]) -> Vec
     results
 }
 
+/// Boxed version of [`resolve_local_user_info`] for cross-crate use.
+pub fn resolve_local_user_info_boxed<'a>(
+    auth_url: &'a str,
+    user_ids: &'a [String],
+) -> crate::BoxFuture<'a, Vec<ResolvedIdentity>> {
+    Box::pin(resolve_local_user_info(auth_url, user_ids))
+}
+
 /// Resolves a single user ID to a display name.
 ///
 /// Requires a repository context. If the requested ID matches the current
 /// user, returns the name from the locally cached JWT token (no network
-/// call). Otherwise performs a repository-scoped authorization exchange and
-/// queries `GetUserInfo` via gRPC with proper domain validation.
+/// call). Otherwise asks the connection's `UserService` with a token cleared
+/// for it (see [`open_user_service`]).
 ///
-/// Falls back to returning the raw user ID string if the auth service cannot
+/// Falls back to returning the raw user ID string if the service cannot
 /// resolve the name.
 pub async fn user_display_name(
     repository: Arc<RepositoryContext>,
@@ -525,31 +496,18 @@ pub async fn user_display_name(
         return Ok(display_name(&user_info));
     }
 
-    // Obtain an authorization token from the authentication token
-    lore_debug!("Get authorization token for identity {user_id} using auth url {auth_url}",);
-    let token_for_auth_service = lore_transport::auth::exchange::exchange(
-        auth_url.as_str(),
-        user_id.as_str(),
-        repository.id,
-        get_domain_or_empty(&auth_url),
-        globals.identity_token(),
-        globals.access_token(),
-    )
-    .await
-    .forward::<UserInfoError>("Failed authorization token exchange")?;
-
-    let auth_impl = authentication::find(&auth_url)
-        .forward::<UserInfoError>("Unable to connect to auth info endpoint")?;
-    let correlation_id = execution_context().globals().correlation_id.to_string();
+    let service_access = open_user_service(&remote, repository.id, &user_id).await?;
+    let correlation_id = globals.correlation_id.to_string();
 
     lore_debug!(
         "Start user info request for {id} on repository {}",
         repository.id
     );
-    let Ok(resolved) = auth_impl
+    let Ok(resolved) = service_access
+        .service
         .get_user_info(
-            &auth_url,
-            &token_for_auth_service,
+            &service_access.user_url,
+            &service_access.token,
             repository.id,
             &[id.to_string()],
             &correlation_id,
@@ -574,11 +532,11 @@ pub async fn user_display_name(
     Ok(id.to_string())
 }
 
-/// Resolves a display name to a user ID via the auth service.
+/// Resolves a display name to a user ID via the connection's `UserService`.
 ///
-/// Requires a repository context. Performs a repository-scoped authorization
-/// token exchange with domain validation, then queries the auth service.
-/// Falls back to returning the input display name if resolution fails.
+/// Requires a repository context. Asks the service with a token cleared for
+/// it (see [`open_user_service`]). Falls back to returning the input display name
+/// if resolution fails or the service knows no such user.
 pub async fn user_id(
     repository: Arc<RepositoryContext>,
     user_name: &str,
@@ -587,37 +545,22 @@ pub async fn user_id(
         .remote()
         .await
         .forward::<UserInfoError>("Not connected")?;
-    let auth_url = remote.auth_url().to_string();
 
     let execution = execution_context();
-    let globals = execution.globals();
     let current_user_id = execution.user_id().await;
 
-    // Obtain an authorization token from the authentication token
-    lore_debug!("Get authorization token for identity {current_user_id} using auth url {auth_url}",);
-    let token_for_auth_service = lore_transport::auth::exchange::exchange(
-        auth_url.as_str(),
-        current_user_id.as_str(),
-        repository.id,
-        get_domain_or_empty(&auth_url),
-        globals.identity_token(),
-        globals.access_token(),
-    )
-    .await
-    .forward::<UserInfoError>("Failed authorization token exchange")?;
-
-    let auth_impl = authentication::find(&auth_url)
-        .forward::<UserInfoError>("Unable to connect to auth info endpoint")?;
-    let correlation_id = execution_context().globals().correlation_id.to_string();
+    let service_access = open_user_service(&remote, repository.id, &current_user_id).await?;
+    let correlation_id = execution.globals().correlation_id.to_string();
 
     lore_debug!(
         "Start user id request for {user_name} on repository {}",
         repository.id
     );
-    let Ok(resolved) = auth_impl
+    let Ok(resolved) = service_access
+        .service
         .get_user_id(
-            &auth_url,
-            &token_for_auth_service,
+            &service_access.user_url,
+            &service_access.token,
             repository.id,
             user_name,
             &correlation_id,

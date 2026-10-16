@@ -68,6 +68,9 @@ impl From<PutFlags> for u8 {
     }
 }
 
+/// Parses a replicated put, refusing one whose payload's sizes disagree with its fragment
+/// ([`lore_storage::check_payload_sizes`]): a peer is trusted, and every payload still has its
+/// sizes checked (ADR-00023).
 pub fn parse(mut bytes: Bytes) -> Result<Put, MessageParseError> {
     if bytes.len() < BASE_REQUEST_SIZE {
         return Err(MessageParseError::InvalidFieldLength);
@@ -82,15 +85,11 @@ pub fn parse(mut bytes: Bytes) -> Result<Put, MessageParseError> {
         flags
     };
     let payload = if !bytes.is_empty() { Some(bytes) } else { None };
-
-    // Defense-in-depth: even though peers are expected to pre-validate,
-    // enforce fragment size bounds at this ingress too.
-    if (fragment.size_payload as usize) > lore_base::types::FRAGMENT_SIZE_THRESHOLD {
-        return Err(MessageParseError::InvalidFieldLength);
-    }
-    if let Some(payload) = payload.as_ref()
-        && payload.len() != fragment.size_payload as usize
-    {
+    let sizes = match payload.as_ref() {
+        Some(payload) => lore_storage::check_payload_sizes(&fragment, payload.len()).is_ok(),
+        None => lore_storage::validate_fragment_size(&fragment).is_ok(),
+    };
+    if !sizes {
         return Err(MessageParseError::InvalidFieldLength);
     }
 
@@ -163,108 +162,5 @@ impl RequestHandler for PutHandler {
             .await?;
 
         Ok(vec![])
-    }
-}
-
-#[cfg(test)]
-pub mod tests {
-    use lore_base::types::Context;
-    use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
-    use lore_revision::fragment;
-    use lore_transport::quic::command_header::CommandHeader;
-    use rand::random;
-    use uuid::Uuid;
-
-    use super::*;
-    use crate::quic::replication_store_service::MAX_CHUNK_SIZE;
-    use crate::quic::tests::collapse_bytes_without_header;
-
-    #[test]
-    fn is_under_max_chunk_size() {
-        // base request plus max payload size
-        let max_request_size = BASE_REQUEST_SIZE + FRAGMENT_SIZE_THRESHOLD;
-        assert!(max_request_size + size_of::<CommandHeader>() <= MAX_CHUNK_SIZE);
-    }
-
-    #[test]
-    fn parsing_without_payload_works() {
-        let repository = random::<Context>();
-        let (fragment, address, _) = fragment::generate_random();
-
-        let input = Put {
-            header: ReplicationHeader {
-                correlation_id: Uuid::new_v4(),
-                repository,
-            },
-            address,
-            fragment,
-            flags: 0,
-            payload: None,
-        };
-        let input_bytes = collapse_bytes_without_header(&input.clone().to_quic_chunks());
-        let output = parse(input_bytes).expect("parse should work");
-
-        assert_eq!(input, output);
-    }
-
-    #[test]
-    fn parsing_with_payload_works() {
-        let repository = random::<Context>();
-        let (fragment, address, payload) = fragment::generate_random();
-
-        let input = Put {
-            header: ReplicationHeader {
-                correlation_id: Uuid::new_v4(),
-                repository,
-            },
-            address,
-            fragment,
-            flags: 1,
-            payload: Some(payload),
-        };
-        let input_bytes = collapse_bytes_without_header(&input.clone().to_quic_chunks());
-        let output = parse(input_bytes).expect("parse should work");
-
-        assert_eq!(input, output);
-    }
-
-    #[test]
-    fn parsing_fails_if_too_small() {
-        let repository = random::<Context>();
-        let (fragment, address, _) = fragment::generate_random();
-
-        let input = Put {
-            header: ReplicationHeader {
-                correlation_id: Uuid::new_v4(),
-                repository,
-            },
-            address,
-            fragment,
-            flags: 0,
-            payload: None,
-        };
-        let input_bytes = collapse_bytes_without_header(&input.to_quic_chunks());
-        let output =
-            parse(input_bytes.slice(0..input_bytes.len() - 1)).expect_err("parse should fail");
-
-        assert_eq!(output, MessageParseError::InvalidFieldLength);
-    }
-
-    #[test]
-    fn set_flags_are_parsed() {
-        let input = PutFlags { force: true };
-        let data: u8 = input.clone().into();
-        let output: PutFlags = data.into();
-
-        assert_eq!(input, output);
-    }
-
-    #[test]
-    fn no_flags_are_parsed() {
-        let input = PutFlags { force: false };
-        let data: u8 = input.clone().into();
-        let output: PutFlags = data.into();
-
-        assert_eq!(input, output);
     }
 }

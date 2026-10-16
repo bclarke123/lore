@@ -54,6 +54,31 @@ async fn write_read_roundtrip() {
     }
 }
 
+/// A file opened with `std` writes, syncs its data and syncs it all through every backend.
+#[tokio::test]
+async fn an_open_std_file_writes_and_syncs_through_every_backend() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-from-std-");
+        let std_file = lore_io::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .to_std()
+            .open(dir.child("f"))
+            .expect("std open");
+        // Safety: the file moves into the wrap, and nothing else holds a handle to it.
+        let file = unsafe { lore_io::IoFile::from_std(&driver, std::sync::Arc::new(std_file)) }
+            .expect("from_std");
+        let data = pattern(4096, 5);
+        file.write_all_at(data.clone(), 0).await.expect("write");
+        file.sync_data().await.expect("sync_data");
+        file.sync_all().await.expect("sync_all");
+        let read = file.read_exact_at(data.len(), 0).await.expect("read");
+        assert_eq!(&read[..], &data[..], "{}", driver.backend_name());
+    }
+}
+
 #[tokio::test]
 async fn positional_reads_have_no_cursor() {
     for driver in drivers() {
@@ -879,6 +904,7 @@ async fn write_file_segments_atomic_replaces_target() {
                 dir.child("data"),
                 &OpenOptions::new().write(true).create(true).truncate(true),
                 segments,
+                true,
             )
             .await
             .unwrap();
@@ -931,6 +957,7 @@ async fn segments_are_released_before_the_call_returns() {
                     data: data.clone(),
                     released: Arc::clone(&released),
                 },
+                true,
             )
             .await
             .unwrap();

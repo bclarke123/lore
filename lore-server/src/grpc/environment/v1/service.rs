@@ -5,6 +5,7 @@ use lore_proto::lore::environment::v1::Endpoint;
 use lore_proto::lore::environment::v1::Environment;
 use lore_proto::lore::environment::v1::EnvironmentGetRequest;
 use lore_proto::lore::environment::v1::EnvironmentGetResponse;
+use lore_proto::lore::environment::v1::Oidc;
 use lore_proto::lore::environment::v1::environment_service_server::EnvironmentService;
 use lore_storage::CompressionMode;
 use tonic::Request;
@@ -21,6 +22,7 @@ fn endpoint_to_proto(endpoint: &Option<lore_transport::Endpoint>) -> Option<Endp
         revision_url: endpoint.revision_url.clone().unwrap_or_default(),
         lock_url: endpoint.lock_url.clone().unwrap_or_default(),
         notification_url: endpoint.notification_url.clone().unwrap_or_default(),
+        user_url: endpoint.user_url.clone().unwrap_or_default(),
     })
 }
 
@@ -47,12 +49,28 @@ fn config_to_proto(config: &Option<lore_revision::environment::Config>) -> Optio
     })
 }
 
+fn oidc_to_proto(oidc: &lore_transport::Oidc) -> Oidc {
+    Oidc {
+        issuer: oidc.issuer.clone(),
+        client_id: oidc.client_id.clone(),
+        scopes: oidc.scopes.clone(),
+        preferred: oidc.preferred,
+        resource_template: oidc.resource_template.clone().unwrap_or_default(),
+        scope_template: oidc.scope_template.clone().unwrap_or_default(),
+        token_exchange_issuer: oidc.token_exchange_issuer.clone().unwrap_or_default(),
+        // `identity_claim` (8) is deprecated and left empty.
+        ..Default::default()
+    }
+}
+
+#[lore_macro::test_pub]
 fn environment_to_proto(
     environment: &lore_revision::environment::EnvironmentConfig,
 ) -> Environment {
     Environment {
         endpoint: endpoint_to_proto(&environment.endpoint),
         config: config_to_proto(&environment.config),
+        oidc: environment.oidc.as_ref().map(oidc_to_proto),
     }
 }
 
@@ -94,19 +112,5 @@ impl EnvironmentService for LoreEnvironmentV1Service {
         Ok(Response::new(EnvironmentGetResponse {
             environment: Some(self.environment.clone()),
         }))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use lore_proto::lore::environment::v1::environment_service_server::EnvironmentServiceServer;
-
-    use super::*;
-
-    #[allow(dead_code)]
-    fn assert_implements_trait(
-        service: LoreEnvironmentV1Service,
-    ) -> EnvironmentServiceServer<LoreEnvironmentV1Service> {
-        EnvironmentServiceServer::new(service)
     }
 }

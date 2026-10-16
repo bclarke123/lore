@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
 import logging
+import os
 import re
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from error_types import InvalidRepositoryPath
 from lore import Lore
 from lore_parsers import parse_jsonl
+from service_util import LORE_SERVICE_ENVIRONMENT
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,26 @@ def test_repository_info_url(new_lore_repo, tmp_path_factory, monkeypatch):
     assert (
         get_url(no_repo_urc.repository_info(url=repo.remote_path)) + "/" == repo.remote
     )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("local", [False, True], ids=["remote", "local"])
+def test_repository_info_resolves_a_relative_repository_against_the_caller(
+    new_lore_repo, lore_service_runner, tmp_path, local
+):
+    """The service runs in a directory unrelated to the caller's, so it must
+    resolve a relative `--repository` where the caller ran, whether the
+    information comes from the remote or from the local stores."""
+    service_directory = tmp_path / "service_elsewhere"
+    service_directory.mkdir()
+    lore_service_runner.start(str(service_directory))
+
+    repo: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+
+    output = repo.repository_info(
+        path=os.path.basename(repo.path), cwd=os.path.dirname(repo.path), local=local
+    )
+    assert repo.get_id() in output, f"the info must describe the repository: {output}"
 
 
 @pytest.mark.smoke

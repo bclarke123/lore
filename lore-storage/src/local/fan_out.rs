@@ -5,6 +5,7 @@
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -45,6 +46,7 @@ pub const BUCKET_FILENAME_PREFIX: &str = "index_";
 pub const BUCKET_NEW_SUFFIX: &str = ".new";
 
 /// Magic value at the start of the marker file. Bytes spell `LVNO` on disk.
+#[lore_macro::test_pub]
 const MARKER_MAGIC: u32 = u32::from_le_bytes(*b"LVNO");
 
 /// Marker file format version. Independent of `MutableStoreVersion` /
@@ -152,14 +154,15 @@ pub async fn read_level_marker(group_path: &Path) -> std::io::Result<Option<usiz
 /// # Arguments
 /// * `group_path` — the per-group directory. Must already exist.
 /// * `level` — the bucket count to record. Should be a value from `LEVEL_LADDER`.
-/// * `sync_data` — when true, fsync the file before returning.
+/// * `sync_data` — when true, sync the file before it replaces the marker, and its directory
+///   after.
 ///
 /// # Returns
 /// * `Ok(())` on success.
-/// * `Err(io::Error)` for any I/O failure during file creation, write, or fsync.
+/// * `Err(io::Error)` for any I/O failure during file creation, write, sync or rename.
 ///
 /// # Invariants
-/// * Existing marker file (if any) is truncated and rewritten — this is a full overwrite.
+/// * The marker is replaced whole, see [`write_level_header_file`].
 /// * `level` is cast to u32; must fit (always true for ladder values ≤ 256).
 pub async fn write_level_marker(
     group_path: &Path,
@@ -179,6 +182,7 @@ const MARKER_PATH_LEN: usize = "/index".len() + 1 + 2 + 1 + MARKER_FILENAME.len(
 ///
 /// Path components are built through this rather than `format!`: on the per-bucket flush and
 /// recovery paths that is one `String` allocated and dropped per bucket, for two bytes.
+#[lore_macro::test_pub]
 pub(crate) fn write_hex_byte(out: &mut [u8], value: u8) {
     const HEX: [u8; 16] = *b"0123456789abcdef";
     out[0] = HEX[(value >> 4) as usize];
@@ -199,6 +203,54 @@ pub fn group_dir_path(index_path: &Path, group_index: usize) -> PathBuf {
     let mut path = index_path.to_path_buf();
     push_group_dir(&mut path, group_index);
     path
+}
+
+/// Which of the `group_count` groups have a directory under `index_path`, found with one
+/// listing rather than a probe per group: a store open asks this of every group, and a small
+/// store has written only a few of them.
+///
+/// # Returns
+/// * One flag per group, all `false` when `index_path` does not exist.
+/// * `None` when the listing fails for another reason, or an entry named like a group cannot be
+///   resolved to what it is, so the caller can probe each group as it would without this.
+pub async fn existing_group_dirs(index_path: &Path, group_count: usize) -> Option<Vec<bool>> {
+    let mut existing = vec![false; group_count];
+    let mut entries = match lore_io::IoDriver::global().read_dir(index_path).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(existing),
+        Err(_) => return None,
+    };
+    while let Some(entry) = entries.next().await {
+        let entry = entry.ok()?;
+        let Some(group_index) = entry.file_name.to_str().and_then(parse_group_dir_name) else {
+            continue;
+        };
+        // A name that could be a group but whose metadata did not resolve may be a group that
+        // is there, so it is not an absent one: the caller probes.
+        let metadata = entry.metadata.as_ref()?;
+        if !metadata.is_dir() {
+            continue;
+        }
+        if let Some(flag) = existing.get_mut(group_index) {
+            *flag = true;
+        }
+    }
+    Some(existing)
+}
+
+/// The group a directory name stands for, when it is exactly the name [`push_group_dir`] gives
+/// one: two lowercase hex digits.
+#[lore_macro::test_pub]
+fn parse_group_dir_name(name: &str) -> Option<usize> {
+    let &[high, low] = name.as_bytes() else {
+        return None;
+    };
+    let digit = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    };
+    Some(usize::from(digit(high)? << 4 | digit(low)?))
 }
 
 /// Format the path for a bucket index file inside a group directory: `<group_path>/index_<bb>`
@@ -300,15 +352,23 @@ pub async fn commit_if_initial_level(
     }
 }
 
+/// Whether `name` names a committed bucket file, `index_<bb>`, rather than a `.new` twin or a
+/// temporary file.
+pub(crate) fn is_bucket_file_name(name: &str) -> bool {
+    name.len() == BUCKET_FILENAME_LEN && name.starts_with(BUCKET_FILENAME_PREFIX)
+}
+
 /// Whether `group_path` holds at least one committed bucket file.
 ///
 /// A group is serialized as a whole, so this separates a group that has been written
 /// from one that has not. `.new` twins are ignored: they belong to a fan-out commit
-/// that never reached its commit point and record no committed layout.
+/// that never reached its commit point and record no committed layout. Temporary files
+/// are ignored too: they belong to a write that never reached its rename.
 ///
 /// # Returns
 /// * `true` when the directory holds a file named `index_<bb>`.
 /// * `false` when it holds none, or cannot be read at all.
+#[lore_macro::test_pub]
 pub(crate) async fn group_has_buckets(group_path: &Path) -> bool {
     let Ok(mut entries) = lore_io::IoDriver::global().read_dir(group_path).await else {
         return false;
@@ -320,7 +380,7 @@ pub(crate) async fn group_has_buckets(group_path: &Path) -> bool {
         let Some(name) = entry.file_name.to_str() else {
             continue;
         };
-        if name.starts_with(BUCKET_FILENAME_PREFIX) && !name.ends_with(BUCKET_NEW_SUFFIX) {
+        if is_bucket_file_name(name) {
             return true;
         }
     }
@@ -429,8 +489,9 @@ impl lore_io::StableBufList for LevelHeaderSegment {
     }
 }
 
-/// Write a level-header file (marker or pending) to an explicit path. Shared format helper;
-/// one backend dispatch covering create, write and (when `sync_data`) sync-all.
+/// Write a level-header file (marker or pending) to a temporary file renamed over `path`, so that
+/// a process stopped during the write leaves the file it last wrote, or none. With `sync_data`,
+/// the file is synced before the rename and its directory after.
 async fn write_level_header_file(
     path: &Path,
     level: usize,
@@ -445,7 +506,8 @@ async fn write_level_header_file(
     let mut segment = Box::new([0u8; size_of::<LevelMarkerHeader>()]);
     segment.copy_from_slice(header.as_bytes());
     lore_io::IoDriver::global()
-        .write_file_segments(
+        .write_file_segments_atomic(
+            temporary_path(path),
             path,
             &lore_io::OpenOptions::new()
                 .write(true)
@@ -454,8 +516,26 @@ async fn write_level_header_file(
             LevelHeaderSegment(segment),
             sync_data,
         )
-        .await?;
-    Ok(())
+        .await
+}
+
+/// The file a write of `path` goes to before it is renamed over `path`: `path` with `.tmp`
+/// appended, so that the temporary file of `index_<bb>.new` is `index_<bb>.new.tmp` and does not
+/// collide with that of `index_<bb>`.
+pub(crate) fn temporary_path(path: &Path) -> PathBuf {
+    let mut temporary = std::ffi::OsString::with_capacity(path.as_os_str().len() + 4);
+    temporary.push(path.as_os_str());
+    temporary.push(".tmp");
+    PathBuf::from(temporary)
+}
+
+/// Mark `buckets` dirty again after a fan-out commit that failed once their `.new` files were
+/// written, so that the next flush writes them again rather than leaving their entries only in
+/// those files.
+pub(crate) fn mark_uncommitted_dirty(dirty: &[AtomicBool], buckets: &[usize]) {
+    for &bucket in buckets {
+        dirty[bucket].store(true, Ordering::Relaxed);
+    }
 }
 
 /// Recover from a possibly-interrupted fan-out commit in `group_path`.
@@ -472,8 +552,8 @@ async fn write_level_header_file(
 /// # Returns
 /// * `Ok(None)` if no recovery was needed (no `level.pending` present).
 /// * `Ok(Some(level))` if recovery rolled forward to `level`.
-/// * `Err(io::Error)` if recovery encountered an I/O error it could not work around. Individual
-///   `.new` rename failures are logged but do not abort the routine — the next open retries.
+/// * `Err(io::Error)` if recovery encountered an I/O error, such as a `.new` rename that failed.
+///   `level.pending` is then kept, so that the next open retries.
 pub async fn recover_level_transition(
     group_path: &Path,
     sync_data: bool,
@@ -501,6 +581,7 @@ pub async fn recover_level_transition(
                     new_path.display(),
                     final_path.display()
                 );
+                return Err(err);
             }
         }
     }
@@ -508,536 +589,4 @@ pub async fn recover_level_transition(
     write_level_marker(group_path, target, sync_data).await?;
     delete_level_pending(group_path).await?;
     Ok(Some(target))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn key_with_byte_one(byte: u8) -> Hash {
-        let mut hash = Hash::default();
-        hash.data_mut()[1] = byte;
-        hash
-    }
-
-    #[test]
-    fn level_ladder_is_powers_of_two_starting_at_one() {
-        assert_eq!(LEVEL_LADDER, [1, 32, 64, 128, 256]);
-        for &m in &LEVEL_LADDER[1..] {
-            assert!(m.is_power_of_two(), "level {m} must be power of two");
-            assert!(
-                m <= FAN_OUT_LEVEL_MAX,
-                "level {m} must be <= FAN_OUT_LEVEL_MAX"
-            );
-        }
-    }
-
-    #[test]
-    fn fan_out_level_max_matches_top_of_ladder() {
-        assert_eq!(FAN_OUT_LEVEL_MAX, LEVEL_LADDER[LEVEL_LADDER.len() - 1]);
-    }
-
-    #[test]
-    fn fan_out_threshold_default_is_one_thousand() {
-        assert_eq!(FAN_OUT_THRESHOLD_DEFAULT, 1000);
-    }
-
-    #[test]
-    fn bucket_index_for_level_one_always_zero() {
-        for byte in [0u8, 0x05, 0x80, 0xFF] {
-            let key = key_with_byte_one(byte);
-            assert_eq!(bucket_index_for(&key, 1), 0);
-        }
-    }
-
-    #[test]
-    fn bucket_index_for_level_256_returns_full_byte() {
-        for byte in [0u8, 0x05, 0x42, 0x80, 0xFF] {
-            let key = key_with_byte_one(byte);
-            assert_eq!(bucket_index_for(&key, 256), byte as usize);
-        }
-    }
-
-    #[test]
-    fn bucket_index_for_level_32_takes_top_5_bits() {
-        // byte = 0b101_01010 (0xAA): top 5 bits = 0b10101 = 21
-        let key = key_with_byte_one(0xAA);
-        assert_eq!(bucket_index_for(&key, 32), 21);
-        // byte = 0xFF: top 5 bits = 0b11111 = 31
-        let key = key_with_byte_one(0xFF);
-        assert_eq!(bucket_index_for(&key, 32), 31);
-        // byte = 0x00: 0
-        let key = key_with_byte_one(0x00);
-        assert_eq!(bucket_index_for(&key, 32), 0);
-    }
-
-    #[test]
-    fn bucket_index_for_level_64_takes_top_6_bits() {
-        // byte = 0xAA = 0b10101010: top 6 bits = 0b101010 = 42
-        let key = key_with_byte_one(0xAA);
-        assert_eq!(bucket_index_for(&key, 64), 42);
-    }
-
-    #[test]
-    fn bucket_index_for_level_128_takes_top_7_bits() {
-        // byte = 0xAA = 0b10101010: top 7 bits = 0b1010101 = 85
-        let key = key_with_byte_one(0xAA);
-        assert_eq!(bucket_index_for(&key, 128), 85);
-    }
-
-    #[test]
-    fn split_n_to_2n_preserves_bucket_membership_via_high_bit() {
-        // For any byte, the bucket at level 2N is either 2*idx_N or 2*idx_N + 1.
-        for byte in 0..=255u8 {
-            let key = key_with_byte_one(byte);
-            let idx_32 = bucket_index_for(&key, 32);
-            let idx_64 = bucket_index_for(&key, 64);
-            assert!(
-                idx_64 == 2 * idx_32 || idx_64 == 2 * idx_32 + 1,
-                "byte 0x{byte:02x}: idx_32={idx_32}, idx_64={idx_64}"
-            );
-        }
-    }
-
-    #[test]
-    fn level_for_below_threshold_is_current_level() {
-        // b_max ≤ threshold ⇒ no fan-out required ⇒ current_level returned (still in ladder).
-        assert_eq!(level_for(1, 800, 1000), 1);
-        assert_eq!(level_for(1, 1000, 1000), 1);
-        assert_eq!(level_for(32, 999, 1000), 32);
-    }
-
-    #[test]
-    fn level_for_5k_at_level_1_is_32() {
-        // 1 * 5000 / 1000 = 5, smallest ladder M >= 5 is 32
-        assert_eq!(level_for(1, 5000, 1000), 32);
-    }
-
-    #[test]
-    fn level_for_1500_at_level_32_is_64() {
-        // 32 * 1500 / 1000 = 48, smallest ladder M >= 48 is 64
-        assert_eq!(level_for(32, 1500, 1000), 64);
-    }
-
-    #[test]
-    fn level_for_1500_at_level_128_is_256() {
-        // 128 * 1500 / 1000 = 192, smallest ladder M >= 192 is 256
-        assert_eq!(level_for(128, 1500, 1000), 256);
-    }
-
-    #[test]
-    fn level_for_caps_at_256() {
-        // Even an extreme b_max can't push us past 256.
-        assert_eq!(level_for(128, 10_000, 1000), 256);
-        assert_eq!(level_for(256, 10_000, 1000), 256);
-    }
-
-    #[test]
-    fn level_for_uses_ceiling_division() {
-        // 1*1001/1000 ceiling is 2, smallest ladder M ≥ 2 is 32; floor would wrongly return current_level=1 even though trigger has fired.
-        assert_eq!(level_for(1, 1001, 1000), 32);
-    }
-
-    fn temp_group_dir() -> crate::test_util::TempDir {
-        crate::test_util::TempDir::new("fan_out_marker_")
-    }
-
-    #[tokio::test]
-    async fn read_level_marker_missing_returns_none() {
-        let dir = temp_group_dir();
-        assert_eq!(read_level_marker(dir.path()).await.unwrap(), None);
-    }
-
-    /// A held flush guard, standing in for the one a caller owns.
-    async fn held_flush_guard() -> OwnedMutexGuard<()> {
-        std::sync::Arc::new(tokio::sync::Mutex::new(()))
-            .lock_owned()
-            .await
-    }
-
-    /// A store root whose group directory exists, ready for a marker write.
-    fn temp_store_with_group(group_index: usize) -> (crate::test_util::TempDir, PathBuf) {
-        let dir = crate::test_util::TempDir::new("fan_out_commit_");
-        let mut group_path = dir.path().to_path_buf();
-        group_path.push("index");
-        push_group_dir(&mut group_path, group_index);
-        std::fs::create_dir_all(&group_path).expect("group dir");
-        (dir, group_path)
-    }
-
-    #[tokio::test]
-    async fn commit_if_initial_level_records_the_level_below_the_maximum() {
-        for &level in &LEVEL_LADDER[..LEVEL_LADDER.len() - 1] {
-            let (dir, group_path) = temp_store_with_group(0x2a);
-            let committed = AtomicUsize::new(0);
-            let bucket_count = AtomicUsize::new(level);
-
-            commit_if_initial_level(
-                &held_flush_guard().await,
-                &committed,
-                &bucket_count,
-                dir.path(),
-                0x2a,
-                false,
-            )
-            .await;
-
-            assert_eq!(read_level_marker(&group_path).await.unwrap(), Some(level));
-            assert_eq!(committed.load(Ordering::Relaxed), level);
-        }
-    }
-
-    #[tokio::test]
-    async fn commit_if_initial_level_leaves_a_committed_group_alone() {
-        let (dir, group_path) = temp_store_with_group(0x2a);
-        let committed = AtomicUsize::new(32);
-        let bucket_count = AtomicUsize::new(64);
-
-        commit_if_initial_level(
-            &held_flush_guard().await,
-            &committed,
-            &bucket_count,
-            dir.path(),
-            0x2a,
-            false,
-        )
-        .await;
-
-        assert_eq!(read_level_marker(&group_path).await.unwrap(), None);
-        assert_eq!(committed.load(Ordering::Relaxed), 32);
-    }
-
-    #[tokio::test]
-    async fn commit_if_initial_level_leaves_a_group_at_the_maximum_alone() {
-        let (dir, group_path) = temp_store_with_group(0x2a);
-        let committed = AtomicUsize::new(0);
-        let bucket_count = AtomicUsize::new(FAN_OUT_LEVEL_MAX);
-
-        commit_if_initial_level(
-            &held_flush_guard().await,
-            &committed,
-            &bucket_count,
-            dir.path(),
-            0x2a,
-            false,
-        )
-        .await;
-
-        assert_eq!(read_level_marker(&group_path).await.unwrap(), None);
-        assert_eq!(committed.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn write_then_read_round_trip_every_ladder_value() {
-        for &level in &LEVEL_LADDER {
-            let dir = temp_group_dir();
-            write_level_marker(dir.path(), level, true).await.unwrap();
-            assert_eq!(read_level_marker(dir.path()).await.unwrap(), Some(level));
-        }
-    }
-
-    #[tokio::test]
-    async fn read_level_marker_with_corrupt_magic_errors() {
-        let dir = temp_group_dir();
-        let marker = dir.path().join(MARKER_FILENAME);
-        std::fs::write(
-            &marker,
-            [0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        )
-        .unwrap();
-        let err = read_level_marker(dir.path()).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-    }
-
-    #[tokio::test]
-    async fn read_level_marker_truncated_errors() {
-        let dir = temp_group_dir();
-        let marker = dir.path().join(MARKER_FILENAME);
-        std::fs::write(&marker, [b'L', b'V', b'N', b'O', 1, 0, 0, 0]).unwrap();
-        let err = read_level_marker(dir.path()).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
-    }
-
-    #[tokio::test]
-    async fn read_level_marker_unsupported_version_errors() {
-        let dir = temp_group_dir();
-        let marker = dir.path().join(MARKER_FILENAME);
-        let mut bytes = vec![];
-        bytes.extend_from_slice(&MARKER_MAGIC.to_le_bytes());
-        bytes.extend_from_slice(&999u32.to_le_bytes());
-        bytes.extend_from_slice(&32u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        std::fs::write(&marker, bytes).unwrap();
-        let err = read_level_marker(dir.path()).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-    }
-
-    #[tokio::test]
-    async fn write_level_marker_overwrites_existing() {
-        let dir = temp_group_dir();
-        write_level_marker(dir.path(), 1, false).await.unwrap();
-        write_level_marker(dir.path(), 64, false).await.unwrap();
-        assert_eq!(read_level_marker(dir.path()).await.unwrap(), Some(64));
-    }
-
-    #[tokio::test]
-    async fn marker_file_is_exactly_16_bytes() {
-        let dir = temp_group_dir();
-        write_level_marker(dir.path(), 32, false).await.unwrap();
-        let metadata = std::fs::metadata(dir.path().join(MARKER_FILENAME)).unwrap();
-        assert_eq!(metadata.len(), 16);
-    }
-
-    #[tokio::test]
-    async fn read_level_pending_missing_returns_none() {
-        let dir = temp_group_dir();
-        assert_eq!(read_level_pending(dir.path()).await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn level_pending_round_trip_every_ladder_value() {
-        for &level in &LEVEL_LADDER {
-            let dir = temp_group_dir();
-            write_level_pending(dir.path(), level, false).await.unwrap();
-            assert_eq!(read_level_pending(dir.path()).await.unwrap(), Some(level));
-        }
-    }
-
-    #[tokio::test]
-    async fn delete_level_pending_is_idempotent() {
-        let dir = temp_group_dir();
-        // Delete on missing file succeeds.
-        delete_level_pending(dir.path()).await.unwrap();
-        // Delete after write removes it.
-        write_level_pending(dir.path(), 32, false).await.unwrap();
-        delete_level_pending(dir.path()).await.unwrap();
-        assert_eq!(read_level_pending(dir.path()).await.unwrap(), None);
-        // Second delete is also fine.
-        delete_level_pending(dir.path()).await.unwrap();
-    }
-
-    #[test]
-    fn bucket_path_lowercase_two_digit_hex() {
-        let dir = temp_group_dir();
-        assert_eq!(
-            bucket_path(dir.path(), 0).file_name().unwrap(),
-            std::ffi::OsStr::new("index_00")
-        );
-        assert_eq!(
-            bucket_path(dir.path(), 0xab).file_name().unwrap(),
-            std::ffi::OsStr::new("index_ab")
-        );
-        assert_eq!(
-            bucket_path(dir.path(), 255).file_name().unwrap(),
-            std::ffi::OsStr::new("index_ff")
-        );
-    }
-
-    #[test]
-    fn bucket_new_path_appends_dot_new() {
-        let dir = temp_group_dir();
-        assert_eq!(
-            bucket_new_path(dir.path(), 0xab).file_name().unwrap(),
-            std::ffi::OsStr::new("index_ab.new")
-        );
-    }
-
-    #[test]
-    fn group_dir_path_lowercase_two_digit_hex() {
-        let dir = temp_group_dir();
-        assert_eq!(
-            group_dir_path(dir.path(), 0).file_name().unwrap(),
-            std::ffi::OsStr::new("00")
-        );
-        assert_eq!(
-            group_dir_path(dir.path(), 255).file_name().unwrap(),
-            std::ffi::OsStr::new("ff")
-        );
-    }
-
-    #[test]
-    fn every_path_formatter_agrees_with_hex_formatting() {
-        let dir = temp_group_dir();
-        for index in 0..=255usize {
-            let byte = index as u8;
-            let mut hex = [0u8; 2];
-            write_hex_byte(&mut hex, byte);
-            assert_eq!(std::str::from_utf8(&hex).unwrap(), format!("{byte:02x}"));
-            assert_eq!(
-                group_dir_path(dir.path(), index).file_name().unwrap(),
-                std::ffi::OsStr::new(&format!("{byte:02x}"))
-            );
-            assert_eq!(
-                bucket_path(dir.path(), index).file_name().unwrap(),
-                std::ffi::OsStr::new(&format!("{BUCKET_FILENAME_PREFIX}{byte:02x}"))
-            );
-            assert_eq!(
-                bucket_new_path(dir.path(), index).file_name().unwrap(),
-                std::ffi::OsStr::new(&format!(
-                    "{BUCKET_FILENAME_PREFIX}{byte:02x}{BUCKET_NEW_SUFFIX}"
-                ))
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn group_has_buckets_missing_directory_is_false() {
-        let dir = temp_group_dir();
-        assert!(!group_has_buckets(&dir.path().join("absent")).await);
-    }
-
-    #[tokio::test]
-    async fn group_has_buckets_empty_directory_is_false() {
-        let dir = temp_group_dir();
-        assert!(!group_has_buckets(dir.path()).await);
-    }
-
-    #[tokio::test]
-    async fn group_has_buckets_level_files_alone_are_false() {
-        let dir = temp_group_dir();
-        write_level_marker(dir.path(), 32, false).await.unwrap();
-        write_level_pending(dir.path(), 64, false).await.unwrap();
-        assert!(!group_has_buckets(dir.path()).await);
-    }
-
-    #[tokio::test]
-    async fn group_has_buckets_uncommitted_new_twins_alone_are_false() {
-        let dir = temp_group_dir();
-        for bb in 0..4 {
-            std::fs::write(bucket_new_path(dir.path(), bb), [bb as u8; 8]).unwrap();
-        }
-        assert!(!group_has_buckets(dir.path()).await);
-    }
-
-    #[tokio::test]
-    async fn group_has_buckets_committed_bucket_is_true() {
-        let dir = temp_group_dir();
-        std::fs::write(bucket_path(dir.path(), 0x37), b"bucket").unwrap();
-        std::fs::write(bucket_new_path(dir.path(), 0x38), b"twin").unwrap();
-        assert!(group_has_buckets(dir.path()).await);
-    }
-
-    #[test]
-    fn unwritten_group_level_follows_the_initial_level_when_fan_out_aware() {
-        for &level in &LEVEL_LADDER {
-            assert_eq!(unwritten_group_level(true, level), level);
-        }
-    }
-
-    #[test]
-    fn unwritten_group_level_is_max_without_fan_out_awareness() {
-        for &level in &LEVEL_LADDER {
-            assert_eq!(unwritten_group_level(false, level), FAN_OUT_LEVEL_MAX);
-        }
-    }
-
-    #[tokio::test]
-    async fn read_group_level_marker_wins_over_bucket_files() {
-        let dir = temp_group_dir();
-        std::fs::write(bucket_path(dir.path(), 0x37), b"bucket").unwrap();
-        write_level_marker(dir.path(), 64, false).await.unwrap();
-        assert_eq!(
-            read_group_level(dir.path()).await.unwrap(),
-            GroupLevel::Marked(64)
-        );
-    }
-
-    #[tokio::test]
-    async fn read_group_level_buckets_without_marker_are_pre_fan_out() {
-        let dir = temp_group_dir();
-        std::fs::write(bucket_path(dir.path(), 0x37), b"bucket").unwrap();
-        assert_eq!(
-            read_group_level(dir.path()).await.unwrap(),
-            GroupLevel::PreFanOut
-        );
-    }
-
-    #[tokio::test]
-    async fn read_group_level_empty_group_is_unwritten() {
-        let dir = temp_group_dir();
-        assert_eq!(
-            read_group_level(dir.path()).await.unwrap(),
-            GroupLevel::Unwritten
-        );
-    }
-
-    #[tokio::test]
-    async fn read_group_level_propagates_a_corrupt_marker() {
-        let dir = temp_group_dir();
-        std::fs::write(dir.path().join(MARKER_FILENAME), [0xDE; 16]).unwrap();
-        let err = read_group_level(dir.path()).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-    }
-
-    #[tokio::test]
-    async fn recover_level_transition_no_pending_is_noop() {
-        let dir = temp_group_dir();
-        assert_eq!(
-            recover_level_transition(dir.path(), false).await.unwrap(),
-            None
-        );
-        // No marker should be created when there's nothing to recover.
-        assert_eq!(read_level_marker(dir.path()).await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn recover_level_transition_renames_all_new_files() {
-        let dir = temp_group_dir();
-        // Set up "after pending, before any rename" state for target=4: four .new files exist with synthetic content; pending says target=4; no marker yet.
-        for bb in 0..4 {
-            std::fs::write(bucket_new_path(dir.path(), bb), [bb as u8; 8]).unwrap();
-        }
-        write_level_pending(dir.path(), 4, false).await.unwrap();
-
-        let recovered = recover_level_transition(dir.path(), false).await.unwrap();
-        assert_eq!(recovered, Some(4));
-
-        // All .new files renamed to final.
-        for bb in 0..4 {
-            assert!(!bucket_new_path(dir.path(), bb).exists());
-            let bytes = std::fs::read(bucket_path(dir.path(), bb)).unwrap();
-            assert_eq!(bytes, vec![bb as u8; 8]);
-        }
-        // Marker reflects target.
-        assert_eq!(read_level_marker(dir.path()).await.unwrap(), Some(4));
-        // Pending deleted.
-        assert!(!dir.path().join(LEVEL_PENDING_FILENAME).exists());
-    }
-
-    #[tokio::test]
-    async fn recover_level_transition_skips_already_renamed_buckets() {
-        let dir = temp_group_dir();
-        // Mid-rename state: bb=0 already renamed (final present, no .new); bb=1 still .new.
-        std::fs::write(bucket_path(dir.path(), 0), b"final-0").unwrap();
-        std::fs::write(bucket_new_path(dir.path(), 1), b"new-1").unwrap();
-        write_level_pending(dir.path(), 2, false).await.unwrap();
-
-        let recovered = recover_level_transition(dir.path(), false).await.unwrap();
-        assert_eq!(recovered, Some(2));
-
-        assert_eq!(
-            std::fs::read(bucket_path(dir.path(), 0)).unwrap(),
-            b"final-0"
-        );
-        assert_eq!(std::fs::read(bucket_path(dir.path(), 1)).unwrap(), b"new-1");
-        assert!(!bucket_new_path(dir.path(), 1).exists());
-        assert_eq!(read_level_marker(dir.path()).await.unwrap(), Some(2));
-        assert!(!dir.path().join(LEVEL_PENDING_FILENAME).exists());
-    }
-
-    #[tokio::test]
-    async fn recover_level_transition_is_idempotent() {
-        let dir = temp_group_dir();
-        for bb in 0..2 {
-            std::fs::write(bucket_new_path(dir.path(), bb), [bb as u8; 4]).unwrap();
-        }
-        write_level_pending(dir.path(), 2, false).await.unwrap();
-
-        let first = recover_level_transition(dir.path(), false).await.unwrap();
-        let second = recover_level_transition(dir.path(), false).await.unwrap();
-        // First run rolls forward; second run is a no-op since pending is gone.
-        assert_eq!(first, Some(2));
-        assert_eq!(second, None);
-        assert_eq!(read_level_marker(dir.path()).await.unwrap(), Some(2));
-    }
 }

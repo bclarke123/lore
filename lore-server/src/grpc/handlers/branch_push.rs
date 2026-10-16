@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: MIT
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use lore_base::error::AddressNotFound;
+use lore_base::lore_drain_tasks;
 use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
@@ -24,6 +26,7 @@ use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
 use lore_revision::state::State;
+use lore_revision::util::request_tracker::StoreRequestTracker;
 use lore_storage::StoreError;
 use lore_storage::StoreMatch;
 use lore_storage::StoreMatchResult;
@@ -32,6 +35,8 @@ use lore_telemetry::tracing::fields::ADDRESS;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use lore_telemetry::tracing::fields::REVISION;
 use lore_transport::grpc::address_not_found_status;
+use opentelemetry::metrics::Histogram;
+use parking_lot::Mutex;
 use tokio::task::JoinSet;
 use tonic::Request;
 use tonic::Response;
@@ -58,6 +63,90 @@ use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
 use crate::util::setup_execution;
 
+struct BranchPushInstrumentProvider;
+
+impl InstrumentProvider for BranchPushInstrumentProvider {
+    fn namespace(&self) -> &'static str {
+        "lore.branch_push"
+    }
+}
+
+static PEAK_FRAGMENT_LOOKUPS_IN_FLIGHT: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    BranchPushInstrumentProvider
+        .length_histogram("peak_fragment_lookups_in_flight", peak_boundaries())
+});
+
+static FRAGMENT_LOOKUPS: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    BranchPushInstrumentProvider.length_histogram("fragment_lookups", count_boundaries())
+});
+
+static CONCURRENT_QUERY_BATCHES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    BranchPushInstrumentProvider.length_histogram("concurrent_query_batches", peak_boundaries())
+});
+
+static COLLECTED_ADDRESSES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    BranchPushInstrumentProvider.length_histogram("collected_addresses", count_boundaries())
+});
+
+fn peak_boundaries() -> Vec<f64> {
+    vec![
+        1., 10., 50., 100., 250., 500., 1_000., 2_500., 5_000., 10_000., 25_000., 50_000.,
+        100_000., 250_000.,
+    ]
+}
+
+fn count_boundaries() -> Vec<f64> {
+    vec![
+        10., 100., 1_000., 10_000., 50_000., 100_000., 500_000., 1_000_000., 5_000_000.,
+    ]
+}
+
+/// The store requests one push makes to verify its fragments, recorded once when dropped, so a
+/// push that fails or is cancelled part-way still reports what it made.
+///
+/// `lookups` counts the per-address fragment lookups the collection spawns, across every
+/// verification the push runs. The address and batch counts are those of its latest
+/// verification, since a push verifies again only for the same revision.
+#[derive(Default)]
+struct PushStoreRequests {
+    lookups: Arc<StoreRequestTracker>,
+    collected_addresses: Option<u64>,
+    concurrent_query_batches: Option<u64>,
+    /// Whether the push returned, with success or an error, rather than being dropped part-way
+    /// as a cancelled request is.
+    finished: bool,
+}
+
+impl Drop for PushStoreRequests {
+    fn drop(&mut self) {
+        let num_lookups = self.lookups.requests();
+        // A push that never walks its fragments, such as one rejected as not a fast-forward,
+        // would only skew the distributions.
+        if num_lookups == 0 {
+            return;
+        }
+
+        let peak_lookups_in_flight = self.lookups.peak_in_flight();
+        PEAK_FRAGMENT_LOOKUPS_IN_FLIGHT.record(peak_lookups_in_flight, &[]);
+        FRAGMENT_LOOKUPS.record(num_lookups, &[]);
+        if let Some(collected_addresses) = self.collected_addresses {
+            COLLECTED_ADDRESSES.record(collected_addresses, &[]);
+        }
+        if let Some(concurrent_query_batches) = self.concurrent_query_batches {
+            CONCURRENT_QUERY_BATCHES.record(concurrent_query_batches, &[]);
+        }
+        debug!(
+            peak_lookups_in_flight,
+            num_lookups,
+            num_collected_addresses = self.collected_addresses,
+            num_concurrent_query_batches = self.concurrent_query_batches,
+            finished = self.finished,
+            "Branch push store requests"
+        );
+    }
+}
+
+#[lore_macro::test_pub]
 pub(crate) fn extract_client_ip<T>(request: &Request<T>) -> Option<IpAddr> {
     // try to get the LAST entry from XFF metadata header (injected by ALB)
     if let Some(ip_str) = request
@@ -327,7 +416,7 @@ pub async fn push(
         }
     }
 
-    let mut current_head = load_latest(repository.clone(), branch)
+    let current_head = load_latest(repository.clone(), branch)
         .await
         .filter_slow_down()?
         .unwrap_or_default();
@@ -356,6 +445,39 @@ pub async fn push(
         });
     }
 
+    let mut store_requests = PushStoreRequests::default();
+    let result = store_new_head(
+        repository,
+        branch,
+        latest,
+        state,
+        current_head,
+        force,
+        fast_forward_merge,
+        history_step_size,
+        acceleration,
+        &mut store_requests,
+    )
+    .await;
+    store_requests.finished = true;
+    result
+}
+
+/// Verifies the fragments `state` introduces and stores it as the latest revision of `branch`,
+/// retrying while the head moves underneath it.
+#[allow(clippy::too_many_arguments)]
+async fn store_new_head(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    latest: Hash,
+    state: Arc<State>,
+    mut current_head: Hash,
+    force: bool,
+    fast_forward_merge: bool,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
+    store_requests: &mut PushStoreRequests,
+) -> Result<PushResult, Status> {
     let mut new_head = latest;
     loop {
         // Verify the current latest revision is parent of the incoming revision unless the push is forced
@@ -384,6 +506,7 @@ pub async fn push(
                 current_head,
                 history_step_size,
                 acceleration,
+                store_requests,
             )
             .await;
         }
@@ -403,6 +526,7 @@ pub async fn push(
             state_parent.clone(),
             state_other.clone(),
             state.clone(),
+            store_requests,
         )
         .await?;
 
@@ -483,6 +607,7 @@ async fn try_fast_forward_merge(
     mut current_head: Hash,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
+    store_requests: &mut PushStoreRequests,
 ) -> Result<PushResult, Status> {
     let incoming_revision = incoming_state.revision();
     let original_base = incoming_state.parent_self();
@@ -511,6 +636,7 @@ async fn try_fast_forward_merge(
         base_state,
         other_parent_state,
         incoming_state.clone(),
+        store_requests,
     )
     .await?;
 
@@ -742,6 +868,102 @@ async fn load_other_parent_state(
     Ok(Some(other_parent_state))
 }
 
+#[lore_macro::test_pub]
+async fn collect_new_addresses(
+    repository: Arc<RepositoryContext>,
+    parent_state: Arc<State>,
+    other_parent_state: Option<Arc<State>>,
+    state: Arc<State>,
+    store_requests: Arc<StoreRequestTracker>,
+) -> Result<Vec<Address>, Status> {
+    // Each walk appends what it found rather than returning it, so the drain below can
+    // be the shared one: it joins every task before reporting a failure. A walk must
+    // never be aborted part-way.
+    let collected: Arc<Mutex<Vec<Address>>> = Default::default();
+
+    let collect = async |parent_state: Arc<State>,
+                         repository: Arc<RepositoryContext>,
+                         to_state: Arc<State>,
+                         collected: Arc<Mutex<Vec<Address>>>,
+                         store_requests: Arc<StoreRequestTracker>| {
+        let parent = parent_state.revision();
+        let mut fragments = state::collect_new_fragments(
+            repository,
+            parent_state,
+            to_state,
+            true, /* Ignore already durably stored fragments */
+            store_requests,
+        )
+            .instrument(span!(Level::DEBUG, "collect_new_addresses"))
+            .await
+            .warn_map_err(|err| {
+                if let Some(converted_error) = err.as_address_not_found() {
+                    return address_not_found_status(
+                        converted_error,
+                        format!(
+                            "Failed to collect new fragments for verification. Missing address '{converted_error}'"
+                        ),
+                    );
+                }
+
+                Status::internal(format!(
+                    "Failed to collect new fragments for verification: {err}"
+                ))
+            })?;
+        debug!(%parent, num_addresses = fragments.len(), "Collected new fragments against parent");
+
+        collected.lock().append(&mut fragments);
+        Ok(())
+    };
+
+    let mut collect_tasks = JoinSet::default();
+    lore_spawn!(
+        collect_tasks,
+        collect(
+            parent_state,
+            repository.clone(),
+            state.clone(),
+            collected.clone(),
+            store_requests.clone(),
+        )
+        .in_current_span()
+    );
+    if let Some(other_parent_state) = other_parent_state {
+        collected
+            .lock()
+            .push(Address::zero_context_hash(state.parent_other()));
+        lore_spawn!(
+            collect_tasks,
+            collect(
+                other_parent_state,
+                repository,
+                state,
+                collected.clone(),
+                store_requests
+            )
+            .in_current_span()
+        );
+    }
+    lore_drain_tasks!(
+        collect_tasks,
+        Status::internal("Error with collect_new_addresses task")
+    )?;
+
+    let mut new_fragments = std::mem::take(&mut *collected.lock());
+
+    // each address vec appended is already sorted, so `sort()` can detect the linear runs
+    // better than `sort_unstable()`
+    new_fragments.sort();
+    new_fragments.dedup();
+
+    debug!(
+        num_addresses = new_fragments.len(),
+        "Collected new addresses for verification"
+    );
+
+    Ok(new_fragments)
+}
+
 /// Verify that all new fragments between `parent_state` and `state` exist in the
 /// immutable store. Also includes the other parent hash if the state is a merge.
 /// Returns an error if any fragment is missing.
@@ -759,41 +981,18 @@ async fn verify_fragments(
     parent_state: Arc<State>,
     other_parent_state: Option<Arc<State>>,
     state: Arc<State>,
+    store_requests: &mut PushStoreRequests,
 ) -> Result<(), Status> {
-    let collect = async |parent_state: Arc<State>| {
-        state::collect_new_fragments(
-            repository.clone(),
-            parent_state,
-            state.clone(),
-            true, /* Ignore already durably stored fragments */
-        )
-        .instrument(span!(Level::DEBUG, "collect_new_fragments"))
-        .await
-        .warn_map_err(|err| {
-            if let Some(converted_error) = err.as_address_not_found() {
-                return address_not_found_status(
-                    converted_error,
-                    format!(
-                        "Failed to collect new fragments for verification. Missing address '{converted_error}'"
-                    ),
-                );
-            }
-
-            Status::internal(format!(
-                "Failed to collect new fragments for verification: {err}"
-            ))
-        })
-    };
-
-    let mut new_fragments = collect(parent_state).await?;
-
-    if let Some(other_parent_state) = other_parent_state {
-        new_fragments.append(&mut collect(other_parent_state).await?);
-        new_fragments.push(Address::zero_context_hash(state.parent_other()));
-    }
-
-    new_fragments.sort_unstable();
-    new_fragments.dedup();
+    let mut new_fragments = collect_new_addresses(
+        repository.clone(),
+        parent_state,
+        other_parent_state,
+        state,
+        store_requests.lookups.clone(),
+    )
+    .await?;
+    store_requests.collected_addresses = Some(new_fragments.len() as u64);
+    store_requests.concurrent_query_batches = None;
 
     let mut retry = lore_revision::util::time::retry(
         push::RETRY_START_DURATION,
@@ -824,10 +1023,12 @@ async fn verify_fragments(
     let mut slowed_down: Vec<Address> = Vec::new();
     let mut num_slow_downs = 0;
     loop {
+        let num_addresses = new_fragments.len();
+        let num_in_flight = tasks.len();
         let batch_span = span!(
             Level::DEBUG,
             "exist_batch",
-            items = new_fragments.len(),
+            items = num_addresses,
             batch_size = max_batch_size
         );
 
@@ -851,6 +1052,18 @@ async fn verify_fragments(
                 );
             }
         });
+        let num_sent = tasks.len() - num_in_flight;
+        if num_sent > 0 {
+            // In-flight batches never exceed the cap, and the first fill reaches it when
+            // the push has enough batches, so the first fill is the one that holds the peak.
+            store_requests
+                .concurrent_query_batches
+                .get_or_insert(tasks.len() as u64);
+            debug!(
+                num_batches = num_sent,
+                num_addresses, "Sent existence query batches"
+            );
+        }
 
         let Some(result) = tasks.join_next().await else {
             if slowed_down.is_empty() {
@@ -906,797 +1119,4 @@ pub async fn try_store_latest(
         new_latest,
     )
     .await
-}
-
-#[cfg(test)]
-mod tests {
-    use std::net::IpAddr;
-    use std::net::Ipv4Addr;
-    use std::net::SocketAddr;
-
-    use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
-    use lore_revision::node::Node;
-    use lore_revision::node::NodeFlags;
-    use lore_revision::node::ROOT_NODE;
-    use rand::random;
-    use tonic::Code;
-    use tonic::Request;
-    use tonic::metadata::MetadataValue;
-    use tonic::transport::server::TcpConnectInfo;
-
-    use super::*;
-    use crate::grpc::server::RevisionListAcceleration;
-    use crate::store::test_store_create;
-
-    async fn create_test_branch(repository: &Arc<RepositoryContext>) -> BranchId {
-        let branch_id = BranchId::from(uuid::Uuid::now_v7());
-        let write_token = get_write_token();
-        branch::create(
-            repository.clone(),
-            &write_token,
-            branch_id,
-            "test-branch",
-            branch::default_category(),
-            "creator",
-            1,
-            vec![],
-            false,
-            false,
-        )
-        .await
-        .expect("create branch");
-        branch_id
-    }
-
-    async fn serialize_revision(
-        repository: &Arc<RepositoryContext>,
-        branch: BranchId,
-        parent_self: Hash,
-        parent_other: Hash,
-        revision_number: u64,
-    ) -> Arc<State> {
-        let write_token = get_write_token();
-        let mut metadata = lore_revision::metadata::Metadata::new();
-        metadata.set_branch(branch).expect("set branch");
-        let metadata_hash = metadata
-            .serialize(repository.clone())
-            .await
-            .expect("serialize metadata");
-
-        let state = Arc::new(State::new());
-        state.set_parent_self(parent_self);
-        if !parent_other.is_zero() {
-            state.set_parent_other(parent_other);
-        }
-        state.set_revision_number(revision_number);
-        state.set_metadata_hash(metadata_hash);
-        state
-            .serialize(repository.clone(), &write_token)
-            .await
-            .expect("serialize state");
-        state
-    }
-
-    /// A revision whose metadata names `payload`, so the walk collects an address
-    /// it never reads.
-    async fn serialize_revision_naming_a_payload(
-        repository: &Arc<RepositoryContext>,
-        branch: BranchId,
-        payload: Address,
-    ) -> Arc<State> {
-        let write_token = get_write_token();
-        let mut metadata = lore_revision::metadata::Metadata::new();
-        metadata.set_branch(branch).expect("set branch");
-        metadata
-            .set_address("build-artifact", payload)
-            .expect("set the payload address");
-        let metadata_hash = metadata
-            .serialize(repository.clone())
-            .await
-            .expect("serialize metadata");
-
-        let state = Arc::new(State::new());
-        state.set_parent_self(Hash::default());
-        state.set_revision_number(1);
-        state.set_metadata_hash(metadata_hash);
-        state
-            .serialize(repository.clone(), &write_token)
-            .await
-            .expect("serialize state");
-        state
-    }
-
-    /// A revision holding one file, so its state references node and name
-    /// fragments the walk has to read.
-    async fn serialize_revision_with_a_file(
-        repository: &Arc<RepositoryContext>,
-        branch: BranchId,
-    ) -> Arc<State> {
-        let write_token = get_write_token();
-        let mut metadata = lore_revision::metadata::Metadata::new();
-        metadata.set_branch(branch).expect("set branch");
-        let metadata_hash = metadata
-            .serialize(repository.clone())
-            .await
-            .expect("serialize metadata");
-
-        let state = Arc::new(State::new());
-        state.set_parent_self(Hash::default());
-        state.set_revision_number(1);
-        state.set_metadata_hash(metadata_hash);
-        state
-            .node_add(
-                repository.clone(),
-                ROOT_NODE,
-                Node {
-                    flags: NodeFlags::File.bits(),
-                    name_hash: lore_storage::hash::hash_string("file.txt"),
-                    ..Default::default()
-                },
-                "file.txt",
-            )
-            .await
-            .expect("node_add");
-        state
-            .serialize(repository.clone(), &write_token)
-            .await
-            .expect("serialize state");
-        state
-    }
-
-    /// Copy the fragment at `hash` alone, leaving everything it references absent
-    /// in `target`.
-    async fn hand_over_fragment(
-        source: &Arc<dyn lore_storage::ImmutableStore>,
-        target: &Arc<dyn lore_storage::ImmutableStore>,
-        repository: RepositoryId,
-        hash: Hash,
-    ) {
-        let address = Address::zero_context_hash(hash);
-        let data = source
-            .clone()
-            .get(repository, address)
-            .await
-            .expect("read the fragment to hand over");
-        target
-            .clone()
-            .put(repository, address, data.fragment, data.payload, false)
-            .await
-            .expect("hand over the fragment");
-    }
-
-    /// Push revisions `numbers`, chained from `parent`. Returns the pushed
-    /// signatures oldest-first.
-    async fn push_linear_revisions(
-        repository: &Arc<RepositoryContext>,
-        branch: BranchId,
-        parent: Hash,
-        numbers: std::ops::RangeInclusive<u64>,
-    ) -> Vec<Hash> {
-        let mut parent = parent;
-        let mut signatures = Vec::new();
-        for number in numbers {
-            let state =
-                serialize_revision(repository, branch, parent, Hash::default(), number).await;
-            parent = push(
-                repository.clone(),
-                branch,
-                state.revision(),
-                true,
-                true,
-                false,
-                DEFAULT_HISTORY_STEP_SIZE,
-                RevisionListAcceleration::default(),
-            )
-            .await
-            .expect("push revision")
-            .revision;
-            signatures.push(parent);
-        }
-        signatures
-    }
-
-    /// Push a merge revision whose `parent_other` carries a much higher
-    /// revision number, so the branch's revision number jumps to
-    /// `other_revision_number + 1` and skips the numbers in between.
-    async fn push_jump_revision(
-        repository: &Arc<RepositoryContext>,
-        branch: BranchId,
-        parent: Hash,
-        other_revision_number: u64,
-    ) -> (Hash, u64) {
-        let other = serialize_revision(
-            repository,
-            branch,
-            Hash::default(),
-            Hash::default(),
-            other_revision_number,
-        )
-        .await;
-        let state = serialize_revision(
-            repository,
-            branch,
-            parent,
-            other.revision(),
-            0, /* rewritten */
-        )
-        .await;
-
-        let result = push(
-            repository.clone(),
-            branch,
-            state.revision(),
-            true,
-            true,
-            false,
-            DEFAULT_HISTORY_STEP_SIZE,
-            RevisionListAcceleration::default(),
-        )
-        .await
-        .expect("push jump revision");
-        (result.revision, result.revision_number)
-    }
-
-    /// Read the revision sealed at `boundary`, or `None` when unsealed.
-    async fn load_step_key(
-        repository: &Arc<RepositoryContext>,
-        branch: BranchId,
-        boundary: u64,
-    ) -> Option<Hash> {
-        let (key, key_type) = branch::revision_step_key(
-            repository::SALT_LORE,
-            repository.id,
-            branch,
-            boundary,
-            DEFAULT_HISTORY_STEP_SIZE,
-        );
-        repository
-            .clone()
-            .read_mutable_store()
-            .load(repository.id, key, key_type)
-            .await
-            .ok()
-            .filter(|revision| !revision.is_zero())
-    }
-
-    mod extract_client_ip {
-        use super::*;
-
-        #[test]
-        fn use_x_forwarded_when_available() {
-            let mut req = Request::new(());
-
-            let xff_metadata_value: MetadataValue<_> = "10.0.0.1, 10.0.0.2".parse().unwrap();
-            req.metadata_mut()
-                .insert("x-forwarded-for", xff_metadata_value);
-
-            // set remote address to make sure it's NOT used in presence of the XFF header
-            let peer_addr = SocketAddr::from(([192, 168, 1, 42], 4242));
-            req.extensions_mut().insert(TcpConnectInfo {
-                local_addr: None,
-                remote_addr: Some(peer_addr),
-            });
-
-            assert_eq!(
-                extract_client_ip(&req),
-                Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))
-            );
-        }
-
-        #[test]
-        fn dont_use_xff_when_it_contains_invalid_value() {
-            let mut req = Request::new(());
-
-            let xff_metadata_value: MetadataValue<_> = "10.0.0.lol, 10.0.0.wat".parse().unwrap();
-            req.metadata_mut()
-                .insert("x-forwarded-for", xff_metadata_value);
-
-            let peer_addr = SocketAddr::from(([192, 168, 1, 42], 4242));
-            req.extensions_mut().insert(TcpConnectInfo {
-                local_addr: None,
-                remote_addr: Some(peer_addr),
-            });
-
-            assert_eq!(
-                extract_client_ip(&req),
-                Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42)))
-            );
-        }
-
-        #[test]
-        fn still_uses_last_ip_when_xff_contains_invalid_value_in_chain() {
-            let mut req = Request::new(());
-
-            let xff_metadata_value: MetadataValue<_> =
-                "10.0.0.lol, 10.0.0.wat, 10.0.0.42".parse().unwrap();
-            req.metadata_mut()
-                .insert("x-forwarded-for", xff_metadata_value);
-
-            let peer_addr = SocketAddr::from(([192, 168, 1, 42], 4242));
-            req.extensions_mut().insert(TcpConnectInfo {
-                local_addr: None,
-                remote_addr: Some(peer_addr),
-            });
-
-            assert_eq!(
-                extract_client_ip(&req),
-                Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42)))
-            );
-        }
-
-        #[test]
-        fn fallback_to_remote_addr() {
-            let mut req = Request::new(());
-
-            let peer_addr = SocketAddr::from(([192, 168, 1, 42], 31415));
-            req.extensions_mut().insert(TcpConnectInfo {
-                local_addr: None,
-                remote_addr: Some(peer_addr),
-            });
-
-            assert_eq!(
-                extract_client_ip(&req),
-                Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42)))
-            );
-        }
-    }
-
-    mod push {
-        use super::*;
-
-        #[tokio::test]
-        async fn push_unknown_revision_returns_not_found() {
-            let repository_id = random::<RepositoryId>();
-            let branch_id = BranchId::from(uuid::Uuid::now_v7());
-
-            let (immutable_store, mutable_store, execution) =
-                test_store_create().await.expect("Failed to create stores");
-
-            Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
-                let repository_context = Arc::new(RepositoryContext::new_server_context(
-                    immutable_store,
-                    mutable_store,
-                    repository_id,
-                ));
-
-                let write_token = get_write_token();
-                branch::create(
-                    repository_context.clone(),
-                    &write_token,
-                    branch_id,
-                    "test-branch",
-                    branch::personal_category(),
-                    "test-creator",
-                    1,
-                    vec![],
-                    false,
-                    false,
-                )
-                .await
-                .expect("Failed to create branch");
-
-                // A hash with no corresponding state data in the immutable store
-                let nonexistent_revision = random::<Hash>();
-
-                let result = push(
-                    repository_context,
-                    branch_id,
-                    nonexistent_revision,
-                    true,
-                    true,
-                    false,
-                    DEFAULT_HISTORY_STEP_SIZE,
-                    RevisionListAcceleration::default(),
-                )
-                .await;
-
-                let Err(status) = result else {
-                    panic!("an unknown revision cannot be pushed");
-                };
-                assert_eq!(status.code(), Code::NotFound);
-                let error = lore_transport::ProtocolError::from(status);
-                assert!(error.is_not_found(), "{error:?}");
-            }))
-            .await;
-        }
-
-        /// A fragment the walk cannot read is named as an address the caller
-        /// reconstructs. Both detections share a code, so the message is what
-        /// pins which one this reaches.
-        #[tokio::test]
-        async fn a_fragment_the_walk_cannot_read_names_its_address() {
-            let repository_id = random::<RepositoryId>();
-
-            let (peer_store, peer_mutable, execution) =
-                test_store_create().await.expect("Failed to create stores");
-            let (store, mutable_store, _) =
-                test_store_create().await.expect("Failed to create stores");
-
-            Box::pin(LORE_CONTEXT.scope(execution, async move {
-                let peer = Arc::new(RepositoryContext::new_server_context(
-                    peer_store.clone(),
-                    peer_mutable,
-                    repository_id,
-                ));
-                let repository = Arc::new(RepositoryContext::new_server_context(
-                    store.clone(),
-                    mutable_store,
-                    repository_id,
-                ));
-
-                let branch = create_test_branch(&repository).await;
-                let state = serialize_revision_with_a_file(&peer, branch).await;
-
-                hand_over_fragment(&peer_store, &store, repository_id, state.revision()).await;
-
-                let Err(status) = push(
-                    repository,
-                    branch,
-                    state.revision(),
-                    true,
-                    true,
-                    false,
-                    DEFAULT_HISTORY_STEP_SIZE,
-                    RevisionListAcceleration::default(),
-                )
-                .await
-                else {
-                    panic!("a revision missing its fragments cannot be pushed");
-                };
-
-                assert_eq!(status.code(), Code::FailedPrecondition);
-                assert!(
-                    status
-                        .message()
-                        .starts_with("Failed to collect new fragments"),
-                    "{}",
-                    status.message()
-                );
-                let error = lore_transport::ProtocolError::from(status);
-                assert!(error.is_address_not_found(), "{error:?}");
-            }))
-            .await;
-        }
-
-        /// A fragment the store answers as absent is named the same way, so the
-        /// two paths that detect it report one condition.
-        ///
-        /// The revision and the blob holding its metadata are both handed over,
-        /// since the walk reads both. What stays absent is the payload that
-        /// metadata names, which the walk collects without reading, so the store
-        /// query is what detects it.
-        #[tokio::test]
-        async fn a_fragment_the_store_reports_absent_names_its_address() {
-            let repository_id = random::<RepositoryId>();
-
-            let (peer_store, peer_mutable, execution) =
-                test_store_create().await.expect("Failed to create stores");
-            let (store, mutable_store, _) =
-                test_store_create().await.expect("Failed to create stores");
-
-            Box::pin(LORE_CONTEXT.scope(execution, async move {
-                let peer = Arc::new(RepositoryContext::new_server_context(
-                    peer_store.clone(),
-                    peer_mutable,
-                    repository_id,
-                ));
-                let repository = Arc::new(RepositoryContext::new_server_context(
-                    store.clone(),
-                    mutable_store,
-                    repository_id,
-                ));
-
-                let branch = create_test_branch(&repository).await;
-                let payload = Address::zero_context_hash(Hash::from([0xabu8; 32]));
-                let state = serialize_revision_naming_a_payload(&peer, branch, payload).await;
-                hand_over_fragment(&peer_store, &store, repository_id, state.revision()).await;
-                hand_over_fragment(&peer_store, &store, repository_id, state.metadata_hash()).await;
-
-                let Err(status) = push(
-                    repository,
-                    branch,
-                    state.revision(),
-                    true,
-                    true,
-                    false,
-                    DEFAULT_HISTORY_STEP_SIZE,
-                    RevisionListAcceleration::default(),
-                )
-                .await
-                else {
-                    panic!("a revision missing a payload its metadata names cannot be pushed");
-                };
-
-                assert_eq!(status.code(), Code::FailedPrecondition);
-                assert_eq!(
-                    status.message(),
-                    format!("Missing fragment '{payload}'"),
-                    "the absent payload has to be the fragment named"
-                );
-                let error = lore_transport::ProtocolError::from(status);
-                assert!(error.is_address_not_found(), "{error:?}");
-            }))
-            .await;
-        }
-
-        /// A merge whose second parent the store cannot answer for is refused as the
-        /// missing fragment it is.
-        ///
-        /// The merge and the blob holding its metadata are handed over, so what stays
-        /// absent is the line the merge joins. That parent carries what the merge is
-        /// verified against, so it is read rather than only queried, and the read has to
-        /// report the address as a missing fragment like the query does.
-        #[tokio::test]
-        async fn a_merge_missing_its_other_parent_names_that_address() {
-            let repository_id = random::<RepositoryId>();
-
-            let (peer_store, peer_mutable, execution) =
-                test_store_create().await.expect("Failed to create stores");
-            let (store, mutable_store, _) =
-                test_store_create().await.expect("Failed to create stores");
-
-            Box::pin(LORE_CONTEXT.scope(execution, async move {
-                let peer = Arc::new(RepositoryContext::new_server_context(
-                    peer_store.clone(),
-                    peer_mutable,
-                    repository_id,
-                ));
-                let repository = Arc::new(RepositoryContext::new_server_context(
-                    store.clone(),
-                    mutable_store,
-                    repository_id,
-                ));
-
-                let branch = create_test_branch(&repository).await;
-                let other =
-                    serialize_revision(&peer, branch, Hash::default(), Hash::default(), 1).await;
-                let merge =
-                    serialize_revision(&peer, branch, Hash::default(), other.revision(), 2).await;
-
-                hand_over_fragment(&peer_store, &store, repository_id, merge.revision()).await;
-                hand_over_fragment(&peer_store, &store, repository_id, merge.metadata_hash()).await;
-
-                let Err(status) = push(
-                    repository,
-                    branch,
-                    merge.revision(),
-                    true,
-                    true,
-                    false,
-                    DEFAULT_HISTORY_STEP_SIZE,
-                    RevisionListAcceleration::default(),
-                )
-                .await
-                else {
-                    panic!("a merge missing the line it joins cannot be pushed");
-                };
-
-                assert_eq!(status.code(), Code::FailedPrecondition);
-                assert_eq!(
-                    status.message(),
-                    format!(
-                        "Missing fragment '{}'",
-                        Address::zero_context_hash(other.revision())
-                    ),
-                    "the absent parent has to be the fragment named"
-                );
-                let error = lore_transport::ProtocolError::from(status);
-                assert!(error.is_address_not_found(), "{error:?}");
-            }))
-            .await;
-        }
-
-        /// A merge is verified against its second parent as well as its first, so a
-        /// second parent the store cannot walk refuses the push.
-        ///
-        /// That parent and the blob holding its metadata are handed over, leaving the tree
-        /// it names absent. The merge itself holds no file, so collecting it against its
-        /// first parent reads nothing of that tree: what reaches it is the collection
-        /// against the second parent, which is the one this covers.
-        #[tokio::test]
-        async fn a_merge_is_verified_against_the_tree_of_its_other_parent() {
-            let repository_id = random::<RepositoryId>();
-
-            let (peer_store, peer_mutable, execution) =
-                test_store_create().await.expect("Failed to create stores");
-            let (store, mutable_store, _) =
-                test_store_create().await.expect("Failed to create stores");
-
-            Box::pin(LORE_CONTEXT.scope(execution, async move {
-                let peer = Arc::new(RepositoryContext::new_server_context(
-                    peer_store.clone(),
-                    peer_mutable,
-                    repository_id,
-                ));
-                let repository = Arc::new(RepositoryContext::new_server_context(
-                    store.clone(),
-                    mutable_store,
-                    repository_id,
-                ));
-
-                let branch = create_test_branch(&repository).await;
-                let other = serialize_revision_with_a_file(&peer, branch).await;
-                let merge =
-                    serialize_revision(&peer, branch, Hash::default(), other.revision(), 2).await;
-
-                for hash in [
-                    merge.revision(),
-                    merge.metadata_hash(),
-                    other.revision(),
-                    other.metadata_hash(),
-                ] {
-                    hand_over_fragment(&peer_store, &store, repository_id, hash).await;
-                }
-
-                let Err(status) = push(
-                    repository,
-                    branch,
-                    merge.revision(),
-                    true,
-                    true,
-                    false,
-                    DEFAULT_HISTORY_STEP_SIZE,
-                    RevisionListAcceleration::default(),
-                )
-                .await
-                else {
-                    panic!("a merge whose other parent cannot be walked cannot be pushed");
-                };
-
-                assert_eq!(status.code(), Code::FailedPrecondition);
-                assert!(
-                    status
-                        .message()
-                        .starts_with("Failed to collect new fragments"),
-                    "{}",
-                    status.message()
-                );
-                let error = lore_transport::ProtocolError::from(status);
-                assert!(error.is_address_not_found(), "{error:?}");
-            }))
-            .await;
-        }
-
-        #[tokio::test]
-        async fn linear_history_seals_a_boundary_only_once_the_head_moves_past_it() {
-            let (immutable_store, mutable_store, execution) =
-                test_store_create().await.expect("Failed to create stores");
-
-            Box::pin(LORE_CONTEXT.scope(execution, async move {
-                let repository = Arc::new(RepositoryContext::new_server_context(
-                    immutable_store,
-                    mutable_store,
-                    random::<RepositoryId>(),
-                ));
-                let branch = create_test_branch(&repository).await;
-
-                let chain =
-                    push_linear_revisions(&repository, branch, Hash::default(), 1..=100).await;
-
-                // Revision 100 is the head, so segment 100 is still the open one.
-                assert_eq!(load_step_key(&repository, branch, 100).await, None);
-
-                push_linear_revisions(&repository, branch, chain[99], 101..=101).await;
-
-                // Now the head has moved past 100, sealing it with revision 100.
-                assert_eq!(
-                    load_step_key(&repository, branch, 100).await,
-                    Some(chain[99])
-                );
-                // Nothing above the head may be sealed.
-                assert_eq!(load_step_key(&repository, branch, 200).await, None);
-            }))
-            .await;
-        }
-
-        #[tokio::test]
-        async fn linear_history_seals_each_boundary_with_its_own_highest_revision() {
-            let (immutable_store, mutable_store, execution) =
-                test_store_create().await.expect("Failed to create stores");
-
-            Box::pin(LORE_CONTEXT.scope(execution, async move {
-                let repository = Arc::new(RepositoryContext::new_server_context(
-                    immutable_store,
-                    mutable_store,
-                    random::<RepositoryId>(),
-                ));
-                let branch = create_test_branch(&repository).await;
-
-                let chain =
-                    push_linear_revisions(&repository, branch, Hash::default(), 1..=250).await;
-
-                assert_eq!(
-                    load_step_key(&repository, branch, 100).await,
-                    Some(chain[99])
-                );
-                assert_eq!(
-                    load_step_key(&repository, branch, 200).await,
-                    Some(chain[199])
-                );
-                // Segment 300 holds the head at 250 and stays open.
-                assert_eq!(load_step_key(&repository, branch, 300).await, None);
-            }))
-            .await;
-        }
-
-        /// A jump seals the boundaries between the two revisions and no
-        /// others. The segment the new revision lands in stays open, since the
-        /// revisions above it do not exist yet.
-        #[tokio::test]
-        async fn jump_seals_the_crossed_boundary_and_not_the_one_it_landed_in() {
-            let (immutable_store, mutable_store, execution) =
-                test_store_create().await.expect("Failed to create stores");
-
-            Box::pin(LORE_CONTEXT.scope(execution, async move {
-                let repository = Arc::new(RepositoryContext::new_server_context(
-                    immutable_store,
-                    mutable_store,
-                    random::<RepositoryId>(),
-                ));
-                let branch = create_test_branch(&repository).await;
-
-                let chain =
-                    push_linear_revisions(&repository, branch, Hash::default(), 1..=99).await;
-                let (_, revision_number) =
-                    push_jump_revision(&repository, branch, chain[98], 104).await;
-                assert_eq!(revision_number, 105);
-
-                // Boundary 100 is the only one crossed, answered by revision 99.
-                assert_eq!(
-                    load_step_key(&repository, branch, 100).await,
-                    Some(chain[98])
-                );
-                // Segment 200 contains the new head at 105 and is still open.
-                assert_eq!(load_step_key(&repository, branch, 200).await, None);
-                assert_eq!(load_step_key(&repository, branch, 300).await, None);
-            }))
-            .await;
-        }
-
-        #[tokio::test]
-        async fn jump_seals_every_boundary_it_skipped_over() {
-            let (immutable_store, mutable_store, execution) =
-                test_store_create().await.expect("Failed to create stores");
-
-            Box::pin(LORE_CONTEXT.scope(execution, async move {
-                let repository = Arc::new(RepositoryContext::new_server_context(
-                    immutable_store,
-                    mutable_store,
-                    random::<RepositoryId>(),
-                ));
-                let branch = create_test_branch(&repository).await;
-
-                let chain =
-                    push_linear_revisions(&repository, branch, Hash::default(), 1..=150).await;
-                assert_eq!(
-                    load_step_key(&repository, branch, 100).await,
-                    Some(chain[99])
-                );
-
-                let (_, revision_number) =
-                    push_jump_revision(&repository, branch, chain[149], 399).await;
-                assert_eq!(revision_number, 400);
-
-                // 150 -> 400 skips 200 and 300; both are answered by revision 150,
-                // the highest revision numbered at or below them.
-                assert_eq!(
-                    load_step_key(&repository, branch, 200).await,
-                    Some(chain[149])
-                );
-                assert_eq!(
-                    load_step_key(&repository, branch, 300).await,
-                    Some(chain[149])
-                );
-                // The boundary already sealed before the jump is left alone.
-                assert_eq!(
-                    load_step_key(&repository, branch, 100).await,
-                    Some(chain[99])
-                );
-                // Segment 400 holds the new head, and 500 was never reached.
-                assert_eq!(load_step_key(&repository, branch, 400).await, None);
-                assert_eq!(load_step_key(&repository, branch, 500).await, None);
-            }))
-            .await;
-        }
-    }
 }

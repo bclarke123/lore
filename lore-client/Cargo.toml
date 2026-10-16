@@ -20,6 +20,7 @@ tokio = { workspace = true }
 toml = { workspace = true }
 
 lore = { workspace = true }
+lore-macro = { workspace = true }
 
 [target.'cfg(target_family = "windows")'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_System_Console", "Win32_Networking_WinSock", "Win32_Globalization"] }
@@ -28,10 +29,12 @@ windows-sys = { workspace = true, features = ["Win32_System_Console", "Win32_Net
 default = []
 oodle = ["lore/oodle"]
 swfs = ["lore/swfs"]
+test-util = []
+
+[dev-dependencies]
+lore-client = { path = ".", features = ["test-util"] }
 
 [build-dependencies]
-vergen = { workspace = true }
-anyhow = { workspace = true }
 winresource = "0.1.23"
 
 [[bin]]
@@ -46,9 +49,13 @@ harness = false
 [lib]
 name = "lore_client"
 path = "src/cli/lib.rs"
+test = false
 
 [package.metadata.winresource]
 OriginalFilename = "lore.exe"
 ProductName = "Lore"
 FileDescription = "Lore CLI"
 LegalCopyright = "Copyright Epic Games, Inc."
+
+[lints]
+workspace = true

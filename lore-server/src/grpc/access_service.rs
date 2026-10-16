@@ -58,7 +58,7 @@ impl LoreAccessService {
         }
     }
 
-    fn installed(&self) -> Result<Arc<AccessControl>, Status> {
+    fn installed() -> Result<Arc<AccessControl>, Status> {
         crate::access::installed().ok_or_else(|| {
             Status::failed_precondition(
                 "access control requires server-local authentication to be enabled",
@@ -68,6 +68,7 @@ impl LoreAccessService {
 
     /// Resolve a repository reference to an id. The all-zero id is allowed
     /// (server-level grants).
+    #[lore_macro::test_pub]
     async fn resolve(&self, reference: Option<RepositoryRef>) -> Result<RepositoryId, Status> {
         let reference = reference
             .and_then(|r| r.r#ref)
@@ -76,7 +77,7 @@ impl LoreAccessService {
             Ref::Id(bytes) => {
                 let hex = hex::encode(&bytes);
                 RepositoryId::from_str(&hex)
-                    .map_err(|_| Status::invalid_argument("invalid repository id"))
+                    .map_err(|_err| Status::invalid_argument("invalid repository id"))
             }
             Ref::Name(name) => {
                 let context = lore_revision::access::server_context(
@@ -86,7 +87,7 @@ impl LoreAccessService {
                 );
                 lore_revision::repository::id_from_name(context, &name)
                     .await
-                    .map_err(|_| Status::not_found(format!("Repository {name} not found")))
+                    .map_err(|_err| Status::not_found(format!("Repository {name} not found")))
             }
         }
     }
@@ -112,7 +113,7 @@ impl AccessService for LoreAccessService {
         &self,
         request: Request<AccessGrantRequest>,
     ) -> Result<Response<AccessGrantResponse>, Status> {
-        let access = self.installed()?;
+        let access = Self::installed()?;
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
         let execution = setup_execution(module_path!(), correlation_id, String::default());
         LORE_CONTEXT
@@ -134,7 +135,9 @@ impl AccessService for LoreAccessService {
                         crate::access::AccessError::InvalidGrant(reason) => {
                             Status::invalid_argument(reason)
                         }
-                        e => Status::internal(format!("Failed to store grant: {e}")),
+                        e @ crate::access::AccessError::Store(_) => {
+                            Status::internal(format!("Failed to store grant: {e}"))
+                        }
                     })?;
                 Ok(Response::new(AccessGrantResponse {}))
             })
@@ -146,7 +149,7 @@ impl AccessService for LoreAccessService {
         &self,
         request: Request<AccessRevokeRequest>,
     ) -> Result<Response<AccessRevokeResponse>, Status> {
-        let access = self.installed()?;
+        let access = Self::installed()?;
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
         let execution = setup_execution(module_path!(), correlation_id, String::default());
         LORE_CONTEXT
@@ -171,7 +174,7 @@ impl AccessService for LoreAccessService {
         &self,
         request: Request<AccessListRequest>,
     ) -> Result<Response<AccessListResponse>, Status> {
-        let access = self.installed()?;
+        let access = Self::installed()?;
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
         let execution = setup_execution(module_path!(), correlation_id, String::default());
         LORE_CONTEXT
@@ -197,94 +200,5 @@ impl AccessService for LoreAccessService {
                 }))
             })
             .await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::store::test_store_create;
-
-    #[tokio::test]
-    async fn rpcs_fail_without_access_control() {
-        // The process-global access control is not installed in unit tests,
-        // so every RPC reports FailedPrecondition. (Installed-path behavior
-        // is covered by the access-control smoke tests.)
-        let (immutable, mutable, execution) = test_store_create().await.expect("test stores");
-        let service = LoreAccessService::new(immutable, mutable);
-
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let grant = service
-                .access_grant(Request::new(AccessGrantRequest {
-                    repository: Some(RepositoryRef {
-                        r#ref: Some(Ref::Name("repo".to_string())),
-                    }),
-                    principal: "alice".to_string(),
-                    role: "read".to_string(),
-                }))
-                .await
-                .unwrap_err();
-            assert_eq!(grant.code(), tonic::Code::FailedPrecondition);
-
-            let revoke = service
-                .access_revoke(Request::new(AccessRevokeRequest {
-                    repository: None,
-                    principal: "alice".to_string(),
-                }))
-                .await
-                .unwrap_err();
-            assert_eq!(revoke.code(), tonic::Code::FailedPrecondition);
-
-            let list = service
-                .access_list(Request::new(AccessListRequest { repository: None }))
-                .await
-                .unwrap_err();
-            assert_eq!(list.code(), tonic::Code::FailedPrecondition);
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn resolve_accepts_ids_and_rejects_garbage() {
-        let (immutable, mutable, execution) = test_store_create().await.expect("test stores");
-        let service = LoreAccessService::new(immutable, mutable);
-
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            // A well-formed id resolves.
-            let id_bytes = RepositoryId::from_str("0194b726b34e72b0b45550b88a967076")
-                .expect("id")
-                .data()
-                .to_vec();
-            let resolved = service
-                .resolve(Some(RepositoryRef {
-                    r#ref: Some(Ref::Id(id_bytes.into())),
-                }))
-                .await
-                .expect("resolve");
-            assert_eq!(resolved.to_string(), "0194b726b34e72b0b45550b88a967076");
-
-            // Garbage id refused.
-            let err = service
-                .resolve(Some(RepositoryRef {
-                    r#ref: Some(Ref::Id(vec![1, 2, 3].into())),
-                }))
-                .await
-                .unwrap_err();
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
-
-            // Unknown name → not found.
-            let err = service
-                .resolve(Some(RepositoryRef {
-                    r#ref: Some(Ref::Name("missing-repo".to_string())),
-                }))
-                .await
-                .unwrap_err();
-            assert_eq!(err.code(), tonic::Code::NotFound);
-
-            // Missing reference refused.
-            let err = service.resolve(None).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        }))
-        .await;
     }
 }

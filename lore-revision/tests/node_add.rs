@@ -62,7 +62,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable_store).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let first = state
                     .node_add(repository.clone(), ROOT_NODE, directory("first"), "first")
@@ -120,7 +120,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable_store).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let parent = state
                     .node_add(repository.clone(), ROOT_NODE, directory("parent"), "parent")

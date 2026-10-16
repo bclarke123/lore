@@ -2,18 +2,23 @@
 // SPDX-License-Identifier: MIT
 pub mod initialization;
 pub mod service_main;
+pub mod state;
 
+use lore_base::log::LoreLogLevel;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
+use lore_revision::event::LoreServiceMessageEventData;
+use lore_revision::event::LoreServiceStatusEventData;
+use lore_revision::fs::swfs::mount_manager_state::MountManagerState;
 use lore_revision::global::GlobalConfig;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::lore_info;
 use lore_revision::lore_warn;
+use lore_revision::service_state::ServiceStateImpl;
 use lore_revision::util::config::SaveableConfig;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call::no_repository_call;
+use crate::interface::LoreEvent;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreString;
 use crate::remote::call::service_call_over;
@@ -22,13 +27,13 @@ use crate::remote::service_process::collect_exited_services;
 use crate::remote::service_process::connect_or_spawn_service;
 use crate::remote::service_process::connect_to_running_service;
 use crate::remote::service_process::forget_whether_service_is_in_use;
-use crate::remote::service_process::report_settings_that_will_not_relay;
+use crate::remote::service_process::report_settings_update_that_will_not_relay;
 use crate::remote::service_process::request_service_stop;
 use crate::remote::service_process::service_runs_in_this_process;
 use crate::remote::service_process::wait_until_no_service_is_listening;
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(start_local)]
 /// Arguments for starting the Lore service process (no parameters).
 pub struct LoreServiceStartArgs {}
@@ -62,11 +67,11 @@ pub async fn start(
     start_local(globals, args, callback).await
 }
 
-async fn start_local(
+fn start_local(
     globals: LoreGlobalArgs,
     args: LoreServiceStartArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     no_repository_call(globals, callback, args, start, move |_args| async move {
         if service_runs_in_this_process() {
             // The command reached the service itself, which is running, and a
@@ -81,11 +86,10 @@ async fn start_local(
             lore_info!("Lore service is running");
         })
     })
-    .await
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(stop_local)]
 /// Arguments for stopping the Lore service process.
 pub struct LoreServiceStopArgs {}
@@ -136,7 +140,7 @@ async fn stop_local(
     // on a service that is running and must not be what starts one.
     match connect_to_running_service().await {
         Ok(Some(connection)) => {
-            let status = service_call_over(connection, globals, args, callback).await;
+            let status = service_call_over(connection, globals, args.into(), callback).await;
             if status != 0 {
                 return status;
             }
@@ -185,12 +189,13 @@ async fn stop_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(set_executable_local)]
 /// Arguments for naming the executable the Lore service runs from.
 pub struct LoreServiceSetExecutableArgs {
     /// Path of the executable to start as the service. Empty clears the setting,
-    /// which returns to resolving one from the running program.
+    /// which prevents auto-starting the service but can still can connect to an
+    /// already running service.
     pub executable: LoreString,
 }
 
@@ -244,7 +249,7 @@ async fn set_executable_local(
             }
             // Clearing the executable is one of the two ways to end up with a pair
             // that does not relay.
-            report_settings_that_will_not_relay(&config);
+            report_settings_update_that_will_not_relay(&config);
 
             config
                 .save(lock)
@@ -262,7 +267,7 @@ async fn set_executable_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(set_use_automatically_local)]
 /// Arguments for setting whether commands are carried out by the Lore service.
 pub struct LoreServiceSetUseAutomaticallyArgs {
@@ -327,8 +332,152 @@ async fn set_use_automatically_local(
             }
             // Reported after the line above rather than instead of it: the setting
             // was stored, and this says what it will and will not do on its own.
-            report_settings_that_will_not_relay(&config);
+            report_settings_update_that_will_not_relay(&config);
             Ok(())
         };
     no_repository_call(globals, callback, args, set_use_automatically, command).await
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[handler(status_local)]
+/// Arguments for querying the Lore service status (no parameters).
+pub struct LoreServiceStatusArgs {}
+
+/// Query the Lore service status.
+///
+/// Reports whether the service is running and, if so, its metadata: binary path,
+/// uptime, active connection count, and SWFS mount count. Also drains any buffered
+/// service-level log messages.
+///
+/// # Events
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
+///
+/// ## Operation-Specific Events
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::ServiceStatus`](crate::interface::LoreEvent::ServiceStatus) | Service running state and metadata |
+/// | [`LoreEvent::ServiceMessage`](crate::interface::LoreEvent::ServiceMessage) | Buffered service-level log message |
+pub async fn status(
+    globals: LoreGlobalArgs,
+    args: LoreServiceStatusArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    // Status runs where it was called, like start and stop. When in the service
+    // process, it queries local state. When in a client, it tries to connect.
+    status_local(globals, args, callback).await
+}
+
+async fn status_local(
+    globals: LoreGlobalArgs,
+    args: LoreServiceStatusArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    if service_runs_in_this_process() {
+        // Running inside the service: query local state.
+        return no_repository_call(globals, callback, args, status, move |_args| async move {
+            emit_status_from_service();
+            Ok::<(), ServiceProcessError>(())
+        })
+        .await;
+    }
+
+    // Running in a client process: try to connect to the service.
+    match connect_to_running_service().await {
+        Ok(Some(connection)) => {
+            // Service is running; relay the status command to it.
+            service_call_over(connection, globals, args.into(), callback).await
+        }
+        Ok(None) => {
+            // No service is listening; emit not-running status.
+            no_repository_call(globals, callback, args, status, move |_args| async move {
+                emit_not_running_status();
+                Ok::<(), ServiceProcessError>(())
+            })
+            .await
+        }
+        Err(error) => {
+            no_repository_call(globals, callback, args, status, move |_args| async move {
+                Err::<(), ServiceProcessError>(error)
+            })
+            .await
+        }
+    }
+}
+
+/// Emit `ServiceStatus` and `ServiceMessage` events from within the service process.
+fn emit_status_from_service() {
+    // The status command arrives through command dispatch, which carries no
+    // service state, so this is one of the paths that reaches for the global.
+    let service_state = ServiceStateImpl::global();
+
+    // Check if service state is initialized.
+    if !service_state.is_initialized() {
+        // Shouldn't happen if wired correctly, but emit not-running as fallback.
+        emit_not_running_status();
+        return;
+    }
+
+    // Get binary path.
+    let binary_path = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+
+    // Get mount count from MountManagerState.
+    let swfs_mount_count = MountManagerState::mount_manager().map_or(0, |m| m.mount_count() as u32);
+
+    // Emit ServiceStatus event.
+    LoreEvent::ServiceStatus(LoreServiceStatusEventData {
+        running: 1,
+        binary_path: LoreString::from(binary_path.as_str()),
+        uptime_ms: service_state.uptime_ms(),
+        connection_count: service_state.connection_count(),
+        swfs_mount_count,
+    })
+    .send();
+
+    // Drain buffered logs and emit ServiceMessage events.
+    let (messages, dropped_count) = service_state.drain_logs();
+    for message in messages {
+        LoreEvent::ServiceMessage(LoreServiceMessageEventData {
+            level: message.level,
+            message: LoreString::from(message.message.as_str()),
+        })
+        .send();
+    }
+
+    // If messages were dropped, emit a synthetic error message.
+    if dropped_count > 0 {
+        LoreEvent::ServiceMessage(LoreServiceMessageEventData {
+            level: LoreLogLevel::Error,
+            message: LoreString::from(
+                format!("{dropped_count} service log messages were dropped due to buffer overflow")
+                    .as_str(),
+            ),
+        })
+        .send();
+    }
+}
+
+/// Emit a `ServiceStatus` event indicating the service is not running.
+fn emit_not_running_status() {
+    LoreEvent::ServiceStatus(LoreServiceStatusEventData {
+        running: 0,
+        binary_path: LoreString::default(),
+        uptime_ms: 0,
+        connection_count: 0,
+        swfs_mount_count: 0,
+    })
+    .send();
 }

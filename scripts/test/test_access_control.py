@@ -513,6 +513,7 @@ def test_anonymous_clone_of_public_repo(
     """End-to-end: a client that has NEVER logged in can clone a public
     repository, and loses access when the public grant is revoked."""
     from lore import Lore
+    from lore import lore_test_env
 
     grpc_port = access_server["grpc"].split(":")[1]
     remote = f"grpc://localhost:{grpc_port}/"
@@ -539,7 +540,7 @@ def test_anonymous_clone_of_public_repo(
         lore_executable_path=lore_executable_path,
         path=str(tmp_path_factory.mktemp("public-src") / "pubclone"),
         name="pubclone",
-        global_dir=root_global,
+        base_env=lore_test_env(root_global),
         environment_vars={"LORE_AUTH_STORE": "fallback"},
         remote_url=remote,
     )
@@ -568,7 +569,7 @@ def test_anonymous_clone_of_public_repo(
         lore_executable_path=lore_executable_path,
         path=str(tmp_path_factory.mktemp("anon-work") / "seed"),
         name="pubclone",
-        global_dir=anon_global,
+        base_env=lore_test_env(anon_global),
         environment_vars={"LORE_AUTH_STORE": "fallback"},
         remote_url=remote,
         remote_path=remote + "pubclone",
@@ -588,7 +589,7 @@ def test_anonymous_clone_of_public_repo(
         lore_executable_path=lore_executable_path,
         path=str(tmp_path_factory.mktemp("anon-quic") / "seed"),
         name="pubclone",
-        global_dir=anon_global,
+        base_env=lore_test_env(anon_global),
         environment_vars={"LORE_AUTH_STORE": "fallback"},
         remote_url=quic_remote,
         remote_path=quic_remote + "pubclone",

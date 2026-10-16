@@ -1,7 +1,7 @@
 [package]
 name = "lore-proto"
 # Crate version is used for proto-artifactory workflow
-version = "0.1.62"
+version = "0.1.64"
 edition = "2024"
 publish = false
 
@@ -19,3 +19,6 @@ tonic-prost = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
+
+[lints]
+workspace = true

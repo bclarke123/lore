@@ -146,14 +146,7 @@ pub async fn add_file_dependencies(
     }
 
     // Serialize state if modified
-    flush_state(
-        &repository,
-        token,
-        &state,
-        current_revision,
-        staged_revision,
-    )
-    .await?;
+    flush_state(&repository, token, &state, current_revision).await?;
 
     Ok(AddResult { added })
 }
@@ -188,17 +181,11 @@ pub async fn resolve_path(
 pub(super) async fn flush_state(
     repository: &Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
-    state: &State,
+    state: &Arc<State>,
     current_revision: Hash,
-    staged_revision: Hash,
 ) -> Result<(), DependencyError> {
     if state.is_dirty() {
-        state.set_revision_number(0);
-        state.set_parent_self(current_revision);
-
-        if staged_revision == current_revision {
-            state.set_parent_other(Hash::default());
-        }
+        state.reparent_onto(current_revision);
 
         let signature = state
             .serialize(repository.clone(), token)

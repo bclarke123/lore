@@ -39,7 +39,30 @@ impl FSLock {
         path: impl AsRef<Path>,
         create_directory_if_necessary: bool,
     ) -> std::io::Result<FSLock> {
-        let mut path = path.as_ref().to_path_buf();
+        let path = Self::file_lock_path(path.as_ref(), create_directory_if_necessary)?;
+        Self::acquire_exact_path(&path).await.map_err(|_err| {
+            std::io::Error::other(format!("Failed to acquire lock file \"{path:?}\""))
+        })
+    }
+
+    /// Takes the lock [`acquire_file_lock`](Self::acquire_file_lock) takes if no other holder
+    /// has it, without waiting: `None` while it is held.
+    pub fn try_acquire_file_lock(path: impl AsRef<Path>) -> std::io::Result<Option<FSLock>> {
+        let path = Self::file_lock_path(path.as_ref(), false)?;
+        let file = Self::open_lock_file(&path)?;
+        match Self::try_lock(&file) {
+            Ok(()) => Ok(Some(FSLock { file })),
+            Err(err) if is_lock_contended(&err) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The lock file guarding `path`: `path` with `.lock` appended, in its canonical directory.
+    fn file_lock_path(
+        path: &Path,
+        create_directory_if_necessary: bool,
+    ) -> std::io::Result<std::path::PathBuf> {
+        let mut path = path.to_path_buf();
         let mut file_name = path
             .file_name()
             .ok_or(std::io::Error::other(
@@ -53,9 +76,7 @@ impl FSLock {
         let mut path = path.canonicalize()?;
         file_name.push(".lock");
         path.push(file_name);
-        Self::acquire_exact_path(&path).await.map_err(|_err| {
-            std::io::Error::other(format!("Failed to acquire lock file \"{path:?}\""))
-        })
+        Ok(path)
     }
 
     /// Directory twin of [`acquire_file_lock`](Self::acquire_file_lock).
@@ -239,57 +260,5 @@ impl Drop for FSLock {
             // Safety: Calling OS functions
             unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_util::TempDir;
-
-    /// The lock excludes a second acquirer, which waits rather than failing. Both `flock` and
-    /// `LockFileEx` contend between separate handles on one file, so one process is enough to
-    /// observe it: the second acquisition is still pending when the window closes, where a
-    /// failing implementation would have returned an error and a broken one would have returned
-    /// a guard.
-    #[tokio::test]
-    async fn a_second_acquirer_waits_while_the_lock_is_held() {
-        let dir = TempDir::new("lore-base-lock-held");
-        let held = FSLock::acquire_directory_lock(dir.path())
-            .await
-            .expect("first acquisition");
-
-        // Several poll intervals, so the second acquirer has attempted and backed off repeatedly.
-        let waited = tokio::time::timeout(
-            Duration::from_millis(50),
-            FSLock::acquire_directory_lock(dir.path()),
-        )
-        .await;
-
-        assert!(
-            waited.is_err(),
-            "a second acquirer must neither take a held lock nor fail on it"
-        );
-        drop(held);
-    }
-
-    /// Dropping the guard releases the OS lock, so the next acquisition completes. Bounded by a
-    /// timeout because the wait is otherwise unbounded: a lock that was not released would hang
-    /// the test rather than fail it.
-    #[tokio::test]
-    async fn the_lock_is_acquirable_once_the_guard_drops() {
-        let dir = TempDir::new("lore-base-lock-released");
-        let held = FSLock::acquire_directory_lock(dir.path())
-            .await
-            .expect("first acquisition");
-        drop(held);
-
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            FSLock::acquire_directory_lock(dir.path()),
-        )
-        .await
-        .expect("the lock must be acquirable once the guard drops")
-        .expect("second acquisition");
     }
 }

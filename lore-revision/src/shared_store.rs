@@ -29,7 +29,6 @@ use crate::repository::StoreConfig;
 use crate::shared_store::registry::SharedStoreRegistry;
 use crate::store::immutable;
 use crate::store::immutable::ImmutableStoreCreateOptions;
-use crate::store::immutable::ImmutableStoreSettings;
 use crate::store::mutable;
 use crate::util;
 use crate::util::config;
@@ -146,7 +145,7 @@ pub fn find_existing_shared_store_in_dir(
 
 /// Data for an event reporting that a shared store was created.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreSharedStoreCreateEventData {
     /// Filesystem path of the created shared store.
@@ -247,15 +246,13 @@ async fn create_shared_store_at(
         Some(shared_store_path),
         options,
         false,
-        ImmutableStoreSettings {
-            protect_local_fragment: true, /* Protect local fragments from eviction */
-            verify_write: shared_store_config
+        immutable::client_settings(
+            shared_store_config
                 .store_config
                 .as_ref()
                 .and_then(|config| config.verify_write)
                 .unwrap_or_default(),
-            ..Default::default()
-        },
+        ),
     )
     .await
     .forward::<SharedStoreError>("creating immutable store")?;
@@ -517,7 +514,7 @@ async fn load_shared_store_config(
 
 /// Data for an event describing the configured shared stores.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreSharedStoreInfoEventData {
     /// Nonzero when a shared store is used automatically for the repository.
@@ -532,7 +529,7 @@ pub struct LoreSharedStoreInfoEventData {
 
 /// Data for an event describing all shared stores.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreSharedStoreListEventData {
     /// All stores from the registry.
@@ -541,7 +538,7 @@ pub struct LoreSharedStoreListEventData {
 
 /// Shared store array list item.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreSharedStoreListItem {
     /// Remote URL the shared store is for.

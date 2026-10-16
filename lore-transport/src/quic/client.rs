@@ -75,8 +75,14 @@ const IDLE_TIMEOUT_MS: u32 = 30000;
 const KEEP_ALIVE_MS: u64 = 500;
 const HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 const HAPPY_EYEBALLS_DELAY_MS: u64 = 250;
+#[lore_macro::test_pub]
 const HAPPY_EYEBALLS_MAX_IN_FLIGHT: usize = 10;
 pub const DEFAULT_EXPECTED_RTT_MS: u64 = 100;
+/// The UDP receive buffer a client socket asks for. Linux allocates twice the request, 1 MiB, which is
+/// intended. Its default of 208 KiB holds under half a millisecond of a 5 Gbit/s transfer, and every
+/// datagram that arrives while it is full is lost.
+#[lore_macro::test_pub]
+const RECEIVE_BUFFER_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ClientCerts {
@@ -372,7 +378,6 @@ impl QuicConnection {
                 .map_err(|_err| QuicClientError::StreamOpen)?;
             connection.writer.push(Arc::new(Mutex::new(send)));
             connection.reader.push(ResponseReader::new(
-                0,
                 recv,
                 self.max_chunk_size,
                 last_recv,
@@ -422,6 +427,11 @@ impl QuicConnection {
 
     pub async fn connection_stats(&self) -> ConnectionStats {
         self.connection.read().await.connection.stats().into()
+    }
+
+    /// Requests outstanding on each stream, as the stream selection sees them.
+    pub fn stream_inflight(&self) -> [u64; STREAM_COUNT as usize] {
+        std::array::from_fn(|stream| self.stream_inflight[stream].load(Ordering::Relaxed))
     }
 }
 
@@ -769,6 +779,9 @@ pub async fn connect(
                 if let Some(cwnd) = transport.initial_cwnd {
                     bbr.initial_window(cwnd);
                 }
+                // quinn never has more than the send window unacknowledged, so a larger
+                // congestion window would only raise the pacing rate.
+                bbr.max_window(send_window);
                 Arc::new(bbr)
             }
             CongestionAlgorithm::Cubic => {
@@ -809,6 +822,7 @@ pub async fn connect(
     Err(ProtocolError::from(Disconnected))
 }
 
+#[lore_macro::test_pub]
 fn interleave_socket_addrs(remote_addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
     let Some(first) = remote_addrs.first() else {
         return remote_addrs;
@@ -839,6 +853,7 @@ fn interleave_socket_addrs(remote_addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
     interleaved
 }
 
+#[lore_macro::test_pub]
 async fn connect_happy_eyeballs<T, F, Fut>(
     remote_addrs: Vec<SocketAddr>,
     attempt_delay: Duration,
@@ -894,6 +909,22 @@ where
     }
 }
 
+/// Raises `socket`'s receive buffer to `bytes` when it is smaller, and leaves a buffer of at least
+/// that size alone. The OS may grant less than asked: Linux caps the request at
+/// `net.core.rmem_max`, and allocates and reports twice what it grants.
+#[lore_macro::test_pub]
+fn raise_receive_buffer(socket: &std::net::UdpSocket, bytes: usize) {
+    let socket = socket2::SockRef::from(socket);
+    if socket.recv_buffer_size().is_ok_and(|size| size >= bytes) {
+        return;
+    }
+    let result = socket.set_recv_buffer_size(bytes);
+    lore_debug!(
+        "QUIC socket receive buffer {:?} after asking for {bytes} bytes: {result:?}",
+        socket.recv_buffer_size()
+    );
+}
+
 async fn connect_to_addr(
     client_config: quinn::ClientConfig,
     host: String,
@@ -917,6 +948,7 @@ async fn connect_to_addr(
     let endpoint = {
         let _guard = lore_base::runtime::net_runtime().enter();
         std::net::UdpSocket::bind(bind).and_then(|socket| {
+            raise_receive_buffer(&socket, RECEIVE_BUFFER_BYTES);
             quinn::Endpoint::new(
                 quinn::EndpointConfig::default(),
                 None,
@@ -1160,7 +1192,6 @@ async fn add_stream(connection: Arc<QuicConnection>) -> Result<u32, QuicClientEr
             .map_err(|_err| QuicClientError::StreamOpen)?;
         connection_lock.writer.push(Arc::new(Mutex::new(send)));
         connection_lock.reader.push(ResponseReader::new(
-            stream_index,
             recv,
             connection.max_chunk_size,
             last_recv.clone(),
@@ -1183,11 +1214,13 @@ async fn add_stream(connection: Arc<QuicConnection>) -> Result<u32, QuicClientEr
 /// The count is what [`select_stream`] balances on, so it has
 /// to come back down on every way out of a send - error returns and a dropped send future
 /// included, not just the successful path.
+#[lore_macro::test_pub]
 struct StreamInflightGuard<'a> {
     inflight: &'a AtomicU64,
 }
 
 impl<'a> StreamInflightGuard<'a> {
+    #[lore_macro::test_pub]
     fn new(inflight: &'a AtomicU64) -> Self {
         inflight.fetch_add(1, Ordering::Relaxed);
         Self { inflight }
@@ -1217,6 +1250,7 @@ impl Drop for StreamInflightGuard<'_> {
 /// Ties resolve to the lowest eligible index, which deliberately keeps a caller that issues one
 /// request at a time on a single stream rather than scattering requests that were never
 /// concurrent.
+#[lore_macro::test_pub]
 fn select_stream(stream_inflight: &[AtomicU64], reader_count: u32, high_priority: bool) -> u32 {
     let first = if high_priority || reader_count <= PRIORITY_STREAM_COUNT {
         0
@@ -1346,8 +1380,7 @@ pub async fn send_command<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>
 
         if stream_count != 0 && stream_index >= stream_count {
             // Box the rare path to avoid increasing send_command future size
-            let connection = connection.clone();
-            Box::pin(async move { add_stream(connection).await }).await?;
+            Box::pin(add_stream(connection.clone())).await?;
         }
     }
 
@@ -1436,299 +1469,4 @@ pub async fn send_without_response(
     send_command::<false, false>(connection, command, session_id, v4, chunks)
         .await
         .map(|_| ())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use parking_lot::Mutex;
-    use tokio::sync::mpsc;
-
-    use super::*;
-
-    fn inflight_counters() -> [AtomicU64; STREAM_COUNT as usize] {
-        std::array::from_fn(|_| AtomicU64::new(0))
-    }
-
-    #[test]
-    fn inflight_guard_counts_a_request_only_while_it_is_outstanding() {
-        let inflight = AtomicU64::new(0);
-
-        {
-            let _first = StreamInflightGuard::new(&inflight);
-            assert_eq!(inflight.load(Ordering::Relaxed), 1);
-
-            let _second = StreamInflightGuard::new(&inflight);
-            assert_eq!(inflight.load(Ordering::Relaxed), 2);
-        }
-
-        assert_eq!(inflight.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn high_priority_spreads_concurrent_requests_over_every_stream() {
-        let inflight = inflight_counters();
-
-        let mut guards = Vec::new();
-        let mut selected = Vec::new();
-        for _ in 0..STREAM_COUNT {
-            let stream = select_stream(&inflight, STREAM_COUNT, true);
-            guards.push(StreamInflightGuard::new(&inflight[stream as usize]));
-            selected.push(stream);
-        }
-
-        selected.sort_unstable();
-        assert_eq!(selected, (0..STREAM_COUNT).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn high_priority_reuses_a_stream_once_its_request_completed() {
-        let inflight = inflight_counters();
-
-        for _ in 0..STREAM_COUNT * 4 {
-            let stream = select_stream(&inflight, STREAM_COUNT, true);
-            let _guard = StreamInflightGuard::new(&inflight[stream as usize]);
-            assert_eq!(stream, 0);
-        }
-
-        assert!(
-            inflight
-                .iter()
-                .all(|count| count.load(Ordering::Relaxed) == 0)
-        );
-    }
-
-    #[test]
-    fn normal_priority_spreads_concurrent_requests_over_the_non_priority_streams() {
-        let inflight = inflight_counters();
-
-        let mut guards = Vec::new();
-        let mut selected = Vec::new();
-        for _ in PRIORITY_STREAM_COUNT..STREAM_COUNT {
-            let stream = select_stream(&inflight, STREAM_COUNT, false);
-            guards.push(StreamInflightGuard::new(&inflight[stream as usize]));
-            selected.push(stream);
-        }
-
-        selected.sort_unstable();
-        assert_eq!(
-            selected,
-            (PRIORITY_STREAM_COUNT..STREAM_COUNT).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn normal_priority_leaves_the_priority_streams_to_metadata() {
-        let inflight = inflight_counters();
-
-        // Every non-priority stream is busy while the priority streams sit idle. Balancing on
-        // outstanding requests alone would send bulk traffic to a priority stream; the reserved
-        // window is what stops it.
-        let _guards: Vec<_> = (PRIORITY_STREAM_COUNT..STREAM_COUNT)
-            .map(|stream| StreamInflightGuard::new(&inflight[stream as usize]))
-            .collect();
-
-        let stream = select_stream(&inflight, STREAM_COUNT, false);
-        assert!(
-            stream >= PRIORITY_STREAM_COUNT,
-            "bulk traffic must stay off the reserved streams, got {stream}"
-        );
-    }
-
-    #[test]
-    fn normal_priority_shares_what_is_open_before_any_stream_can_be_reserved() {
-        let inflight = inflight_counters();
-
-        // With fewer streams open than the reservation needs, there is nothing to reserve.
-        assert_eq!(select_stream(&inflight, 1, false), 0);
-        assert_eq!(select_stream(&inflight, PRIORITY_STREAM_COUNT, false), 0);
-    }
-
-    #[test]
-    fn normal_priority_reuses_a_stream_once_its_request_completed() {
-        let inflight = inflight_counters();
-
-        for _ in 0..STREAM_COUNT * 4 {
-            let stream = select_stream(&inflight, STREAM_COUNT, false);
-            let _guard = StreamInflightGuard::new(&inflight[stream as usize]);
-            assert_eq!(stream, PRIORITY_STREAM_COUNT);
-        }
-
-        assert!(
-            inflight
-                .iter()
-                .all(|count| count.load(Ordering::Relaxed) == 0)
-        );
-    }
-    fn ipv6_addr() -> SocketAddr {
-        "[::1]:41337".parse().unwrap()
-    }
-
-    fn ipv4_addr() -> SocketAddr {
-        "127.0.0.1:41337".parse().unwrap()
-    }
-
-    #[test]
-    fn happy_eyeballs_interleaves_ipv6_first_addresses() {
-        let ipv6_second = "[::2]:41337".parse().unwrap();
-        let ipv6_third = "[::3]:41337".parse().unwrap();
-        let ipv4_second = "127.0.0.2:41337".parse().unwrap();
-
-        assert_eq!(
-            interleave_socket_addrs(vec![
-                ipv6_addr(),
-                ipv6_second,
-                ipv6_third,
-                ipv4_addr(),
-                ipv4_second,
-            ]),
-            vec![
-                ipv6_addr(),
-                ipv4_addr(),
-                ipv6_second,
-                ipv4_second,
-                ipv6_third,
-            ]
-        );
-    }
-
-    #[test]
-    fn happy_eyeballs_interleaves_ipv4_first_addresses() {
-        let ipv4_second = "127.0.0.2:41337".parse().unwrap();
-        let ipv6_second = "[::2]:41337".parse().unwrap();
-
-        assert_eq!(
-            interleave_socket_addrs(vec![ipv4_addr(), ipv4_second, ipv6_addr(), ipv6_second,]),
-            vec![ipv4_addr(), ipv6_addr(), ipv4_second, ipv6_second]
-        );
-    }
-
-    #[tokio::test]
-    async fn happy_eyeballs_starts_fallback_while_first_attempt_is_stalled() {
-        let attempts = Arc::new(Mutex::new(Vec::new()));
-        let attempt_log = attempts.clone();
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            connect_happy_eyeballs(
-                vec![ipv6_addr(), ipv4_addr()],
-                Duration::from_millis(10),
-                move |addr| {
-                    let attempt_log = attempt_log.clone();
-                    async move {
-                        attempt_log.lock().push(addr);
-                        if addr.is_ipv6() {
-                            std::future::pending().await
-                        } else {
-                            Some(addr)
-                        }
-                    }
-                },
-            ),
-        )
-        .await
-        .expect("fallback should not wait for the stalled first attempt");
-
-        assert_eq!(result, Some(ipv4_addr()));
-        assert_eq!(*attempts.lock(), vec![ipv6_addr(), ipv4_addr()]);
-    }
-
-    #[tokio::test]
-    async fn happy_eyeballs_advances_immediately_after_failure() {
-        let started = std::time::Instant::now();
-
-        let result = connect_happy_eyeballs(
-            vec![ipv6_addr(), ipv4_addr()],
-            Duration::from_secs(1),
-            |addr| async move { if addr.is_ipv6() { None } else { Some(addr) } },
-        )
-        .await;
-
-        assert_eq!(result, Some(ipv4_addr()));
-        assert!(started.elapsed() < Duration::from_millis(750));
-    }
-
-    #[tokio::test]
-    async fn happy_eyeballs_does_not_start_fallback_after_first_success() {
-        let attempts = Arc::new(Mutex::new(HashMap::new()));
-        let attempt_counts = attempts.clone();
-
-        let result = connect_happy_eyeballs(
-            vec![ipv6_addr(), ipv4_addr()],
-            Duration::from_millis(10),
-            move |addr| {
-                let attempt_counts = attempt_counts.clone();
-                async move {
-                    *attempt_counts.lock().entry(addr).or_insert(0) += 1;
-                    Some(addr)
-                }
-            },
-        )
-        .await;
-
-        assert_eq!(result, Some(ipv6_addr()));
-        assert_eq!(attempts.lock().get(&ipv6_addr()), Some(&1));
-        assert_eq!(attempts.lock().get(&ipv4_addr()), None);
-    }
-
-    #[tokio::test]
-    async fn happy_eyeballs_returns_none_when_all_attempts_fail() {
-        let result = connect_happy_eyeballs(
-            vec![ipv6_addr(), ipv4_addr()],
-            Duration::from_millis(10),
-            |_| async { None::<SocketAddr> },
-        )
-        .await;
-
-        assert_eq!(result, None);
-    }
-
-    #[tokio::test]
-    async fn happy_eyeballs_bounds_in_flight_attempts() {
-        let remote_addrs: Vec<_> = (1..=HAPPY_EYEBALLS_MAX_IN_FLIGHT + 1)
-            .map(|port| SocketAddr::new(ipv6_addr().ip(), port as u16))
-            .collect();
-        let release = Arc::new(Semaphore::new(0));
-        let attempt_release = release.clone();
-        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-
-        let task = lore_base::lore_spawn!(connect_happy_eyeballs(
-            remote_addrs.clone(),
-            Duration::from_millis(1),
-            move |addr| {
-                started_tx.send(addr).unwrap();
-                let attempt_release = attempt_release.clone();
-                async move {
-                    attempt_release.acquire().await.unwrap().forget();
-                    None::<SocketAddr>
-                }
-            },
-        ));
-
-        for expected in remote_addrs.iter().take(HAPPY_EYEBALLS_MAX_IN_FLIGHT) {
-            assert_eq!(
-                tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
-                    .await
-                    .expect("attempt should start"),
-                Some(*expected)
-            );
-        }
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), started_rx.recv())
-                .await
-                .is_err(),
-            "attempts above the in-flight limit should remain queued"
-        );
-
-        release.add_permits(1);
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
-                .await
-                .expect("queued attempt should start when a slot opens"),
-            Some(remote_addrs[HAPPY_EYEBALLS_MAX_IN_FLIGHT])
-        );
-
-        task.abort();
-    }
 }

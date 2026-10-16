@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use super::MetadataErrors;
@@ -21,7 +20,7 @@ use crate::util::path::RelativePath;
 
 /// Data for an event reporting that revision metadata was cleared.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreMetadataClearRevisionEventData {
     /// Hash of the revision whose metadata was cleared.
@@ -30,14 +29,14 @@ pub struct LoreMetadataClearRevisionEventData {
 
 /// Data for an event reporting that a file's metadata was cleared.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreMetadataClearFileEventData {
     /// Path of the file whose metadata was cleared.
     pub path: LoreString,
 }
 
-pub async fn clear_revision(
+pub(crate) async fn clear_revision(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
 ) -> Result<(), MetadataErrors> {
@@ -58,12 +57,7 @@ pub async fn clear_revision(
 
     // Serialize the new current state
     if state.is_dirty() {
-        state.set_revision_number(0);
-        state.set_parent_self(current_revision);
-
-        if staged_revision == current_revision {
-            state.set_parent_other(Hash::default());
-        }
+        state.reparent_onto(current_revision);
 
         let signature = state
             .serialize(repository.clone(), token)
@@ -81,6 +75,14 @@ pub async fn clear_revision(
     .send();
 
     Ok(())
+}
+
+/// Boxed version of [`clear_revision`] for cross-crate use.
+pub fn clear_revision_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+) -> crate::BoxFuture<'_, Result<(), MetadataErrors>> {
+    Box::pin(clear_revision(repository, token))
 }
 
 pub async fn clear_file(
@@ -140,12 +142,7 @@ pub async fn clear_file(
 
     // Serialize the new current state
     if state.is_dirty() {
-        state.set_revision_number(0);
-        state.set_parent_self(current_revision);
-
-        if staged_revision == current_revision {
-            state.set_parent_other(Hash::default());
-        }
+        state.reparent_onto(current_revision);
 
         let signature = state
             .serialize(repository.clone(), token)

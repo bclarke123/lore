@@ -47,3 +47,6 @@ lore-proto = { workspace = true }
 [features]
 default = []
 mocks = []
+
+[lints]
+workspace = true

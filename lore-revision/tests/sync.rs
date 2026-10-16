@@ -26,6 +26,313 @@ mod tests {
 
     include!("helper.rs");
 
+    /// The file the executable bit test carries across two revisions.
+    const SCRIPT: &str = "script.sh";
+    const FIRST: &[u8] = b"#!/bin/sh\necho first";
+    const SECOND: &[u8] = b"#!/bin/sh\necho second";
+
+    /// Syncs `instance` to `revision`, discarding local modifications where `reset` asks it to.
+    async fn sync_to(instance: &TestRepository, revision: lore_base::types::Hash, reset: bool) {
+        sync::sync_boxed(
+            instance.repository.clone(),
+            &instance.write_token,
+            SyncOptions {
+                revision: Some(revision.to_string()),
+                reset,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to sync to the revision");
+    }
+
+    /// A repository whose second revision rewrites [`SCRIPT`], answered beside the working tree
+    /// standing on the first revision with the file marked executable by hand.
+    #[cfg(target_family = "unix")]
+    async fn a_chmodded_working_tree(
+        immutable_store: std::sync::Arc<dyn lore_storage::ImmutableStore>,
+        mutable_store: std::sync::Arc<dyn lore_storage::MutableStore>,
+    ) -> (TestRepository, lore_base::types::Hash) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let instance = test_repository_create(
+            immutable_store,
+            mutable_store,
+            RepositoryId::from(uuid::Uuid::now_v7()),
+        )
+        .await;
+        let script = instance.path.join(SCRIPT);
+
+        test_file_write(script.as_path(), FIRST);
+        let first = test_commit_tree(&instance, "First").await.revision();
+        test_file_write(script.as_path(), SECOND);
+        let second = test_commit_tree(&instance, "Second").await.revision();
+
+        sync_to(&instance, first, false).await;
+        std::fs::set_permissions(script.as_path(), std::fs::Permissions::from_mode(0o755))
+            .expect("Failed to set the executable bit");
+
+        (instance, second)
+    }
+
+    /// Whether the working file at `path` carries the executable bit.
+    #[cfg(target_family = "unix")]
+    fn working_executable(path: &std::path::Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::metadata(path)
+            .expect("The working file must be readable")
+            .permissions()
+            .mode()
+            & 0o111
+            != 0
+    }
+
+    /// A chmod is a modification of the executable bit and nothing else, which the content an
+    /// incoming revision carries answers nothing about. A sync to that revision writes the content
+    /// and leaves the bit, so the change the user made stands as a local modification against the
+    /// revision the tree lands on rather than being reverted by the write.
+    #[cfg(target_family = "unix")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sync_writes_new_content_and_keeps_a_local_executable_bit() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let (instance, second) =
+                    a_chmodded_working_tree(immutable_store, mutable_store).await;
+                let script = instance.path.join(SCRIPT);
+
+                sync_to(&instance, second, false).await;
+
+                assert_eq!(
+                    fs::read(script.as_path()).expect("The synced file must be readable"),
+                    SECOND,
+                    "the sync has to carry the content the revision it lands on holds"
+                );
+                assert!(
+                    working_executable(script.as_path()),
+                    "the bit the user set has to survive the write"
+                );
+
+                let (current, staged) = test_anchor_states(&instance.repository).await;
+                let scanned =
+                    test_reported(&test_scan(instance.repository.clone(), staged, current).await);
+                assert!(
+                    scanned.contains(&("M".to_string(), SCRIPT.to_string())),
+                    "the bit has to stand as a local modification against the revision synced \
+                     to, reported {scanned:?}"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A reset discards local modifications, which the executable bit is one of: the file is left
+    /// holding the mode its revision names.
+    #[cfg(target_family = "unix")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_sync_discards_a_local_executable_bit() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let (instance, second) =
+                    a_chmodded_working_tree(immutable_store, mutable_store).await;
+                let script = instance.path.join(SCRIPT);
+
+                sync_to(&instance, second, true).await;
+
+                assert_eq!(
+                    fs::read(script.as_path()).expect("The synced file must be readable"),
+                    SECOND,
+                    "a reset carries the content the revision it lands on holds"
+                );
+                assert!(
+                    !working_executable(script.as_path()),
+                    "a reset leaves the mode the revision names, the local bit with it"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A path that is a file in one revision and a directory in the next. A reset sync back to the
+    /// file diffs the target against the working tree, where the directory and everything under
+    /// it has to be reported so it is deleted before the file is written in its place; reporting
+    /// only the directory left it in the way and the write failed with "Is a directory".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_sync_turns_a_directory_back_into_a_file() {
+        const ENTRY: &str = "entry";
+        const CONTENT: &[u8] = b"entry as a file";
+
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let instance = Box::pin(test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                ))
+                .await;
+                let entry = instance.path.join(ENTRY);
+
+                test_file_write(entry.as_path(), CONTENT);
+                let as_file = test_commit_tree(&instance, "Entry is a file")
+                    .await
+                    .revision();
+
+                fs::remove_file(entry.as_path()).expect("Failed to remove the file");
+                fs::create_dir_all(entry.join("sub")).expect("Failed to create the directory");
+                test_file_write(entry.join("inner").as_path(), b"inner");
+                test_file_write(entry.join("sub").join("deep").as_path(), b"deep");
+                let as_directory = test_commit_tree(&instance, "Entry is a directory")
+                    .await
+                    .revision();
+
+                sync_to(&instance, as_file, true).await;
+                assert_eq!(
+                    fs::read(entry.as_path()).expect("The entry must be a readable file"),
+                    CONTENT,
+                    "a reset sync has to replace the directory with the file the revision holds"
+                );
+
+                sync_to(&instance, as_directory, true).await;
+                assert_eq!(
+                    fs::read(entry.join("sub").join("deep").as_path())
+                        .expect("The nested file must be readable"),
+                    b"deep",
+                    "a reset sync forward has to bring the directory and its content back"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// The directory that replaced the file is the root of a nested repository: the walk never
+    /// descends into one, so a reset sync reports nothing under it, the non-recursive directory
+    /// delete keeps it, and the sync fails without touching the nested repository's working files.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_sync_leaves_a_nested_repository_that_replaced_a_file_alone() {
+        const ENTRY: &str = "entry";
+
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let instance = Box::pin(test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                ))
+                .await;
+                let entry = instance.path.join(ENTRY);
+
+                test_file_write(entry.as_path(), b"entry as a file");
+                let as_file = test_commit_tree(&instance, "Entry is a file")
+                    .await
+                    .revision();
+
+                fs::remove_file(entry.as_path()).expect("Failed to remove the file");
+                fs::create_dir_all(entry.join(".lore"))
+                    .expect("Failed to mark a nested repository");
+                test_file_write(entry.join("work").as_path(), b"another repository's work");
+
+                let result = sync::sync_boxed(
+                    instance.repository.clone(),
+                    &instance.write_token,
+                    SyncOptions {
+                        revision: Some(as_file.to_string()),
+                        reset: true,
+                        ..Default::default()
+                    },
+                )
+                .await;
+                assert!(
+                    result.is_err(),
+                    "a nested repository in the way has to fail the sync rather than be emptied"
+                );
+                assert_eq!(
+                    fs::read(entry.join("work").as_path())
+                        .expect("The nested repository's file must still be there"),
+                    b"another repository's work",
+                    "a reset sync must not delete another repository's working files"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A provider that holds its state in a `State` refuses a sync restricted to a dependency set,
+    /// as it holds whole revisions, and one resetting local changes, before the instance moves.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provider_holding_its_state_refuses_a_dependency_set_and_a_reset() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let instance = test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                let script = instance.path.join(SCRIPT);
+                test_file_write(script.as_path(), FIRST);
+                let first = test_commit_tree(&instance, "First").await.revision();
+                test_file_write(script.as_path(), SECOND);
+                let second = test_commit_tree(&instance, "Second").await.revision();
+
+                for refused in [
+                    SyncOptions {
+                        root_files: vec![SCRIPT.to_string()],
+                        ..Default::default()
+                    },
+                    SyncOptions {
+                        reset: true,
+                        ..Default::default()
+                    },
+                ] {
+                    let (holding, _) = test_holding_context(&instance.repository);
+                    let result = sync::sync_boxed(
+                        holding,
+                        &instance.write_token,
+                        SyncOptions {
+                            revision: Some(first.to_string()),
+                            ..refused
+                        },
+                    )
+                    .await;
+
+                    assert!(
+                        matches!(result, Err(sync::SyncError::InvalidArguments(_))),
+                        "the sync is refused, got {result:?}"
+                    );
+                    let (current, _) =
+                        lore_revision::instance::load_current_anchor_boxed(&instance.repository)
+                            .await
+                            .expect("Failed to load current anchor");
+                    assert_eq!(
+                        current, second,
+                        "the instance stays at the revision it stood on"
+                    );
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn sync_explicit_revision() {
         let (_immutable_store, _mutable_store, execution) =
@@ -88,7 +395,7 @@ mod tests {
                     layer: None,
                 };
                 let first_signature =
-                    Box::pin(commit::commit(repository.clone(), &write_token, options))
+                    commit::commit_boxed(repository.clone(), &write_token, options)
                         .await
                         .expect("Failed to commit revision");
 
@@ -128,12 +435,12 @@ mod tests {
                     layer: None,
                 };
                 let second_signature =
-                    Box::pin(commit::commit(repository.clone(), &write_token, options))
+                    commit::commit_boxed(repository.clone(), &write_token, options)
                         .await
                         .expect("Failed to commit revision");
 
                 // Sync back to first revision
-                Box::pin(sync::sync(
+                sync::sync_boxed(
                     repository.clone(),
                     &write_token,
                     SyncOptions {
@@ -141,7 +448,7 @@ mod tests {
                         filter_mode: lore_revision::filter::FilterMode::Full,
                         ..Default::default()
                     },
-                ))
+                )
                 .await
                 .expect("Failed to sync back to first revision");
 
@@ -158,7 +465,7 @@ mod tests {
                 );
 
                 // Sync forward to second revision
-                Box::pin(sync::sync(
+                sync::sync_boxed(
                     repository.clone(),
                     &write_token,
                     SyncOptions {
@@ -166,7 +473,7 @@ mod tests {
                         filter_mode: lore_revision::filter::FilterMode::Full,
                         ..Default::default()
                     },
-                ))
+                )
                 .await
                 .expect("Failed to sync forward to second revision");
 

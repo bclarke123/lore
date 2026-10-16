@@ -134,20 +134,3 @@ impl StorageServiceV1 for LoreStorageService {
         mutable_compare_and_swap::handler(request, self.mutable_store().clone()).await
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use lore_proto::lore::storage::v1::storage_service_server::StorageServiceServer;
-
-    use crate::grpc::storage_service::LoreStorageService;
-
-    /// Compile-time check that `LoreStorageService` fully implements the generated
-    /// `StorageService` trait — wrapping it in `StorageServiceServer` requires the
-    /// trait bound to hold. Per-handler behavior is tested in each handler module.
-    #[allow(dead_code)]
-    fn assert_implements_trait(
-        service: LoreStorageService,
-    ) -> StorageServiceServer<LoreStorageService> {
-        StorageServiceServer::new(service)
-    }
-}

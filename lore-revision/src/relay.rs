@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::sync::Arc;
+
 use bytes::Bytes;
 use lore_base::lore_spawn_core;
 use tokio::sync::Mutex;
@@ -24,20 +26,52 @@ use crate::util;
 /// optional `Bytes` keepalive that pins a buffer referenced by the
 /// event's payload for the duration of the callback invocation.
 ///
-/// The only event that uses the keepalive today is
-/// `LoreEvent::StorageGetData`, whose `LoreBytes` view points into the
-/// carried `Bytes`. The forwarder holds the `Bytes` clone while the
+/// The events that use the keepalive today are `LoreEvent::StorageGetData`
+/// and `LoreEvent::StorageGetFragment`, whose `LoreBytes` views point into
+/// the carried `Bytes`. The forwarder holds the `Bytes` clone while the
 /// callback runs, then drops it. Since `Bytes` is itself refcounted,
 /// the caller's task may drop its own clone as soon as `send_with_bytes`
 /// returns — the buffer stays alive until every registered keepalive
 /// has been consumed.
 type DispatchedEvent = (LoreEvent, Option<Bytes>);
 
+/// Keeps a dispatcher's channel open past `complete`, for a task that goes on
+/// sending after the command that started it has answered — a notification
+/// subscription. `drain` waits for the forwarder only while nothing holds one
+/// of these; dropping it lets the channel close once every sender is gone.
+pub struct KeepOpen {
+    _sender: UnboundedSender<DispatchedEvent>,
+    holds: Arc<parking_lot::Mutex<Holds>>,
+}
+
+impl Drop for KeepOpen {
+    fn drop(&mut self) {
+        self.holds.lock().count -= 1;
+    }
+}
+
+/// The holds on a dispatcher's channel, and whether a drain has settled on waiting for that
+/// channel to close.
+///
+/// Both behind one lock, so taking a hold and settling on the wait are ordered against each
+/// other. A hold taken after a drain has settled would keep open the channel the drain is
+/// waiting to see closed, which for a subscription is until the subscription ends.
+#[derive(Default)]
+struct Holds {
+    count: usize,
+    settled: bool,
+}
+
+#[lore_macro::test_pub]
 pub struct EventDispatcher {
     pub correlation_id: String,
     pub completed: CancellationToken,
     pub weak_sender: Option<WeakUnboundedSender<DispatchedEvent>>,
     pub strong_sender: Mutex<Option<UnboundedSender<DispatchedEvent>>>,
+    /// The [`KeepOpen`] holds on the channel. Counted here rather than read off
+    /// the channel's strong count, which does not tell a hold apart from the
+    /// upgrade a `send` takes for the length of its push.
+    holds: Arc<parking_lot::Mutex<Holds>>,
     /// The forwarder task, kept so `complete` can await the task itself rather
     /// than only the token it cancels. A runtime torn down under an in-flight
     /// call drops the task, which leaves the token uncancelled forever, but the
@@ -52,6 +86,7 @@ impl Default for EventDispatcher {
             completed: CancellationToken::new(),
             weak_sender: None,
             strong_sender: Mutex::new(None),
+            holds: Arc::default(),
             forwarder: Mutex::new(None),
         }
     }
@@ -93,6 +128,7 @@ impl EventDispatcher {
             completed,
             weak_sender: Some(weak_sender),
             strong_sender: Mutex::new(Some(sender)),
+            holds: Arc::default(),
             forwarder: Mutex::new(forwarder),
         }
     }
@@ -103,14 +139,45 @@ impl EventDispatcher {
             completed: CancellationToken::new(),
             weak_sender: None,
             strong_sender: Mutex::new(None),
+            holds: Arc::default(),
             forwarder: Mutex::new(None),
         }
     }
 
-    pub fn sender(&self) -> Option<UnboundedSender<DispatchedEvent>> {
+    #[lore_macro::test_pub]
+    fn sender(&self) -> Option<UnboundedSender<DispatchedEvent>> {
         self.weak_sender
             .as_ref()
             .and_then(|sender| sender.upgrade())
+    }
+
+    /// Keeps the channel open past `complete`, so that events sent afterwards
+    /// still reach the callback; `End` then follows the last hold rather than
+    /// `Complete`. `None` once the channel has closed, and once
+    /// [`drain`](Self::drain) has settled on waiting for it to close, which a
+    /// hold granted afterwards would keep open.
+    pub fn keep_open(&self) -> Option<KeepOpen> {
+        let mut holds = self.holds.lock();
+        if holds.settled {
+            return None;
+        }
+        let sender = self.sender()?;
+        holds.count += 1;
+        Some(KeepOpen {
+            _sender: sender,
+            holds: self.holds.clone(),
+        })
+    }
+
+    /// Settles whether a drain waits for the channel to close, which it does where nothing
+    /// holds the channel open.
+    ///
+    /// Decided under the lock a hold is taken under, so a hold cannot appear behind the
+    /// decision and keep open the channel the wait is for.
+    fn settle(&self) -> bool {
+        let mut holds = self.holds.lock();
+        holds.settled = holds.count == 0;
+        holds.settled
     }
 
     pub fn send(&self, event: LoreEvent) {
@@ -158,15 +225,10 @@ impl EventDispatcher {
         // if this is the only strong reference to the event channel
         drop(self.strong_sender.lock().await.take());
 
-        // If there are other strong references remaining it means the end event will come
-        // whenever that completes (such as an ongoing notification subscription)
-        if self
-            .weak_sender
-            .as_ref()
-            .map(|sender| sender.strong_count())
-            .unwrap_or_default()
-            == 0
-        {
+        // A hold means the end event will come whenever its holder is done
+        // (an ongoing notification subscription), so there is nothing to wait
+        // for here.
+        if self.settle() {
             // Await the forwarder task, not just the token it cancels on its way
             // out. The two finish together in the normal case, but a runtime torn
             // down under an in-flight call drops the task before it can cancel
@@ -212,63 +274,5 @@ impl EventDispatcher {
             location: Default::default(),
             message: message.into(),
         }
-    }
-}
-
-#[cfg(test)]
-mod complete_outcome_tests {
-    use std::sync::Arc;
-    use std::sync::Mutex;
-
-    use super::EventDispatcher;
-    use crate::event::LoreCompleteEventData;
-    use crate::event::LoreErrorDetail;
-    use crate::event::LoreEvent;
-    use crate::interface::LoreString;
-
-    // Captures the single `Complete` event a `complete` call emits. The
-    // callback is the real dispatch boundary, so the assertion reads the
-    // event a consumer would actually receive.
-    fn capture_complete(error: LoreErrorDetail) -> LoreCompleteEventData {
-        let captured: Arc<Mutex<Option<LoreCompleteEventData>>> = Arc::new(Mutex::new(None));
-        let sink = captured.clone();
-        let callback: crate::interface::LoreEventCallback =
-            Some(Box::new(move |event: &LoreEvent| {
-                if let LoreEvent::Complete(data) = event {
-                    *sink.lock().unwrap() = Some(data.clone());
-                }
-            }));
-
-        let dispatcher = EventDispatcher::new(callback);
-        lore_base::runtime::runtime().block_on(dispatcher.complete(error));
-
-        let data = captured.lock().unwrap().take();
-        data.expect("complete must emit a Complete event")
-    }
-
-    #[test]
-    fn default_detail_completes_with_status_zero_and_empty_detail() {
-        let data = capture_complete(LoreErrorDetail::default());
-
-        assert_eq!(data.status, 0);
-        assert_eq!(data.error.error_code, 0);
-        assert!(data.error.message.is_empty());
-        assert!(data.error.trace_locations.is_empty());
-    }
-
-    #[test]
-    fn populated_detail_completes_with_its_code_and_carries_detail() {
-        let detail = LoreErrorDetail {
-            error_code: 13,
-            message: LoreString::from("not found"),
-            ..LoreErrorDetail::default()
-        };
-
-        let data = capture_complete(detail);
-
-        // `status` is the detail's `error_code`, so the two agree.
-        assert_eq!(data.status, 13);
-        assert_eq!(data.error.error_code, 13);
-        assert_eq!(data.error.message.as_str(), "not found");
     }
 }

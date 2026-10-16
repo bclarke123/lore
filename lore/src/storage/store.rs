@@ -24,6 +24,7 @@ use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_storage::options::ReadOptions;
 use lore_transport::StorageSession;
+use smallvec::SmallVec;
 use tokio::sync::Notify;
 
 use crate::interface::LoreGlobalArgs;
@@ -38,6 +39,7 @@ use crate::storage::remote::RemoteEndpoint;
 /// cache and forbids the upload-fallback tier in copy.
 ///
 /// Open rejects `local && remote` — the two are contradictory in the bound state.
+#[lore_macro::test_pub]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BoundFlags {
     pub offline: bool,
@@ -94,25 +96,25 @@ impl PerCallFlags {
 /// - `no_local` = (bound or per-call) `remote` is set; the local probe is bypassed.
 /// - `no_remote && no_local` is impossible — the per-call combine rejects that case before
 ///   constructing this value.
+#[lore_macro::test_pub]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EffectiveFlags {
     pub no_remote: bool,
     pub no_local: bool,
-    /// Skip re-hashing a loaded payload against the address it was read from. Taken from the
-    /// handle's `skip_verify` at open; no per-call flag moves it.
-    pub skip_verify: bool,
+    /// Whether the handle's remote is a trusted source ([`ReadOptions::trust_remote`]). Taken from
+    /// the handle at open; no per-call flag moves it.
+    pub trust_remote: bool,
 }
 
 impl EffectiveFlags {
     /// Build the base `ReadOptions` for a get-style op given whether a remote session is
     /// available. The per-item `local_cache=1` opt-in is layered by the caller on top of the
     /// returned options.
+    #[lore_macro::test_pub]
     pub(crate) fn read_options(&self, has_remote_session: bool) -> ReadOptions {
-        let opts = ReadOptions::default();
-        let opts = if self.skip_verify {
-            opts.no_verify()
-        } else {
-            opts
+        let opts = ReadOptions {
+            trust_remote: self.trust_remote,
+            ..ReadOptions::default()
         };
         if self.no_remote || !has_remote_session {
             return opts.no_remote();
@@ -125,6 +127,7 @@ impl EffectiveFlags {
 }
 
 /// Runtime state for one open storage handle.
+#[lore_macro::test_pub]
 pub(crate) struct StoreInternal {
     // Auth identity for remote-path ops; unused by the local-only path.
     #[allow(dead_code)]
@@ -138,8 +141,9 @@ pub(crate) struct StoreInternal {
     /// its per-call globals via [`Self::effective_flags`] to decide whether to consult the
     /// remote or bypass the local cache.
     pub bound_flags: BoundFlags,
-    /// Whether reads on this handle skip re-hashing what they loaded. From `skip_verify` at open.
-    pub skip_verify: bool,
+    /// Whether the handle's remote is a trusted source: `globals.trust_remote` or `skip_verify` at
+    /// open.
+    pub trust_remote: bool,
     /// Optional service-mode connection that owns this handle. Populated by the IPC dispatcher
     /// during a server-mode open so that connection teardown can drive
     /// [`crate::storage::handle::close_all_for_connection`] and reclaim handles whose owning
@@ -152,13 +156,14 @@ pub(crate) struct StoreInternal {
 }
 
 impl StoreInternal {
+    #[lore_macro::test_pub]
     pub(crate) fn new(
         identity: impl Into<String>,
         immutable: Arc<dyn ImmutableStore>,
         mutable: Arc<dyn MutableStore>,
         remote: Option<Arc<RemoteEndpoint>>,
         bound_flags: BoundFlags,
-        skip_verify: bool,
+        trust_remote: bool,
     ) -> Self {
         Self {
             identity: identity.into(),
@@ -166,7 +171,7 @@ impl StoreInternal {
             mutable,
             remote,
             bound_flags,
-            skip_verify,
+            trust_remote,
             connection_id: None,
             in_flight: AtomicU64::new(0),
             invalid: AtomicBool::new(false),
@@ -179,11 +184,11 @@ impl StoreInternal {
     /// handle the connection owned. Client-mode opens never set this; their handles survive
     /// until an explicit close or `lore::shutdown`.
     ///
-    /// Currently only `#[cfg(test)]` callers exercise this — the IPC dispatcher hookup is the
-    /// next piece of infrastructure to land. The `#[cfg(test)]` gate keeps the helper out of
-    /// the public surface until then; remove the gate once a production caller exists.
-    #[cfg(test)]
-    pub(crate) fn with_connection_id(mut self, id: u64) -> Self {
+    /// Currently only tests exercise this — the IPC dispatcher hookup is the next piece of
+    /// infrastructure to land. The `test-util` gate keeps the helper out of the public surface
+    /// until then; remove the gate once a production caller exists.
+    #[cfg(feature = "test-util")]
+    pub fn with_connection_id(mut self, id: u64) -> Self {
         self.connection_id = Some(id);
         self
     }
@@ -219,7 +224,7 @@ impl StoreInternal {
         Ok(EffectiveFlags {
             no_remote: any_local,
             no_local: any_remote,
-            skip_verify: self.skip_verify,
+            trust_remote: self.trust_remote,
         })
     }
 
@@ -249,14 +254,16 @@ impl StoreInternal {
     }
 
     /// Close sequence: mark the store invalid so no new ops enter, then
-    /// block until every in-flight op has paired its decrement. Ops that
-    /// race in between increment-and-check self-abort because they see
-    /// `invalid=true` before proceeding.
+    /// block until every in-flight op has paired its decrement, then drop the
+    /// session pools the handle holds. Ops that race in between
+    /// increment-and-check self-abort because they see `invalid=true` before
+    /// proceeding.
+    #[lore_macro::test_pub]
     pub(crate) async fn mark_invalid_and_await(&self) {
         self.invalid.store(true, Ordering::Release);
         loop {
             if self.in_flight.load(Ordering::Acquire) == 0 {
-                return;
+                break;
             }
             let mut notified = std::pin::pin!(self.drained.notified());
             // Register before the re-check — `notified()` alone is unregistered until
@@ -264,28 +271,32 @@ impl StoreInternal {
             // await.
             notified.as_mut().enable();
             if self.in_flight.load(Ordering::Acquire) == 0 {
-                return;
+                break;
             }
             notified.await;
+        }
+        if let Some(remote) = &self.remote {
+            remote.pools.clear();
         }
     }
 }
 
-/// Reuses one remote [`StorageSession`] across a batched call's items. Batched storage ops
-/// almost always target a single partition (a batch of keys/addresses in one repository), so a
-/// single `SessionReuse` threaded through the item loop resolves the session once for the whole
-/// call and reuses it for every following item with the same partition, resolving a fresh one
-/// only when the partition changes. It is scoped to one call so the lazily-resolved session binds
-/// to that call's correlation id, and it holds no heap state beyond the one remembered session.
+/// Reuses one remote [`StorageSession`] per partition across a batched call's items, so a
+/// `SessionReuse` threaded through the item loop resolves each partition's session once for the
+/// whole call. It is scoped to one call so the lazily-resolved sessions bind to that call's
+/// correlation id. Batched storage ops almost always target a single partition, whose session is
+/// held inline.
 #[derive(Default)]
+#[lore_macro::test_pub]
 pub(crate) struct SessionReuse {
-    last: Option<(Partition, Option<Arc<StorageSession>>)>,
+    sessions: SmallVec<[(Partition, Arc<StorageSession>); 1]>,
 }
 
 impl SessionReuse {
-    /// The remote session for `partition`, reusing the previously resolved one when `partition`
-    /// matches the last call. Returns `None` without resolving when `want_remote` is false (the
-    /// local path) or the handle has no remote endpoint.
+    /// The remote session for `partition`, reusing the one resolved for it earlier in the call.
+    /// Returns `None` without resolving when `want_remote` is false (the local path) or the
+    /// handle has no remote endpoint.
+    #[lore_macro::test_pub]
     pub(crate) fn session_for(
         &mut self,
         store: &StoreInternal,
@@ -295,14 +306,12 @@ impl SessionReuse {
         if !want_remote {
             return None;
         }
-        if let Some((last_partition, session)) = &self.last
-            && *last_partition == partition
-        {
-            return session.clone();
+        if let Some((_, session)) = self.sessions.iter().find(|(held, _)| *held == partition) {
+            return Some(session.clone());
         }
-        let session = store.remote_session_for(partition);
-        self.last = Some((partition, session.clone()));
-        session
+        let session = store.remote_session_for(partition)?;
+        self.sessions.push((partition, session.clone()));
+        Some(session)
     }
 }
 
@@ -310,6 +319,7 @@ impl SessionReuse {
 /// dropping it pairs the in-flight increment with the matching decrement
 /// and, when the count reaches zero, wakes any [`mark_invalid_and_await`]
 /// waiter.
+#[lore_macro::test_pub]
 pub(crate) struct OpGuard {
     store: Arc<StoreInternal>,
 }
@@ -317,6 +327,7 @@ pub(crate) struct OpGuard {
 impl OpGuard {
     /// Enter an op on the store behind `store_handle`. Returns `None` when
     /// the handle is unknown or the store has been marked invalid.
+    #[lore_macro::test_pub]
     pub(crate) fn enter(store_handle: LoreStore) -> Option<Self> {
         let store = handle::lookup(store_handle)?;
         store.in_flight.fetch_add(1, Ordering::AcqRel);
@@ -365,8 +376,8 @@ impl Drop for OpGuard {
 /// Construct a `StoreInternal` backed by in-memory `LocalImmutableStore` / `LocalMutableStore`.
 /// Used by tests that need a real `StoreInternal` to exercise the in-flight counter protocol,
 /// the dispatch helper, etc., without having to drive a full `open` op.
-#[cfg(test)]
-pub(crate) async fn in_memory_for_tests(identity: impl Into<String>) -> Arc<StoreInternal> {
+#[cfg(feature = "test-util")]
+pub async fn in_memory_for_tests(identity: impl Into<String>) -> Arc<StoreInternal> {
     use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
     use lore_storage::local::immutable_store::create as create_immutable;
@@ -398,134 +409,4 @@ pub(crate) async fn in_memory_for_tests(identity: impl Into<String>) -> Arc<Stor
         BoundFlags::default(),
         false,
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Barrier;
-    use std::thread;
-    use std::time::Duration;
-
-    use super::*;
-
-    async fn register_store() -> (Arc<StoreInternal>, LoreStore) {
-        let store = in_memory_for_tests("test").await;
-        let store_handle = handle::register(store.clone());
-        (store, store_handle)
-    }
-
-    #[tokio::test]
-    async fn op_enter_after_mark_invalid_returns_none() {
-        let (store, store_handle) = register_store().await;
-        store.invalid.store(true, Ordering::Release);
-        assert!(OpGuard::enter(store_handle).is_none());
-        handle::unregister(store_handle);
-    }
-
-    #[tokio::test]
-    async fn op_enter_unregistered_handle_returns_none() {
-        let (_, store_handle) = register_store().await;
-        handle::unregister(store_handle);
-        assert!(OpGuard::enter(store_handle).is_none());
-    }
-
-    #[tokio::test]
-    async fn op_guard_increments_and_decrements_counter() {
-        let (store, store_handle) = register_store().await;
-        assert_eq!(store.in_flight.load(Ordering::Acquire), 0);
-        {
-            let _guard = OpGuard::enter(store_handle).expect("enter must succeed");
-            assert_eq!(store.in_flight.load(Ordering::Acquire), 1);
-        }
-        assert_eq!(store.in_flight.load(Ordering::Acquire), 0);
-        handle::unregister(store_handle);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn mark_invalid_and_await_blocks_until_drained() {
-        let (store, store_handle) = register_store().await;
-        let guard = OpGuard::enter(store_handle).expect("enter must succeed");
-
-        let store_for_closer = store.clone();
-        let closer = {
-            #[allow(clippy::disallowed_methods)]
-            tokio::spawn(async move { store_for_closer.mark_invalid_and_await().await })
-        };
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while !store.invalid.load(Ordering::Acquire) {
-            if std::time::Instant::now() > deadline {
-                panic!("closer never set invalid=true");
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-
-        assert!(
-            !closer.is_finished(),
-            "closer must wait for the in-flight op"
-        );
-
-        // Proves the invalid-check-after-increment ordering: a fresh enter still rejects.
-        assert!(OpGuard::enter(store_handle).is_none());
-
-        drop(guard);
-        closer.await.expect("closer join");
-        handle::unregister(store_handle);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_ops_and_close_converge_cleanly() {
-        const THREADS: usize = 8;
-        const PRE_OBSERVED: usize = 8;
-        const POST_OBSERVED: usize = 248;
-        let (store, store_handle) = register_store().await;
-
-        let barrier_start = Arc::new(Barrier::new(THREADS + 1));
-        let barrier_observed = Arc::new(Barrier::new(THREADS + 1));
-        let mut joins = Vec::new();
-        for _ in 0..THREADS {
-            let bs = barrier_start.clone();
-            let bo = barrier_observed.clone();
-            joins.push(thread::spawn(move || {
-                bs.wait();
-                // Pre-close guarantee: every worker observes the store at least PRE_OBSERVED
-                // times before the close is attempted, removing the "did anyone observe it?"
-                // timing dependency.
-                for _ in 0..PRE_OBSERVED {
-                    let _guard = OpGuard::enter(store_handle)
-                        .expect("pre-close enter must succeed — close has not been called yet");
-                }
-                bo.wait();
-                let mut post = 0usize;
-                for _ in 0..POST_OBSERVED {
-                    match OpGuard::enter(store_handle) {
-                        Some(_guard) => post += 1,
-                        None => break,
-                    }
-                }
-                post
-            }));
-        }
-
-        barrier_start.wait();
-        barrier_observed.wait();
-        store.mark_invalid_and_await().await;
-
-        let post_total: usize = joins.into_iter().map(|j| j.join().unwrap()).sum();
-        // `post_total` may reasonably be zero if close wins every race, so the verifiable
-        // invariant is the counter being quiescent — assert that, not the count.
-        let _ = post_total;
-        assert_eq!(store.in_flight.load(Ordering::Acquire), 0);
-        handle::unregister(store_handle);
-    }
-
-    #[tokio::test]
-    async fn mark_invalid_and_await_does_not_deadlock_on_already_invalid() {
-        let (store, store_handle) = register_store().await;
-        store.mark_invalid_and_await().await;
-        tokio::time::timeout(Duration::from_secs(1), store.mark_invalid_and_await())
-            .await
-            .expect("second mark_invalid_and_await must return without blocking");
-        handle::unregister(store_handle);
-    }
 }

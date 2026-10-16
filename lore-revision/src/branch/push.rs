@@ -9,13 +9,14 @@ use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use lore_base::lore_spawn;
-use lore_base::types::BranchPoint;
+use lore_base::types::BranchMetadata;
 use lore_error_set::prelude::*;
+use lore_transport::BranchPushResponse;
 use lore_transport::Connection;
 use lore_transport::ProtocolError;
+use lore_transport::Revision;
 use lore_transport::StorageSession;
 use lore_transport::quic::storage_service::QueryStatus;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinError;
 use tokio::task::JoinSet;
@@ -43,13 +44,15 @@ use crate::repository;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::state;
+use crate::state::Collection;
 use crate::state::State;
 use crate::store::StoreMatch;
+use crate::util::request_tracker::StoreRequestTracker;
 use crate::util::serde::u8_as_bool;
 
 /// Data for the event sent when a branch push starts.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushEventData {
     /// The remote being pushed to.
@@ -84,7 +87,7 @@ pub struct LoreBranchPushEventData {
 
 /// Data for the event sent before a revision's parent is rewritten during push.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushRevisionUpdateBeginEventData {
     /// The revision being updated.
@@ -97,7 +100,7 @@ pub struct LoreBranchPushRevisionUpdateBeginEventData {
 
 /// Data for the event sent after a revision's parent is rewritten during push.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushRevisionUpdateEndEventData {
     /// The updated revision.
@@ -106,7 +109,7 @@ pub struct LoreBranchPushRevisionUpdateEndEventData {
 
 /// Data for the event sent before fragments are transferred during push.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushFragmentBeginEventData {
     /// The number of fragments to transfer.
@@ -117,7 +120,7 @@ pub struct LoreBranchPushFragmentBeginEventData {
 
 /// Data for the event sent as fragments are transferred during push.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushFragmentProgressEventData {
     /// The number of fragments transferred so far.
@@ -132,7 +135,7 @@ pub struct LoreBranchPushFragmentProgressEventData {
 
 /// Data for the event sent after fragments are transferred during push.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushFragmentEndEventData {
     /// The number of fragments transferred.
@@ -151,7 +154,9 @@ pub struct LoreBranchPushFragmentEndEventData {
 /// A push stores no payload of its own: a fragment the peer was asked about is
 /// deduplicated, copied or put, unless the push ended before it was reached.
 #[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, bitcode::Encode, bitcode::Decode,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushStatsEventData {
     /// Fragments the peer already held, so nothing was registered for them.
@@ -164,7 +169,7 @@ pub struct LoreBranchPushStatsEventData {
 
 /// Data for the event sent before a branch is created on the remote.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushBranchCreateBeginEventData {
     /// The repository the branch is created in.
@@ -177,7 +182,7 @@ pub struct LoreBranchPushBranchCreateBeginEventData {
 
 /// Data for the event sent after a branch is created on the remote.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushBranchCreateEndEventData {
     /// The revision the branch points to on the remote.
@@ -186,7 +191,7 @@ pub struct LoreBranchPushBranchCreateEndEventData {
 
 /// Data for the event sent before a revision is pushed to the remote.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushRevisionPushBeginEventData {
     /// The repository being pushed.
@@ -201,7 +206,7 @@ pub struct LoreBranchPushRevisionPushBeginEventData {
 
 /// Data for the event sent when the remote assigns a pushed revision a new identity.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushRevisionPushUpdateEventData {
     /// The revision before the remote reassigned it.
@@ -214,7 +219,7 @@ pub struct LoreBranchPushRevisionPushUpdateEventData {
 
 /// Data for the event sent after a revision is pushed to the remote.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushRevisionPushEndEventData {
     /// The repository that was pushed.
@@ -320,6 +325,7 @@ impl EventError for PushError {
 /// fragment, duplicates an association it holds under another context, or is sent
 /// the payload. Shared behind an [`Arc`](std::sync::Arc) by every task the push
 /// spawns, and cumulative across every revision, link and layer it registers.
+#[lore_macro::test_pub]
 pub(crate) struct PushStats {
     deduplicated: AtomicU64,
     copied: AtomicU64,
@@ -335,6 +341,7 @@ pub(crate) struct PushStats {
 
 impl PushStats {
     /// Counters for one push, keeping what the call's statistics level reports.
+    #[lore_macro::test_pub]
     pub(crate) fn new(statistics: bool) -> Self {
         Self {
             deduplicated: AtomicU64::new(0),
@@ -346,6 +353,7 @@ impl PushStats {
     }
 
     /// `count` fragments the peer already held, so nothing was registered.
+    #[lore_macro::test_pub]
     fn deduplicated(&self, count: u64) {
         if self.statistics {
             self.deduplicated.fetch_add(count, Ordering::Relaxed);
@@ -353,27 +361,32 @@ impl PushStats {
     }
 
     /// The peer duplicated an association it already held, sending no payload.
+    #[lore_macro::test_pub]
     fn copied(&self) {
         self.copied.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A payload was uploaded to the peer.
+    #[lore_macro::test_pub]
     fn put(&self, payload_bytes: u64) {
         self.put.fetch_add(1, Ordering::Relaxed);
         self.put_bytes.fetch_add(payload_bytes, Ordering::Relaxed);
     }
 
     /// Fragments registered with the peer, by copy or upload.
+    #[lore_macro::test_pub]
     fn registered(&self) -> u64 {
         self.copied.load(Ordering::Relaxed) + self.put.load(Ordering::Relaxed)
     }
 
     /// Payload bytes uploaded.
+    #[lore_macro::test_pub]
     fn put_bytes(&self) -> u64 {
         self.put_bytes.load(Ordering::Relaxed)
     }
 
     /// The counts, as an event payload.
+    #[lore_macro::test_pub]
     fn snapshot(&self) -> LoreBranchPushStatsEventData {
         LoreBranchPushStatsEventData {
             deduplicated: self.deduplicated.load(Ordering::Relaxed),
@@ -475,7 +488,7 @@ fn push_stats_event() -> Option<LoreBranchPushStatsEventData> {
     )
 }
 
-pub async fn push(
+pub(crate) async fn push(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: PushOptions,
@@ -508,17 +521,31 @@ pub async fn push(
     collect_fragments_and_push(
         repository.clone(),
         token,
-        options.clone(),
+        &options,
         state_current,
         branch,
         local_latest,
     )
     .await?;
 
-    for (layer, repository) in layer::list_with_context(repository.clone())
+    push_layers(&repository, token, &options, branch).await?;
+    push_links(&repository, token, &options, branch, local_latest).await
+}
+
+/// Push each layer of the repository at its current revision, to `branch`.
+///
+/// Its own future, as is [`push_links`]: inline, what each loop holds across its awaits would be
+/// reserved in every state of [`push`].
+async fn push_layers(
+    repository: &Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    options: &PushOptions,
+    branch: BranchId,
+) -> Result<(), PushError> {
+    let layers = layer::list_with_context(repository.clone())
         .await
-        .unwrap_or_default()
-    {
+        .unwrap_or_default();
+    for (layer, repository) in &layers {
         let state_current = State::deserialize(repository.clone(), layer.current)
             .await
             .forward::<PushError>("deserializing layer state")?;
@@ -526,18 +553,35 @@ pub async fn push(
         collect_fragments_and_push(
             repository.clone(),
             token,
-            options.clone(),
+            options,
             state_current,
             branch,
             layer.current,
         )
         .await?;
     }
+    Ok(())
+}
 
-    let state_current = State::deserialize(repository.clone(), local_latest)
-        .await
-        .forward::<PushError>("re-deserializing current state for links")?;
-    if let Ok(link_list) = state_current.link_list(repository.clone()).await {
+/// Push each link the revision `local_latest` holds, at the latest revision of the branch its
+/// reference resolves `branch` to.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn push_links(
+    repository: &Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    options: &PushOptions,
+    branch: BranchId,
+    local_latest: Hash,
+) -> impl Future<Output = Result<(), PushError>> {
+    async move {
+        let state_current = State::deserialize(repository.clone(), local_latest)
+            .await
+            .forward::<PushError>("re-deserializing current state for links")?;
+        let Ok(link_list) = state_current.link_list(repository.clone()).await else {
+            return Ok(());
+        };
         for link_reference in link_list.iter() {
             let link_repository = repository.to_link_context(link_reference.repository).await;
             let link_branch_id = link_reference.resolve_branch(branch);
@@ -554,16 +598,24 @@ pub async fn push(
             collect_fragments_and_push(
                 link_repository,
                 token,
-                options.clone(),
+                options,
                 link_state,
                 link_branch_id,
                 link_local_latest,
             )
             .await?;
         }
+        Ok(())
     }
+}
 
-    Ok(())
+/// Boxed version of [`push`] for cross-crate use.
+pub fn push_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    options: PushOptions,
+) -> crate::BoxFuture<'_, Result<(), PushError>> {
+    Box::pin(push(repository, token, options))
 }
 
 /// The revision the peer holds as latest for `branch`, remembered in `known`, or zero when
@@ -692,213 +744,350 @@ async fn collect_divergent_history(
     Ok(divergent)
 }
 
-async fn collect_fragments_and_push(
+/// The descriptive metadata of `branch`.
+///
+/// Its own future, so that the key-value metadata it is read from is not held across the awaits
+/// of the futures that keep what it returns.
+async fn load_branch_metadata(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+) -> Result<BranchMetadata, PushError> {
+    let metadata = branch::metadata(repository.clone(), branch)
+        .await
+        .forward::<PushError>("loading branch metadata")?;
+    branch::branch_metadata(repository.clone(), branch, &metadata)
+        .await
+        .forward::<PushError>("loading branch metadata")
+}
+
+/// The history a push of `branch` at `local_latest` reconciles against the peer's.
+struct UnpushedHistory {
+    /// The local revisions the peer is missing, newest first.
+    local: Vec<Hash>,
+    /// The peer's revisions on the lines walked that the local history does not hold.
+    remote: Vec<Hash>,
+    /// The peer's revisions on `branch` itself that the local history does not hold: a push onto
+    /// them diverges.
+    branch_remote: Vec<Hash>,
+    /// The peer's latest revision the walk reached, if it reached one.
+    remote_revision: Option<Hash>,
+}
+
+/// Walk the history of `branch` back from `local_latest`, through the branches it was created
+/// from, until it reaches a revision the peer holds, a parent branch known to be pushed, or the
+/// root of the default branch.
+///
+/// Its own future: inline, what the walk holds across its awaits would be reserved in every
+/// state of [`collect_fragments_and_push`].
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn collect_unpushed_history(
+    repository: &Arc<RepositoryContext>,
+    remote: &Arc<Connection>,
+    state: &State,
+    branch: BranchId,
+    local_latest: Hash,
+    remote_latest: Hash,
+    default_branch: BranchId,
+) -> impl Future<Output = Result<UnpushedHistory, PushError>> {
+    async move {
+        let mut full_local_history = vec![];
+        let mut full_remote_history = vec![];
+        let mut current_branch_remote_history = vec![];
+        let mut remote_revision = None;
+        let mut current_branch = branch;
+        let mut current_revision = local_latest;
+
+        while remote_revision.is_none() {
+            let current_remote_latest = if current_branch != branch {
+                match branch::load_remote(remote.clone(), repository.id, current_branch).await {
+                    Ok(status) => status.latest,
+                    Err(err) if err.is_branch_not_found() => Hash::default(),
+                    Err(err) => {
+                        lore_debug!(
+                            "Failed to load remote branch info for {current_branch}, assuming branch does not exist on remote: {err}"
+                        );
+                        Hash::default()
+                    }
+                }
+            } else {
+                remote_latest
+            };
+
+            let branch_point = load_branch_metadata(repository, current_branch)
+                .await?
+                .stack
+                .first()
+                .cloned()
+                .unwrap_or_default();
+
+            lore_debug!(
+                "Walking history for branch {current_branch} at revision {current_revision}"
+            );
+
+            if current_remote_latest.is_zero() && (current_branch != default_branch) {
+                lore_debug!("Remote latest is zero, collect revisions and continue");
+                if branch_point.revision.is_zero() {
+                    return Err(PushError::internal(
+                        "Invalid branch data, unknown branch point",
+                    ));
+                }
+
+                let branch_point_state =
+                    State::deserialize(repository.clone(), branch_point.revision)
+                        .await
+                        .forward::<PushError>("deserializing branch point state")?;
+
+                let mut local_revision = current_revision;
+                while local_revision != branch_point.revision {
+                    let revision_state = State::deserialize(repository.clone(), local_revision)
+                        .await
+                        .forward::<PushError>("deserializing revision state")?;
+
+                    if revision_state.revision_number() < branch_point_state.revision_number() {
+                        return Err(PushError::internal("Local branch metadata is out of date"));
+                    }
+
+                    full_local_history.push(local_revision);
+                    local_revision = revision_state.parent_self();
+                }
+
+                current_revision = branch_point.revision;
+                current_branch = branch_point.branch;
+
+                // Early out - if the parent branch latest revision is convergent, it is known
+                // to have been pushed and validated at some point. We don't need to iterate further
+                // in that case, since there are no potentially missing fragments from this point
+                if !branch::load_latest_divergent(repository.clone(), current_branch)
+                    .await
+                    .unwrap_or(true)
+                {
+                    lore_debug!(
+                        "Parent branch is known to be convergent, stop iterating revisions to push"
+                    );
+                    break;
+                }
+            } else if (current_remote_latest != state.parent_self()
+                && current_remote_latest != state.parent_other())
+                || current_remote_latest.is_zero()
+            {
+                lore_debug!("Found remote latest or reached initial branch");
+
+                let (_branch_point, remote_history, local_history) = history::find_branch_point(
+                    repository.clone(),
+                    current_remote_latest,
+                    current_revision,
+                )
+                .await
+                .forward::<PushError>("reconciling branch history")?;
+
+                full_local_history.extend(local_history.clone());
+                full_remote_history.extend(remote_history.clone());
+
+                if current_branch == branch {
+                    current_branch_remote_history = remote_history;
+                }
+
+                // Either the remote latest was found or there is none
+                if !current_remote_latest.is_zero() {
+                    remote_revision = Some(current_remote_latest);
+                    lore_debug!("Found remote latest {remote_latest}");
+                } else {
+                    lore_debug!("Remote latest is zero, reached initial branch");
+                    break;
+                }
+            } else {
+                lore_debug!("Only single revision to push");
+
+                full_local_history.push(current_revision);
+                remote_revision = Some(current_remote_latest);
+            }
+        }
+
+        Ok(UnpushedHistory {
+            local: full_local_history,
+            remote: full_remote_history,
+            branch_remote: current_branch_remote_history,
+            remote_revision,
+        })
+    }
+}
+
+/// Push `branch` at `local_latest` to the peer: each revision the peer is missing, with the
+/// fragments it holds and the links it names.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn collect_fragments_and_push(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
-    options: PushOptions,
+    options: &PushOptions,
     state: Arc<State>,
     branch: BranchId,
     local_latest: Hash,
-) -> Result<(), PushError> {
-    let remote = repository
-        .remote()
-        .await
-        .forward::<PushError>("acquiring remote")?;
-
-    let revision_protocol = remote
-        .revision(repository.id)
-        .await
-        .forward::<PushError>("acquiring revision protocol")?;
-
-    let correlation_id = execution_context().globals().correlation_id.to_string();
-    let storage_protocol = remote
-        .session(repository.id, &correlation_id)
-        .await
-        .forward::<PushError>("opening storage session")?;
-
-    let repository_metadata = repository::metadata_hash(repository.clone())
-        .await
-        .forward::<PushError>("loading repository metadata hash")?;
-    let repository_metadata = repository::metadata(repository.clone(), repository_metadata)
-        .await
-        .forward::<PushError>("loading repository metadata")?;
-    let default_branch = repository_metadata.default_branch;
-
-    let mut full_local_history = vec![];
-    let mut full_remote_history = vec![];
-    let mut current_branch_remote_history = vec![];
-    let mut remote_revision = None;
-    let mut current_branch = branch;
-    let mut current_revision = local_latest;
-
-    // Get remote branch info
-    let (mut remote_latest, remote_metadata, remote_deleted) = match branch::load_remote(
-        remote.clone(),
-        repository.id,
-        current_branch,
-    )
-    .await
-    {
-        Ok(status) => (status.latest, status.metadata, status.deleted),
-        Err(err) if err.is_branch_not_found() => (Hash::default(), Hash::default(), false),
-        Err(err) => {
-            lore_debug!(
-                "Failed to load remote branch info, assuming branch does not exist on remote: {err}"
-            );
-            (Hash::default(), Hash::default(), false)
-        }
-    };
-
-    while remote_revision.is_none() {
-        let current_remote_latest = if current_branch != branch {
-            match branch::load_remote(remote.clone(), repository.id, current_branch).await {
-                Ok(status) => status.latest,
-                Err(err) if err.is_branch_not_found() => Hash::default(),
-                Err(err) => {
-                    lore_debug!(
-                        "Failed to load remote branch info for {current_branch}, assuming branch does not exist on remote: {err}"
-                    );
-                    Hash::default()
-                }
-            }
-        } else {
-            remote_latest
-        };
-
-        let branch_metadata = branch::metadata(repository.clone(), current_branch)
+) -> impl Future<Output = Result<(), PushError>> {
+    async move {
+        let remote = repository
+            .remote()
             .await
-            .forward::<PushError>("loading branch metadata")?;
-        let branch_metadata =
-            branch::branch_metadata(repository.clone(), current_branch, &branch_metadata)
-                .await
-                .forward::<PushError>("loading branch metadata")?;
+            .forward::<PushError>("acquiring remote")?;
 
-        let default_branch_point = BranchPoint::default();
+        let revision_protocol = remote
+            .revision(repository.id)
+            .await
+            .forward::<PushError>("acquiring revision protocol")?;
 
-        lore_debug!("Walking history for branch {current_branch} at revision {current_revision}");
-
-        if current_remote_latest.is_zero() && (current_branch != default_branch) {
-            lore_debug!("Remote latest is zero, collect revisions and continue");
-            let branch_point = branch_metadata
-                .stack
-                .first()
-                .map_or(&default_branch_point, |parent| parent);
-            if branch_point.revision.is_zero() {
-                return Err(PushError::internal(
-                    "Invalid branch data, unknown branch point",
-                ));
-            }
-
-            let branch_point_state = State::deserialize(repository.clone(), branch_point.revision)
-                .await
-                .forward::<PushError>("deserializing branch point state")?;
-
-            let mut local_revision = current_revision;
-            while local_revision != branch_point.revision {
-                let revision_state = State::deserialize(repository.clone(), local_revision)
-                    .await
-                    .forward::<PushError>("deserializing revision state")?;
-
-                if revision_state.revision_number() < branch_point_state.revision_number() {
-                    return Err(PushError::internal("Local branch metadata is out of date"));
-                }
-
-                full_local_history.push(local_revision);
-                local_revision = revision_state.parent_self();
-            }
-
-            current_revision = branch_point.revision;
-            current_branch = branch_point.branch;
-
-            // Early out - if the parent branch latest revision is convergent, it is known
-            // to have been pushed and validated at some point. We don't need to iterate further
-            // in that case, since there are no potentially missing fragments from this point
-            if !branch::load_latest_divergent(repository.clone(), current_branch)
-                .await
-                .unwrap_or(true)
-            {
-                lore_debug!(
-                    "Parent branch is known to be convergent, stop iterating revisions to push"
-                );
-                break;
-            }
-        } else if (current_remote_latest != state.parent_self()
-            && current_remote_latest != state.parent_other())
-            || current_remote_latest.is_zero()
-        {
-            lore_debug!("Found remote latest or reached initial branch");
-
-            let (_branch_point, remote_history, local_history) = history::find_branch_point(
-                repository.clone(),
-                current_remote_latest,
-                current_revision,
+        let storage_protocol = remote
+            .session(
+                repository.id,
+                execution_context().globals().correlation_id.as_ref(),
             )
             .await
-            .forward::<PushError>("reconciling branch history")?;
+            .forward::<PushError>("opening storage session")?;
 
-            full_local_history.extend(local_history.clone());
-            full_remote_history.extend(remote_history.clone());
+        let repository_metadata = repository::metadata_hash(repository.clone())
+            .await
+            .forward::<PushError>("loading repository metadata hash")?;
+        let default_branch = repository::metadata(repository.clone(), repository_metadata)
+            .await
+            .forward::<PushError>("loading repository metadata")?
+            .default_branch;
 
-            if current_branch == branch {
-                current_branch_remote_history = remote_history;
+        // Get remote branch info
+        let (mut remote_latest, remote_metadata, remote_deleted) = match branch::load_remote(
+            remote.clone(),
+            repository.id,
+            branch,
+        )
+        .await
+        {
+            Ok(status) => (status.latest, status.metadata, status.deleted),
+            Err(err) if err.is_branch_not_found() => (Hash::default(), Hash::default(), false),
+            Err(err) => {
+                lore_debug!(
+                    "Failed to load remote branch info, assuming branch does not exist on remote: {err}"
+                );
+                (Hash::default(), Hash::default(), false)
             }
+        };
 
-            // Either the remote latest was found or there is none
-            if !current_remote_latest.is_zero() {
-                remote_revision = Some(current_remote_latest);
-                lore_debug!("Found remote latest {remote_latest}");
-            } else {
-                lore_debug!("Remote latest is zero, reached initial branch");
-                break;
+        let UnpushedHistory {
+            local: mut full_local_history,
+            remote: full_remote_history,
+            branch_remote: current_branch_remote_history,
+            remote_revision,
+        } = collect_unpushed_history(
+            &repository,
+            &remote,
+            &state,
+            branch,
+            local_latest,
+            remote_latest,
+            default_branch,
+        )
+        .await?;
+
+        // Check if revision is already pushed and there is nothing to do
+        let already_pushed = remote_latest == local_latest;
+
+        let branch_metadata = load_branch_metadata(&repository, branch).await?;
+
+        event::LoreEvent::BranchPush(LoreBranchPushEventData {
+            remote: remote.remote_url().into(),
+            repository: repository.id,
+            branch,
+            branch_name: branch_metadata.name.as_str().into(),
+            remote_revision: remote_revision.unwrap_or_default(),
+            local_revision: local_latest,
+            remote_history: full_remote_history.len() as u64,
+            local_history: full_local_history.len() as u64,
+            flag_already_pushed: already_pushed.into(),
+            flag_default: (branch == default_branch).into(),
+            flag_link: repository.is_link().into(),
+            flag_layer: repository.is_layer().into(),
+        })
+        .send();
+
+        let dry_run = execution_context().globals().dry_run();
+
+        // If the revision is already pushed and the branch still exists, early out.
+        // If the branch was deleted, restore it via branch_create before returning.
+        //
+        // Under --force, do NOT early out: fall through to the fragment walk so a
+        // server that lost content behind an intact branch pointer can be
+        // re-seeded from this working copy. `push_query` keeps the upload to
+        // exactly what the server is missing, so forcing against a healthy
+        // remote transfers nothing.
+        let force = execution_context().globals().force();
+        if already_pushed {
+            if remote_deleted && !dry_run {
+                lore_debug!(
+                    "Branch deleted on server with same latest, restoring via branch_create"
+                );
+                revision_protocol
+                    .branch_create(
+                        branch,
+                        branch_metadata.name.as_str(),
+                        branch_metadata.category.as_str(),
+                        branch_metadata.creator.as_str(),
+                        &branch_metadata.stack,
+                    )
+                    .await
+                    .forward::<PushError>("creating branch on remote")?;
             }
-        } else {
-            lore_debug!("Only single revision to push");
-
-            full_local_history.push(current_revision);
-            remote_revision = Some(current_remote_latest);
+            if !force {
+                return Ok(());
+            }
         }
-    }
+        // Repair mode: the remote pointer is already correct, so only offer
+        // fragments — never issue BranchPush for ancestor revisions, which
+        // would transiently rewind the branch (and leave it rewound if the
+        // push aborts midway).
+        let repair_only = already_pushed && force && !remote_deleted;
 
-    // Check if revision is already pushed and there is nothing to do
-    let already_pushed = remote_latest == local_latest;
+        // If the branch diverged, early out (unless fast-forward merge is enabled,
+        // in which case let the server attempt to resolve the divergence)
+        if !current_branch_remote_history.is_empty()
+            && !force
+            && !options.fast_forward_merge
+            && !repository.is_link()
+        {
+            lore_debug!(
+                "Branch divergence detected, {} remote changes",
+                current_branch_remote_history.len()
+            );
+            return Err(PushError::internal(
+                "Branch has diverged, sync to merge remote changes",
+            ));
+        }
 
-    let branch_metadata = branch::metadata(repository.clone(), branch)
-        .await
-        .forward::<PushError>("loading branch metadata")?;
-    let branch_metadata = branch::branch_metadata(repository.clone(), branch, &branch_metadata)
-        .await
-        .forward::<PushError>("loading branch metadata")?;
+        // If force pushing a current revision that's already pushed, add it —
+        // together with its whole ancestry when repairing: a server that lost
+        // content can be missing fragments behind ANY revision, not just the
+        // tip's diff against its parent.
+        if full_local_history.is_empty() && !local_latest.is_zero() && force {
+            lore_debug!(
+                "Branch push of old revision detected, {} remote changes",
+                full_remote_history.len()
+            );
+            if repair_only {
+                let mut revision = local_latest;
+                while !revision.is_zero() {
+                    full_local_history.push(revision);
+                    revision = State::deserialize(repository.clone(), revision)
+                        .await
+                        .forward::<PushError>("deserializing history state")?
+                        .parent_self();
+                }
+            } else {
+                full_local_history.push(local_latest);
+            }
+        }
 
-    event::LoreEvent::BranchPush(LoreBranchPushEventData {
-        remote: remote.remote_url().into(),
-        repository: repository.id,
-        branch,
-        branch_name: branch_metadata.name.as_str().into(),
-        remote_revision: remote_revision.unwrap_or_default(),
-        local_revision: local_latest,
-        remote_history: full_remote_history.len() as u64,
-        local_history: full_local_history.len() as u64,
-        flag_already_pushed: already_pushed.into(),
-        flag_default: (branch == default_branch).into(),
-        flag_link: repository.is_link().into(),
-        flag_layer: repository.is_layer().into(),
-    })
-    .send();
-
-    let dry_run = execution_context().globals().dry_run();
-
-    // If the revision is already pushed and the branch still exists, early out.
-    // If the branch was deleted, restore it via branch_create before returning.
-    //
-    // Under --force, do NOT early out: fall through to the fragment walk so a
-    // server that lost content behind an intact branch pointer can be
-    // re-seeded from this working copy. `push_query` keeps the upload to
-    // exactly what the server is missing, so forcing against a healthy
-    // remote transfers nothing.
-    let force = execution_context().globals().force();
-    if already_pushed {
+        // If the branch was deleted on the server, restore it via branch_create
         if remote_deleted && !dry_run {
-            lore_debug!("Branch deleted on server with same latest, restoring via branch_create");
+            lore_debug!("Branch deleted on server, restoring via branch_create before push");
             revision_protocol
                 .branch_create(
                     branch,
@@ -910,152 +1099,132 @@ async fn collect_fragments_and_push(
                 .await
                 .forward::<PushError>("creating branch on remote")?;
         }
-        if !force {
-            return Ok(());
-        }
-    }
-    // Repair mode: the remote pointer is already correct, so only offer
-    // fragments — never issue BranchPush for ancestor revisions, which
-    // would transiently rewind the branch (and leave it rewound if the
-    // push aborts midway).
-    let repair_only = already_pushed && force && !remote_deleted;
 
-    // If the branch diverged, early out (unless fast-forward merge is enabled,
-    // in which case let the server attempt to resolve the divergence)
-    if !current_branch_remote_history.is_empty()
-        && !force
-        && !options.fast_forward_merge
-        && !repository.is_link()
-    {
-        lore_debug!(
-            "Branch divergence detected, {} remote changes",
-            current_branch_remote_history.len()
-        );
-        return Err(PushError::internal(
-            "Branch has diverged, sync to merge remote changes",
-        ));
-    }
+        // If this is the initial push of a branch, create it
+        if remote_metadata.is_zero() {
+            let branch_point = if let Some(parent) = branch_metadata.stack.first() {
+                parent.revision
+            } else {
+                Hash::default()
+            };
 
-    // If force pushing a current revision that's already pushed, add it —
-    // together with its whole ancestry when repairing: a server that lost
-    // content can be missing fragments behind ANY revision, not just the
-    // tip's diff against its parent.
-    if full_local_history.is_empty() && !local_latest.is_zero() && force {
-        lore_debug!(
-            "Branch push of old revision detected, {} remote changes",
-            full_remote_history.len()
-        );
-        if repair_only {
-            let mut revision = local_latest;
-            while !revision.is_zero() {
-                full_local_history.push(revision);
-                revision = State::deserialize(repository.clone(), revision)
-                    .await
-                    .forward::<PushError>("deserializing history state")?
-                    .parent_self();
-            }
-        } else {
-            full_local_history.push(local_latest);
-        }
-    }
-
-    // If the branch was deleted on the server, restore it via branch_create
-    if remote_deleted && !dry_run {
-        lore_debug!("Branch deleted on server, restoring via branch_create before push");
-        revision_protocol
-            .branch_create(
-                branch,
-                branch_metadata.name.as_str(),
-                branch_metadata.category.as_str(),
-                branch_metadata.creator.as_str(),
-                &branch_metadata.stack,
-            )
-            .await
-            .forward::<PushError>("creating branch on remote")?;
-    }
-
-    // If this is the initial push of a branch, create it
-    if remote_metadata.is_zero() {
-        let branch_point = if let Some(parent) = branch_metadata.stack.first() {
-            parent.revision
-        } else {
-            Hash::default()
-        };
-
-        event::LoreEvent::BranchPushBranchCreateBegin(LoreBranchPushBranchCreateBeginEventData {
-            repository: repository.id,
-            branch,
-            local_revision: branch_point,
-        })
-        .send();
-
-        if !dry_run {
-            remote_latest = revision_protocol
-                .branch_create(
+            event::LoreEvent::BranchPushBranchCreateBegin(
+                LoreBranchPushBranchCreateBeginEventData {
+                    repository: repository.id,
                     branch,
-                    branch_metadata.name.as_str(),
-                    branch_metadata.category.as_str(),
-                    branch_metadata.creator.as_str(),
-                    &branch_metadata.stack,
-                )
-                .await
-                .forward::<PushError>("creating branch on remote")?;
+                    local_revision: branch_point,
+                },
+            )
+            .send();
 
-            if remote_latest != branch_point {
-                return Err(PushError::internal(format!(
-                    "Failed to create branch {}, remote latest now at {}",
-                    branch_metadata.name.clone(),
-                    remote_latest
-                )));
+            if !dry_run {
+                remote_latest = revision_protocol
+                    .branch_create(
+                        branch,
+                        branch_metadata.name.as_str(),
+                        branch_metadata.category.as_str(),
+                        branch_metadata.creator.as_str(),
+                        &branch_metadata.stack,
+                    )
+                    .await
+                    .forward::<PushError>("creating branch on remote")?;
+
+                if remote_latest != branch_point {
+                    return Err(PushError::internal(format!(
+                        "Failed to create branch {}, remote latest now at {}",
+                        branch_metadata.name.clone(),
+                        remote_latest
+                    )));
+                }
+
+                branch::store_last_sync(repository.clone(), branch, branch_point).await;
+            } else {
+                // Report the revision the branch creation would yield.
+                remote_latest = branch_point;
             }
 
-            branch::store_last_sync(repository.clone(), branch, branch_point).await;
-        } else {
-            // Report the revision the branch creation would yield.
-            remote_latest = branch_point;
+            event::LoreEvent::BranchPushBranchCreateEnd(LoreBranchPushBranchCreateEndEventData {
+                remote_revision: remote_latest,
+            })
+            .send();
         }
 
-        event::LoreEvent::BranchPushBranchCreateEnd(LoreBranchPushBranchCreateEndEventData {
-            remote_revision: remote_latest,
-        })
-        .send();
-    }
-
-    let divergent_revisions = collect_divergent_history(
-        repository.clone(),
-        remote.clone(),
-        branch,
-        remote_latest,
-        &full_local_history,
-    )
-    .await?;
-
-    for revision in divergent_revisions.iter().rev() {
-        let state = State::deserialize(repository.clone(), *revision)
-            .await
-            .forward::<PushError>("deserializing divergent revision state")?;
-
-        push_revision_links(&repository, token, &options, &state, branch).await?;
-        upload_revision_fragments(
-            &repository,
-            &storage_protocol,
-            remote.environment.max_query_batch(),
-            &state,
-            dry_run,
+        let divergent_revisions = collect_divergent_history(
+            repository.clone(),
+            remote.clone(),
+            branch,
+            remote_latest,
+            &full_local_history,
         )
         .await?;
-    }
 
+        for revision in divergent_revisions.iter().rev() {
+            let state = State::deserialize(repository.clone(), *revision)
+                .await
+                .forward::<PushError>("deserializing divergent revision state")?;
+
+            push_revision_links(&repository, token, options, &state, branch).await?;
+            upload_revision_fragments(
+                &repository,
+                &storage_protocol,
+                remote.environment.max_query_batch(),
+                &state,
+                dry_run,
+                Collection::New,
+            )
+            .await?;
+        }
+
+        push_local_history(
+            &repository,
+            token,
+            options,
+            &remote,
+            &revision_protocol,
+            &storage_protocol,
+            branch,
+            &branch_metadata,
+            &full_local_history,
+            remote_latest,
+            repair_only,
+        )
+        .await
+    }
+}
+
+/// Push each revision of `history` to the peer, oldest first: upload what it holds, offer those on
+/// `branch` as the branch's latest revision, then record the last one the peer accepts as the
+/// branch's local latest revision. With `repair_only` the peer's branch already points at the
+/// latest revision, and only the fragments are offered.
+///
+/// Its own future: inline, what each revision's push holds across its awaits would be reserved
+/// in every state of [`collect_fragments_and_push`].
+#[allow(clippy::too_many_arguments)]
+async fn push_local_history(
+    repository: &Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    options: &PushOptions,
+    remote: &Arc<Connection>,
+    revision_protocol: &Arc<dyn Revision>,
+    storage_protocol: &Arc<StorageSession>,
+    branch: BranchId,
+    branch_metadata: &BranchMetadata,
+    history: &[Hash],
+    mut remote_latest: Hash,
+    repair_only: bool,
+) -> Result<(), PushError> {
+    let force = execution_context().globals().force();
+    let dry_run = execution_context().globals().dry_run();
     let mut current_latest = Hash::default();
     let mut fast_forward_merged = false;
-    for current_revision in full_local_history.iter().rev() {
+    for current_revision in history.iter().rev() {
         let mut current_revision = *current_revision;
 
         let state = State::deserialize(repository.clone(), current_revision)
             .await
             .forward::<PushError>("deserializing revision state")?;
 
-        push_revision_links(&repository, token, &options, &state, branch).await?;
+        push_revision_links(repository, token, options, &state, branch).await?;
 
         if !current_latest.is_zero() && state.parent_self() != current_latest {
             // Rebase on new latest revision
@@ -1087,11 +1256,12 @@ async fn collect_fragments_and_push(
         }
 
         upload_revision_fragments(
-            &repository,
-            &storage_protocol,
+            repository,
+            storage_protocol,
             remote.environment.max_query_batch(),
             &state,
             dry_run,
+            Collection::New,
         )
         .await?;
 
@@ -1114,56 +1284,27 @@ async fn collect_fragments_and_push(
         let mut response_message = None;
 
         if !dry_run && remote_latest != current_revision && !repair_only {
-            let push_result = revision_protocol
-                .branch_push(branch, current_revision, force, options.fast_forward_merge)
-                .await;
-
-            // If the server returns NotFound, the branch was deleted on the server.
-            // Recreate it via branch_create and retry the push.
-            let response = match push_result {
-                Err(ProtocolError::NotFound(_)) => {
-                    lore_debug!("Branch push returned NotFound, recreating branch on server");
-
-                    event::LoreEvent::BranchPushBranchCreateBegin(
-                        LoreBranchPushBranchCreateBeginEventData {
-                            repository: repository.id,
-                            branch,
-                            local_revision: remote_latest,
-                        },
-                    )
-                    .send();
-
-                    revision_protocol
-                        .branch_create(
-                            branch,
-                            branch_metadata.name.as_str(),
-                            branch_metadata.category.as_str(),
-                            branch_metadata.creator.as_str(),
-                            &branch_metadata.stack,
-                        )
-                        .await
-                        .forward::<PushError>("creating branch on remote")?;
-
-                    event::LoreEvent::BranchPushBranchCreateEnd(
-                        LoreBranchPushBranchCreateEndEventData {
-                            remote_revision: remote_latest,
-                        },
-                    )
-                    .send();
-
-                    forward_branch_push(
-                        revision_protocol
-                            .branch_push(
-                                branch,
-                                current_revision,
-                                force,
-                                options.fast_forward_merge,
-                            )
-                            .await,
-                    )?
-                }
-                result => forward_branch_push(result)?,
-            };
+            let response = offer_revision(
+                revision_protocol.as_ref(),
+                repository.id,
+                branch,
+                branch_metadata,
+                remote_latest,
+                current_revision,
+                force,
+                options.fast_forward_merge,
+                || {
+                    Box::pin(upload_revision_fragments(
+                        repository,
+                        storage_protocol,
+                        remote.environment.max_query_batch(),
+                        &state,
+                        false,
+                        Collection::Recovery,
+                    ))
+                },
+            )
+            .await?;
             if response.fast_forward_merged {
                 // Server performed a fast-forward merge — push succeeded with a new revision.
                 // Store the server-created revision as local latest (marked divergent since the
@@ -1284,11 +1425,6 @@ async fn collect_fragments_and_push(
 
 /// Forward what the peer answered a branch push with, naming the fragment where it refused for
 /// a missing one.
-///
-/// A push reaches the peer twice where the branch was deleted under it: the attempt that finds
-/// it gone and the one that follows recreating it. Either can be refused for a fragment the peer
-/// does not hold, and the address is the peer's answer rather than anything the attempt decides,
-/// so both report it the same way.
 #[track_caller]
 fn forward_branch_push<T>(result: Result<T, ProtocolError>) -> Result<T, PushError> {
     match result {
@@ -1311,7 +1447,7 @@ fn collect_fragments_and_push_recurse(
     local_latest: Hash,
 ) -> Pin<Box<dyn Future<Output = Result<(), PushError>> + Send>> {
     Box::pin(async move {
-        collect_fragments_and_push(repository, &token, options, state, branch, local_latest).await
+        collect_fragments_and_push(repository, &token, &options, state, branch, local_latest).await
     })
 }
 
@@ -1325,6 +1461,7 @@ pub const RETRY_MAX_ATTEMPTS: usize = 10;
 /// A full match needs no transfer, but it is still an answer worth keeping. The rest divide by
 /// whether the peer already holds the bytes: it either has to be sent them, or it has an
 /// association for the same hash and can duplicate that instead.
+#[lore_macro::test_pub]
 #[derive(Debug, Default)]
 pub(crate) struct PushQueryResult {
     /// The peer holds nothing for these, so their payloads have to be transferred.
@@ -1337,6 +1474,8 @@ pub(crate) struct PushQueryResult {
     pub present: Vec<Address>,
 }
 
+// `len` counts only what has to be transferred, so an `is_empty` beside it would mislead.
+#[allow(clippy::len_without_is_empty)]
 impl PushQueryResult {
     /// Counts only what has to be transferred. `present` is deliberately excluded. Drives the
     /// fragment total in the push progress events.
@@ -1348,6 +1487,7 @@ impl PushQueryResult {
 /// Sort one batch's answers into what the peer needs from us: nothing for an association it
 /// already holds, a duplicated association where it holds the hash under another context, and the
 /// payload where it holds neither.
+#[lore_macro::test_pub]
 fn classify_query_batch(batch: &[Address], statuses: &Bytes, queried: &mut PushQueryResult) {
     for (address, status) in batch.iter().zip(statuses.iter()) {
         match QueryStatus::from(*status) {
@@ -1531,8 +1671,8 @@ async fn mark_stored_durable(repository: &Arc<RepositoryContext>, address: Addre
 /// Mark the local entries for addresses the peer already holds durable.
 ///
 /// `ExistFullMatch` establishes the same fact an upload does. An entry that never records it is
-/// pinned against eviction, excluded from the store's size and capacity totals, and re-queried on
-/// every subsequent push.
+/// pinned against eviction and re-queried on every subsequent push.
+#[lore_macro::test_pub]
 async fn mark_present_durable(repository: &Arc<RepositoryContext>, present: Vec<Address>) {
     const MAX_PARALLEL_MARK: usize = 1000;
 
@@ -1719,8 +1859,8 @@ async fn push_revision_links(
     Ok(())
 }
 
-/// Upload what `state` holds that its first parent does not, and the revision the second
-/// parent of a merge names.
+/// Upload what `state` holds that its first parent does not, of the addresses `collection`
+/// keeps, and the revision the second parent of a merge names.
 ///
 /// The peer needs this of every revision a push reaches, whether the revision goes on to
 /// be offered as a new latest revision or sits on a line that is only named by a merge.
@@ -1730,6 +1870,7 @@ async fn upload_revision_fragments(
     max_query_batch: Option<usize>,
     state: &Arc<State>,
     dry_run: bool,
+    collection: Collection,
 ) -> Result<(), PushError> {
     let state_parent = State::deserialize(repository.clone(), state.parent_self())
         .await
@@ -1749,12 +1890,17 @@ async fn upload_revision_fragments(
     // from an intact working copy impossible. `push_query` still
     // filters to what the server actually lacks, so a forced push
     // against a healthy remote uploads nothing extra.
-    let ignore_durably_stored = !execution_context().globals().force();
-    let mut fragments = state::collect_new_fragments(
+    let collection = if collection == Collection::New && execution_context().globals().force() {
+        Collection::All
+    } else {
+        collection
+    };
+    let mut fragments = state::collect_fragments(
         repository.clone(),
         state_parent,
         state.clone(),
-        ignore_durably_stored,
+        collection,
+        Arc::new(StoreRequestTracker::default()),
     )
     .await
     .forward::<PushError>("collecting new fragments")?;
@@ -1771,6 +1917,69 @@ async fn upload_revision_fragments(
         dry_run,
     )
     .await
+}
+
+/// Offer `revision` to the peer as the latest revision of `branch`, and return the peer's answer.
+///
+/// A peer that holds no such branch had it deleted while the push ran: the branch is created on
+/// the peer again from `metadata`, and `revision` offered once more. A peer that refuses an offer
+/// for a missing fragment has `recover` upload what it is missing, and `revision` is offered once
+/// more. A push that stopped part way can leave a list on the peer without every fragment it
+/// names, and a list the local store has since evicted hides those fragments from the collection
+/// of [`Collection::New`]. `recover` runs at most once, and only after such a refusal.
+#[allow(clippy::too_many_arguments)]
+#[lore_macro::test_pub]
+async fn offer_revision(
+    revision_protocol: &dyn Revision,
+    repository: RepositoryId,
+    branch: BranchId,
+    metadata: &BranchMetadata,
+    remote_latest: Hash,
+    revision: Hash,
+    force: bool,
+    fast_forward_merge: bool,
+    recover: impl AsyncFnOnce() -> Result<(), PushError>,
+) -> Result<BranchPushResponse, PushError> {
+    let mut answer = revision_protocol
+        .branch_push(branch, revision, force, fast_forward_merge)
+        .await;
+    if let Err(ProtocolError::NotFound(_)) = answer {
+        lore_debug!("Branch push returned NotFound, recreating branch on server");
+        event::LoreEvent::BranchPushBranchCreateBegin(LoreBranchPushBranchCreateBeginEventData {
+            repository,
+            branch,
+            local_revision: remote_latest,
+        })
+        .send();
+        revision_protocol
+            .branch_create(
+                branch,
+                metadata.name.as_str(),
+                metadata.category.as_str(),
+                metadata.creator.as_str(),
+                &metadata.stack,
+            )
+            .await
+            .forward::<PushError>("creating branch on remote")?;
+        event::LoreEvent::BranchPushBranchCreateEnd(LoreBranchPushBranchCreateEndEventData {
+            remote_revision: remote_latest,
+        })
+        .send();
+        answer = revision_protocol
+            .branch_push(branch, revision, force, fast_forward_merge)
+            .await;
+    }
+    if let Err(ProtocolError::AddressNotFound(missing)) = &answer {
+        lore_debug!(
+            "Branch push missing fragment {}, collecting through the remote",
+            Address::from(&missing.address[..])
+        );
+        recover().await?;
+        answer = revision_protocol
+            .branch_push(branch, revision, force, fast_forward_merge)
+            .await;
+    }
+    forward_branch_push(answer)
 }
 
 /// Upload those of `fragments` the peer answers that it is missing, reporting progress
@@ -1820,221 +2029,4 @@ async fn query_and_push_fragments(
     .send();
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn address(seed: u8) -> Address {
-        Address {
-            hash: Hash::from([seed; 32]),
-            context: crate::lore::Context::from([seed; 16]),
-        }
-    }
-
-    /// Statistics level zero reports nothing, so it keeps nothing beyond what a
-    /// progress event reads: the fragments registered, which `copied` and `put`
-    /// sum to, and the bytes uploaded.
-    #[test]
-    fn a_count_is_kept_only_where_something_reports_it() {
-        for (statistics, deduplicated) in [(false, 0), (true, 3)] {
-            let stats = PushStats::new(statistics);
-            stats.deduplicated(3);
-            stats.copied();
-            stats.put(64);
-
-            let counts = stats.snapshot();
-            assert_eq!(counts.deduplicated, deduplicated, "statistics {statistics}");
-            assert_eq!(counts.copied, 1, "statistics {statistics}");
-            assert_eq!(counts.put, 1, "statistics {statistics}");
-            assert_eq!(stats.registered(), 2, "statistics {statistics}");
-            assert_eq!(stats.put_bytes(), 64, "statistics {statistics}");
-        }
-    }
-
-    /// A fragment the peer is missing reaches the caller as the address it is, rather than as a
-    /// generic failure.
-    #[test]
-    fn a_fragment_the_peer_is_missing_keeps_its_address_on_the_way_out() {
-        let result: Result<(), ProtocolError> =
-            Err(ProtocolError::from(AddressNotFound { address: [7u8; 48] }));
-
-        let error = result
-            .forward::<PushError>("pushing branch to remote, missing fragment")
-            .expect_err("an error was forwarded");
-
-        assert!(error.is_address_not_found(), "{error:?}");
-        assert!(error.translated() == LoreError::AddressNotFound);
-    }
-
-    /// What the push does with a fragment is decided entirely by the status byte the peer answered
-    /// with, so this is where the copy path is chosen or missed.
-    mod classify {
-        use super::*;
-
-        fn classify(statuses: &[u8]) -> PushQueryResult {
-            let batch: Vec<Address> = (0..statuses.len() as u8).map(address).collect();
-            let mut queried = PushQueryResult::default();
-            classify_query_batch(&batch, &Bytes::copy_from_slice(statuses), &mut queried);
-            queried
-        }
-
-        /// A full match transfers nothing, but the answer still has to be kept: it is what tells
-        /// the local store the payload is safe elsewhere, and an entry that never learns that is
-        /// pinned against eviction and invisible to both store caps for the rest of its life.
-        #[test]
-        fn an_association_the_peer_holds_transfers_nothing_but_is_recorded() {
-            let queried = classify(&[QueryStatus::ExistFullMatch as u8]);
-            assert_eq!(queried.len(), 0, "nothing to transfer");
-            assert_eq!(queried.present, vec![address(0)]);
-        }
-
-        /// The change this path exists for: the partition holds the hash, so the peer is asked to
-        /// duplicate the association rather than sent the payload it already has.
-        #[test]
-        fn a_partition_match_is_copied_rather_than_uploaded() {
-            let queried = classify(&[QueryStatus::ExistPartitionMatch as u8]);
-            assert_eq!(queried.copyable, vec![address(0)]);
-            assert!(queried.absent.is_empty());
-        }
-
-        #[test]
-        fn a_miss_is_uploaded() {
-            let queried = classify(&[QueryStatus::NotFound as u8]);
-            assert_eq!(queried.absent, vec![address(0)]);
-            assert!(queried.copyable.is_empty());
-        }
-
-        /// A status the client does not know must not be read as "the peer has it" — that would
-        /// drop the fragment from the push and leave the revision unreadable on the peer.
-        #[test]
-        fn an_unknown_status_is_uploaded() {
-            let queried = classify(&[2, 7, 255]);
-            assert_eq!(queried.absent.len(), 3);
-            assert!(queried.copyable.is_empty());
-        }
-
-        #[test]
-        fn a_batch_is_split_by_status_in_order() {
-            let queried = classify(&[
-                QueryStatus::NotFound as u8,
-                QueryStatus::ExistFullMatch as u8,
-                QueryStatus::ExistPartitionMatch as u8,
-                QueryStatus::NotFound as u8,
-                QueryStatus::ExistPartitionMatch as u8,
-            ]);
-            assert_eq!(queried.absent, vec![address(0), address(3)]);
-            assert_eq!(queried.copyable, vec![address(2), address(4)]);
-            assert_eq!(queried.present, vec![address(1)]);
-            assert_eq!(queried.len(), 4, "len counts only what is transferred");
-        }
-
-        /// Each status answers the address at its own position, so a batch where only some entries
-        /// are copyable must not shift the rest.
-        #[test]
-        fn statuses_line_up_with_the_addresses_they_answer() {
-            let queried = classify(&[
-                QueryStatus::ExistPartitionMatch as u8,
-                QueryStatus::ExistFullMatch as u8,
-                QueryStatus::NotFound as u8,
-            ]);
-            assert_eq!(queried.copyable, vec![address(0)]);
-            assert_eq!(queried.present, vec![address(1)]);
-            assert_eq!(queried.absent, vec![address(2)]);
-        }
-    }
-
-    /// Recording a full match is what takes the fragment off the local store's protected list, so
-    /// this is where a push stops re-offering content the peer already holds.
-    mod mark {
-        use super::*;
-
-        const DURABLE: u32 = fragment::FragmentFlags::PayloadStoredDurable.bits();
-
-        /// A repository over in-memory stores, holding only what the test puts in it.
-        async fn null_repository() -> Arc<RepositoryContext> {
-            let immutable_store = lore_storage::local::immutable_store::create(
-                None::<&str>,
-                lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
-                false,
-                lore_storage::ImmutableStoreSettings::default(),
-            )
-            .await
-            .expect("in-memory immutable store");
-            let mutable_store = lore_storage::local::mutable_store::create(
-                None::<&str>,
-                lore_storage::MutableStoreSettings::default(),
-                immutable_store.clone(),
-            )
-            .await
-            .expect("in-memory mutable store");
-
-            Arc::new(RepositoryContext::new_null_context(
-                immutable_store,
-                mutable_store,
-            ))
-        }
-
-        /// Store a payload under `address` carrying no durability, as a local commit leaves it.
-        async fn store_local(repository: &Arc<RepositoryContext>, address: Address) {
-            let payload = Bytes::from_static(b"payload");
-            let fragment = Fragment {
-                flags: 0,
-                size_payload: payload.len() as u32,
-                size_content: payload.len() as u64,
-            };
-            repository
-                .immutable_store()
-                .put(repository.id, address, fragment, Some(payload), false)
-                .await
-                .expect("storing a local payload");
-        }
-
-        /// The flags the store holds for `address`.
-        async fn stored_flags(repository: &Arc<RepositoryContext>, address: Address) -> u32 {
-            repository
-                .immutable_store()
-                .get_metadata(repository.id, address)
-                .await
-                .expect("the store holds the address")
-                .fragment
-                .flags
-        }
-
-        /// The fact a full match establishes: the payload is safe on the peer, so the local entry
-        /// is no longer the only copy.
-        #[tokio::test]
-        async fn a_present_address_becomes_durable() {
-            let repository = null_repository().await;
-            let present = address(1);
-            store_local(&repository, present).await;
-            assert_eq!(
-                stored_flags(&repository, present).await & DURABLE,
-                0,
-                "a locally stored payload starts out non-durable"
-            );
-
-            mark_present_durable(&repository, vec![present]).await;
-
-            assert_eq!(stored_flags(&repository, present).await & DURABLE, DURABLE);
-        }
-
-        /// An address the store cannot describe answers nothing to write back, and must not cost
-        /// the addresses it can describe their record.
-        #[tokio::test]
-        async fn a_batch_marks_what_it_can_and_skips_the_rest() {
-            let repository = null_repository().await;
-            let present = address(2);
-            store_local(&repository, present).await;
-
-            mark_present_durable(&repository, vec![address(0), address(3), present]).await;
-
-            assert_eq!(
-                stored_flags(&repository, present).await & DURABLE,
-                DURABLE,
-                "a zero hash and an address the store never held are skipped, not fatal"
-            );
-        }
-    }
 }

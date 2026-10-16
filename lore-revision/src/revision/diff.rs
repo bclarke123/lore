@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::change;
@@ -25,7 +24,7 @@ use crate::util::path::RelativePath;
 
 /// Details of a single file that differs between two revisions.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionDiffFileEventData {
     /// Path of the file, relative to the root of the working tree.
@@ -115,6 +114,7 @@ impl crate::event::EventError for DiffError {}
 
 /// A request scoped *inside* a link asks for that subtree, so the link's own
 /// entry is left out.
+#[lore_macro::test_pub]
 fn link_path_in_scope(link_path: &str, paths: Option<&[RelativePath]>) -> bool {
     let Some(paths) = paths else {
         return true;
@@ -134,7 +134,8 @@ fn link_path_in_scope(link_path: &str, paths: Option<&[RelativePath]>) -> bool {
 
 /// Calculate the difference between two revisions, as the set of changes that describe
 /// going from revision 'source' to revision 'target', optionally filtered by a set of paths
-pub async fn diff(
+#[lore_macro::test_pub]
+pub(crate) async fn diff(
     repository: Arc<RepositoryContext>,
     source: Hash,
     target: Hash,
@@ -186,7 +187,16 @@ pub async fn diff(
         .send();
     }
 
-    for change in diff {
+    send_file_changes(diff).await
+}
+
+/// Sends a `RevisionDiffFile` event for each change, reading from each side's node whether it is
+/// a file.
+///
+/// Reads the changes by reference, so it holds no change across the node reads.
+#[lore_macro::test_pub]
+async fn send_file_changes(diff: Vec<NodeChange>) -> Result<(), DiffError> {
+    for change in &diff {
         let mut old_is_file = false;
         if change.from.mapping.node != INVALID_NODE {
             old_is_file = change
@@ -215,7 +225,7 @@ pub async fn diff(
         }
 
         event::LoreEvent::RevisionDiffFile(LoreRevisionDiffFileEventData::from_node_change(
-            &change,
+            change,
             old_is_file,
             new_is_file,
         ))
@@ -225,67 +235,12 @@ pub async fn diff(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use std::str::FromStr;
-
-    use super::*;
-
-    fn paths(values: &[&str]) -> Vec<RelativePath> {
-        values
-            .iter()
-            .map(|value| RelativePath::from_str(value).expect("valid path"))
-            .collect()
-    }
-
-    #[test]
-    fn unfiltered_diff_includes_every_link() {
-        assert!(link_path_in_scope("libs/shared", None));
-        assert!(link_path_in_scope("libs/shared", Some(&[])));
-    }
-
-    #[test]
-    fn link_at_the_requested_path_is_in_scope() {
-        assert!(link_path_in_scope(
-            "libs/shared",
-            Some(&paths(&["libs/shared"]))
-        ));
-    }
-
-    #[test]
-    fn link_below_the_requested_path_is_in_scope() {
-        assert!(link_path_in_scope("libs/shared", Some(&paths(&["libs"]))));
-    }
-
-    /// A request scoped inside a link asks for that subtree, not for the
-    /// link's own entry.
-    #[test]
-    fn request_inside_a_link_excludes_the_link_itself() {
-        assert!(!link_path_in_scope(
-            "libs/shared",
-            Some(&paths(&["libs/shared/sub"]))
-        ));
-    }
-
-    #[test]
-    fn unrelated_requested_path_excludes_the_link() {
-        assert!(!link_path_in_scope("libs/shared", Some(&paths(&["docs"]))));
-    }
-
-    /// A sibling sharing a name prefix is not a parent directory.
-    #[test]
-    fn sibling_prefix_does_not_put_a_link_in_scope() {
-        assert!(!link_path_in_scope(
-            "libs/shared",
-            Some(&paths(&["libs/sha"]))
-        ));
-    }
-
-    #[test]
-    fn any_matching_requested_path_puts_the_link_in_scope() {
-        assert!(link_path_in_scope(
-            "libs/shared",
-            Some(&paths(&["docs", "libs"]))
-        ));
-    }
+/// Boxed version of [`diff`] for cross-crate use.
+pub fn diff_boxed(
+    repository: Arc<RepositoryContext>,
+    source: Hash,
+    target: Hash,
+    paths: Option<Vec<RelativePath>>,
+) -> crate::BoxFuture<'static, Result<(), DiffError>> {
+    Box::pin(diff(repository, source, target, paths))
 }

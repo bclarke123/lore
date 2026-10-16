@@ -18,16 +18,23 @@ use crate::state::StateError;
 /// its own failure, reported where it ends rather than in place of a change.
 pub type ChangeSender = mpsc::Sender<NodeChange>;
 
-/// Emits one change to the caller reading them.
+/// Emits the change `build` makes to the caller reading them, once the channel has room for it.
 ///
-/// A closed channel is a caller that has stopped listening, which the walk learns of here: the
-/// error unwinds it, and a caller that closed deliberately already has its answer and discards
-/// that verdict.
-pub(crate) async fn emit(changes: &ChangeSender, change: NodeChange) -> Result<(), StateError> {
-    changes
-        .send(change)
+/// `build` runs after the wait for room, so a walk waiting to emit holds what it builds the
+/// change from rather than the change. A closed channel is a caller that has stopped listening,
+/// which the walk learns of here: the error unwinds it, and a caller that closed deliberately
+/// already has its answer and discards that verdict.
+#[lore_macro::test_pub]
+pub(crate) async fn emit(
+    changes: &ChangeSender,
+    build: impl FnOnce() -> NodeChange,
+) -> Result<(), StateError> {
+    let permit = changes
+        .reserve()
         .await
-        .map_err(|_closed| StateError::internal("Diff receiver dropped"))
+        .map_err(|_closed| StateError::internal("Diff receiver dropped"))?;
+    permit.send(build());
+    Ok(())
 }
 
 /// How many changes a diff may run ahead of the caller reading them, for a caller with no depth
@@ -126,27 +133,30 @@ impl<Summary: Default + Send + 'static> ChangeStream<Summary> {
 
     /// Whether the walk finds a change `wanted` accepts, answered at the first one that does.
     ///
-    /// Stops the walk there rather than reading the rest: one change is the whole of the answer,
-    /// and a walk still looking for a second is work nobody asked for. The walk ends at its next
-    /// emit, so what it would have reported goes unread — which is why this is for a walk whose
-    /// only output is the changes it was cut short of finding.
-    pub async fn any(self, wanted: impl Fn(&NodeChange) -> bool) -> Result<bool, StateError> {
-        let ChangeStream { mut changes, walk } = self;
-        while let Some(change) = changes.recv().await {
-            if wanted(&change) {
+    /// Stops the walk at that change by [abandoning](Self::abandon) it rather than reading the
+    /// rest: one change is the whole of the answer, and a walk still looking for a second is work
+    /// nobody asked for. What the walk would have reported goes unread, which is why this is for
+    /// a walk whose only output is the changes it was cut short of finding.
+    ///
+    /// Either way the walk has unwound when this answers, so what it captured is released before
+    /// the caller acts on the answer.
+    pub async fn any(mut self, wanted: impl Fn(&NodeChange) -> bool) -> Result<bool, StateError> {
+        while let Some(found) = self.next().await.map(|change| wanted(&change)) {
+            if found {
+                self.abandon().await;
                 return Ok(true);
             }
         }
-        joined(walk).await?;
+        joined(self.walk).await?;
         Ok(false)
     }
 
     /// Ends the walk where it stands, and waits for it to stop.
     ///
-    /// Closes the channel so the walk unwinds at its next emit, then joins it, so whatever the
-    /// walk had in flight has settled by the time this answers. What it reports is then the
-    /// closed channel rather than what it found, so nothing comes back. A caller with no reason
-    /// to wait drops the stream instead.
+    /// Closes the channel so the walk unwinds at its next emit, then joins it, so what the walk
+    /// captured is released by the time this answers. What it reports is then the closed channel
+    /// rather than what it found, so nothing comes back. A caller with no reason to wait drops
+    /// the stream instead.
     pub async fn abandon(self) {
         let ChangeStream { changes, walk } = self;
         drop(changes);

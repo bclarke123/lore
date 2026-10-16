@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use lore_error_set::prelude::*;
 
 use crate::branch;
@@ -35,8 +33,8 @@ use crate::lore::Context;
 use crate::lore::Hash;
 use crate::metadata::Metadata;
 use crate::metadata::MetadataType;
+use crate::metadata::store_binary_payload;
 use crate::repository::RepositoryContext;
-use crate::util::path::RelativePath;
 
 /// Keys that cannot be modified or removed via the branch metadata API.
 pub const READ_ONLY_KEYS: &[&str] = &[
@@ -251,7 +249,7 @@ async fn commit_metadata_hash(
 /// is `None`, emits all metadata entries.
 ///
 /// When `local` is true, reads from the local mutable store cache without contacting the remote.
-pub async fn get(
+pub(crate) async fn get(
     repo: Arc<RepositoryContext>,
     branch: BranchId,
     key: Option<&str>,
@@ -275,11 +273,21 @@ pub async fn get(
     Ok(())
 }
 
+/// Boxed version of [`get`] for cross-crate use.
+pub fn get_boxed(
+    repo: Arc<RepositoryContext>,
+    branch: BranchId,
+    key: Option<&str>,
+    local: bool,
+) -> crate::BoxFuture<'_, Result<(), BranchMetadataError>> {
+    Box::pin(get(repo, branch, key, local))
+}
+
 /// Set one or more metadata key-value pairs on the branch metadata. Always contacts the remote.
 ///
 /// `keys`, `values`, and `formats` must be parallel slices of equal length. For binary values,
 /// the value is treated as a file path whose contents are stored in the immutable store.
-pub async fn set(
+pub(crate) async fn set(
     repo: Arc<RepositoryContext>,
     branch: BranchId,
     keys: &[&[u8]],
@@ -324,33 +332,7 @@ pub async fn set(
         let format = formats[i];
 
         if format == MetadataType::Binary {
-            let payload = {
-                let user_path = String::from_utf8_lossy(value).to_string();
-                let given_path = PathBuf::from(&user_path);
-                let input_path = if given_path.is_absolute() {
-                    given_path
-                } else {
-                    let repo_path = repo.require_path()?;
-                    let relative_path =
-                        RelativePath::new_from_user_path(repo_path, &user_path)
-                            .forward::<BranchMetadataError>("resolving binary metadata path")?;
-                    relative_path.to_absolute_path(repo_path)
-                };
-
-                lore_io::IoDriver::global()
-                    .read_file_bytes(input_path)
-                    .await
-                    .internal("reading binary metadata file")?
-            };
-
-            let address = immutable::write(
-                repo.clone(),
-                Context::default(),
-                Bytes::from_owner(payload),
-                immutable::write_options_from_repository(repo.clone()),
-            )
-            .await
-            .forward::<BranchMetadataError>("writing binary metadata to immutable store")?;
+            let address = store_binary_payload::<BranchMetadataError>(&repo, value).await?;
 
             metadata
                 .set_address(
@@ -377,11 +359,22 @@ pub async fn set(
     Ok(())
 }
 
+/// Boxed version of [`set`] for cross-crate use.
+pub fn set_boxed<'a>(
+    repo: Arc<RepositoryContext>,
+    branch: BranchId,
+    keys: &'a [&'a [u8]],
+    values: &'a [&'a [u8]],
+    formats: &'a [MetadataType],
+) -> crate::BoxFuture<'a, Result<(), BranchMetadataError>> {
+    Box::pin(set(repo, branch, keys, values, formats))
+}
+
 /// Remove metadata keys from the branch metadata. Always contacts the remote.
 ///
 /// If `keys` is non-empty, removes only those keys (rejecting built-in keys). If `keys` is
 /// empty, removes all non-built-in keys.
-pub async fn clear(
+pub(crate) async fn clear(
     repo: Arc<RepositoryContext>,
     branch: BranchId,
     keys: &[&str],
@@ -432,4 +425,13 @@ pub async fn clear(
     commit_metadata_hash(repo, branch, &metadata, old_hash, new_hash).await?;
 
     Ok(())
+}
+
+/// Boxed version of [`clear`] for cross-crate use.
+pub fn clear_boxed<'a>(
+    repo: Arc<RepositoryContext>,
+    branch: BranchId,
+    keys: &'a [&'a str],
+) -> crate::BoxFuture<'a, Result<(), BranchMetadataError>> {
+    Box::pin(clear(repo, branch, keys))
 }

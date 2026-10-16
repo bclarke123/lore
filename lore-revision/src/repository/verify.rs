@@ -8,7 +8,6 @@ use std::sync::Arc;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use lore_transport::ProtocolError;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinSet;
 
@@ -41,7 +40,7 @@ use crate::util::path::RelativePath;
 
 /// Data for the event emitted when state verification starts.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryVerifyStateBeginEventData {
     /// Placeholder field. The event carries no data.
@@ -50,7 +49,7 @@ pub struct LoreRepositoryVerifyStateBeginEventData {
 
 /// Data for the event emitted when state verification finishes.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryVerifyStateEndEventData {
     /// Identifier of the staged state after healing. Zero when nothing was healed.
@@ -59,7 +58,7 @@ pub struct LoreRepositoryVerifyStateEndEventData {
 
 /// One stored copy of a fragment found during fragment verification.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryVerifyFragmentMatchEventData {
     /// Slot the match was found in.
@@ -88,7 +87,7 @@ pub struct LoreRepositoryVerifyFragmentMatchEventData {
 
 /// Result of verifying a single fragment, including every stored copy found.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryVerifyFragmentEventData {
     /// Hash of the fragment that was verified.
@@ -113,7 +112,7 @@ pub struct LoreRepositoryVerifyFragmentEventData {
 
 /// Result of verifying a single fragment on the remote.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryVerifyFragmentRemoteEventData {
     /// Hash part of the fragment address.
@@ -264,7 +263,8 @@ async fn verify_no_sibling_claims_a_staged_name(
     Ok(())
 }
 
-/// Reject a node whose stored name does not hash to the `name_hash` beside it.
+/// Reject a node whose stored name the read path refuses, which no commit may publish, or whose
+/// stored name does not hash to the `name_hash` beside it.
 async fn verify_node_name_hash(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
@@ -275,9 +275,14 @@ async fn verify_node_name_hash(
         .block_with_nametable(repository, NodeBlock::index(node_id))
         .await
         .forward::<RepositoryError>("Failed to deserialize repository state")?;
-    let node_name = block
-        .node_name_ref(Node::index(node_id))
-        .forward::<RepositoryError>("Failed to get node name")?;
+    let node_name = match block.node_name_ref(Node::index(node_id)) {
+        Ok(node_name) => node_name,
+        Err(err) => {
+            return Err(RepositoryError::internal(format!(
+                "Repository verification failed: Node {node_id} carries a name no node may: {err}"
+            )));
+        }
+    };
     let expected = hash::hash_string(&node_name);
     if name_hash != expected {
         return Err(RepositoryError::internal(format!(
@@ -295,7 +300,7 @@ fn verify_staged_directory_recurse(
     Box::pin(verify_staged_directory(repository, state, node_id))
 }
 
-pub async fn verify(
+pub(crate) async fn verify(
     repository: Arc<RepositoryContext>,
     path: Option<RelativePath>,
     heal: bool,
@@ -349,14 +354,7 @@ pub async fn verify(
         // Healed, serialize new staged state
         lore_info!("Serializing healed state as new staged state");
 
-        state.set_parent_self(state_current.revision());
-        state.set_revision_number(0);
-
-        if !is_staged {
-            // Force commit same revision, reset metadata
-            state.set_parent_other(Hash::default());
-            state.set_metadata_hash(Hash::default());
-        }
+        state.reparent_onto(state_current.revision());
 
         let signature = state
             .serialize(repository.clone(), token)
@@ -378,6 +376,15 @@ pub async fn verify(
     }
 
     Ok(())
+}
+
+/// Boxed version of [`verify`] for cross-crate use.
+pub fn verify_boxed(
+    repository: Arc<RepositoryContext>,
+    path: Option<RelativePath>,
+    heal: bool,
+) -> crate::BoxFuture<'static, Result<(), RepositoryError>> {
+    Box::pin(verify(repository, path, heal))
 }
 
 async fn verify_node(
@@ -575,7 +582,7 @@ fn verify_node_recurse(
     ))
 }
 
-pub async fn verify_fragment(
+pub(crate) async fn verify_fragment(
     repository: Arc<RepositoryContext>,
     args: VerifyFragmentArgs,
 ) -> Result<(), RepositoryError> {
@@ -596,6 +603,14 @@ pub async fn verify_fragment(
     } else {
         verify_fragment_remote(repository, address, args.heal).await
     }
+}
+
+/// Boxed version of [`verify_fragment`] for cross-crate use.
+pub fn verify_fragment_boxed(
+    repository: Arc<RepositoryContext>,
+    args: VerifyFragmentArgs,
+) -> crate::BoxFuture<'static, Result<(), RepositoryError>> {
+    Box::pin(verify_fragment(repository, args))
 }
 
 async fn verify_fragment_local(

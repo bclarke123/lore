@@ -14,8 +14,6 @@ use lore_revision::shared_store::SharedStoreError;
 use lore_revision::shared_store::find_existing_shared_store_in_dir;
 use lore_revision::shared_store::registry::SharedStoreRegistry;
 use lore_revision::util::config::SaveableConfig;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call::no_repository_call;
 use crate::call_delegation::dispatch_call;
@@ -26,7 +24,7 @@ use crate::interface::LoreGlobalArgs;
 use crate::interface::LoreString;
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(create_local)]
 /// Arguments for creating a new shared store.
 pub struct LoreSharedStoreCreateArgs {
@@ -68,11 +66,11 @@ pub async fn create(
     dispatch_call(globals, args, callback, create_local).await
 }
 
-async fn create_local(
+fn create_local(
     globals: LoreGlobalArgs,
     args: LoreSharedStoreCreateArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     no_repository_call(globals, callback, args, create, async move |args| {
         let path = if args.path.as_str() == "" {
             None
@@ -89,11 +87,10 @@ async fn create_local(
         lore_revision::shared_store::create_shared_store(path, remote_url, args.make_default != 0)
             .await
     })
-    .await
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(info_local)]
 /// Arguments for querying the configured default shared store (no parameters).
 pub struct LoreSharedStoreInfoArgs {}
@@ -166,9 +163,9 @@ async fn info_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(list_local)]
-/// Arguments for listing the registry of shared stores (no parameters).
+/// Arguments for listing the registry of shared stores.
 pub struct LoreSharedStoreListArgs {
     /// Whether to load each shared store to search for each instance using it.
     pub include_instances: u8,
@@ -193,7 +190,7 @@ pub struct LoreSharedStoreListArgs {
 ///
 /// | Event | Description |
 /// |-------|-------------|
-/// | [`LoreEvent::SharedStoreList`](crate::interface::LoreEvent::SharedStoreList) | Emitted on success with the path of the configured default shared store |
+/// | [`LoreEvent::SharedStoreList`](crate::interface::LoreEvent::SharedStoreList) | Emitted on success with every registered shared store, and the instances using each when `include_instances` is set |
 pub async fn list(
     globals: LoreGlobalArgs,
     args: LoreSharedStoreListArgs,
@@ -245,7 +242,7 @@ async fn list_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(set_use_automatically_local)]
 /// Arguments for setting whether to automatically use the shared store.
 pub struct LoreSharedStoreSetUseAutomaticallyArgs {

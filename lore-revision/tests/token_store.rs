@@ -6,6 +6,7 @@ mod tests {
 
     use keyring::mock;
     use keyring::set_default_credential_builder;
+    use lore_base::env::CallEnvironment;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_credential::token_store;
@@ -13,10 +14,20 @@ mod tests {
     use lore_credential::token_store::vulnerable_all_tokens;
     use lore_revision::interface::ExecutionContext;
     use lore_revision::lore::RepositoryId;
+    use lore_revision::relay::EventDispatcher;
 
     include!("helper.rs");
 
     const AUTH_ENDPOINT: &str = "http://storeload.auth.example.com";
+
+    /// `AUTH_ENDPOINT` behind an implementation that refuses every grant, so an
+    /// exchange that misses the cache and the store fails before any network call.
+    fn refusing_endpoint() -> lore_transport::auth::AuthEndpoint {
+        lore_transport::auth::AuthEndpoint::new(
+            AUTH_ENDPOINT.to_string(),
+            lore_transport::auth::AuthEndpoint::none().auth,
+        )
+    }
     static TEST_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
     async fn sequential_mutex_lock() -> tokio::sync::MutexGuard<'static, ()> {
@@ -260,6 +271,69 @@ mod tests {
                 .expect_err(
                     format!("Removed token is still available for {other_identity}").as_str(),
                 );
+            }))
+            .await
+            .expect("Task failure");
+    }
+
+    /// Entries are keyed by the endpoint that issued them, so a user who logs
+    /// in on the gRPC path, then on the OIDC path, and then switches back
+    /// finds the first credentials intact and need not log in a third time.
+    #[tokio::test]
+    async fn a_token_from_one_endpoint_survives_a_login_at_another() {
+        let _lock = sequential_mutex_lock().await;
+
+        let (execution, _auth_dir) = setup_test_env().await;
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                const OIDC_ISSUER: &str = "https://issuer.storeload.example.com";
+                let identity = "identity0";
+                let grpc_token = "grpc-token";
+                let oidc_token = "oidc-token";
+                let _ = token_store::remove_user_token(OIDC_ISSUER, identity).await;
+
+                token_store::store_user_token(AUTH_ENDPOINT, identity, grpc_token, vec![])
+                    .await
+                    .expect("Failed to store the gRPC token");
+                token_store::store_user_token(OIDC_ISSUER, identity, oidc_token, vec![])
+                    .await
+                    .expect("Failed to store the OIDC token");
+
+                let found = token_store::load_user_token_from_store(
+                    AUTH_ENDPOINT,
+                    identity,
+                    vulnerable_all_tokens(),
+                )
+                .await
+                .expect("The gRPC token must still load");
+                assert_eq!(found.as_str(), grpc_token);
+
+                let found = token_store::load_user_token_from_store(
+                    OIDC_ISSUER,
+                    identity,
+                    vulnerable_all_tokens(),
+                )
+                .await
+                .expect("The OIDC token must load");
+                assert_eq!(found.as_str(), oidc_token);
+
+                token_store::remove_user_token(OIDC_ISSUER, identity)
+                    .await
+                    .expect("Failed to remove the OIDC token");
+                let found = token_store::load_user_token_from_store(
+                    AUTH_ENDPOINT,
+                    identity,
+                    vulnerable_all_tokens(),
+                )
+                .await
+                .expect("Removing the OIDC token must leave the gRPC token");
+                assert_eq!(found.as_str(), grpc_token);
+
+                token_store::remove_user_token(AUTH_ENDPOINT, identity)
+                    .await
+                    .expect("Failed to remove the gRPC token");
             }))
             .await
             .expect("Task failure");
@@ -517,9 +591,8 @@ mod tests {
     /// We do not want to mix externally provided tokens with internal login
     /// results.
     ///
-    /// `AUTH_ENDPOINT` has an `http` scheme, which no `Authentication`
-    /// implementation is registered for, so the exchange the supplied call falls
-    /// through to fails before any network call.
+    /// The endpoint's implementation refuses every grant, so the exchange the
+    /// supplied call falls through to fails before any network call.
     #[tokio::test]
     async fn a_supplied_identity_token_bypasses_the_stored_authorization_token() {
         let _lock = sequential_mutex_lock().await;
@@ -547,7 +620,7 @@ mod tests {
 
                 // Nothing supplied: the stored authorization token answers.
                 let stored = lore_transport::auth::exchange::exchange(
-                    AUTH_ENDPOINT,
+                    &refusing_endpoint(),
                     identity,
                     repository,
                     "example.com".to_string(),
@@ -560,9 +633,9 @@ mod tests {
 
                 // An identity token supplied: neither the store nor the entry the
                 // call above cached answers, so this goes on to exchange and
-                // fails on the unregistered scheme.
+                // is refused by the endpoint's implementation.
                 let result = lore_transport::auth::exchange::exchange(
-                    AUTH_ENDPOINT,
+                    &refusing_endpoint(),
                     identity,
                     repository,
                     "example.com".to_string(),
@@ -575,6 +648,112 @@ mod tests {
                     "a supplied identity token must not be served a stored authorization token"
                 );
             }))
+            .await
+            .expect("Task failure");
+    }
+
+    /// The context of a call relayed from a process whose token store is `auth_dir`.
+    fn relayed_from(auth_dir: &TempDir) -> Arc<ExecutionContext> {
+        Arc::new(
+            ExecutionContext::new_client(Default::default(), EventDispatcher::new(None))
+                .with_environment(CallEnvironment {
+                    values: [None, Some(auth_dir.display().to_string())],
+                }),
+        )
+    }
+
+    /// A call relayed from another process reads the token store its caller names, so one
+    /// process caches each store apart: an identity stored through one caller's store is not
+    /// served to a caller naming another.
+    #[tokio::test]
+    async fn a_relayed_call_reads_only_its_callers_token_store() {
+        let _lock = sequential_mutex_lock().await;
+
+        let (_execution, _auth_dir) = setup_test_env().await;
+        let (first_dir, second_dir) = (generate_tempdir(), generate_tempdir());
+        let (first, second) = (relayed_from(&first_dir), relayed_from(&second_dir));
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(async move {
+                LORE_CONTEXT
+                    .scope(first, async {
+                        token_store::store_user_token(AUTH_ENDPOINT, "first", "token", vec![])
+                            .await
+                            .expect("Failed to store token");
+                        assert_eq!(
+                            token_store::load_identities(AUTH_ENDPOINT)
+                                .await
+                                .expect("Failed to get identities"),
+                            ["first"]
+                        );
+                    })
+                    .await;
+                let identities = LORE_CONTEXT
+                    .scope(second, token_store::load_identities(AUTH_ENDPOINT))
+                    .await
+                    .expect("Failed to get identities");
+                assert!(
+                    identities.is_empty(),
+                    "a caller naming another store must not be served this one's identities"
+                );
+            })
+            .await
+            .expect("Task failure");
+    }
+
+    /// An authorization one caller's token store earned is cached for that store alone: a caller
+    /// naming a store that holds nothing for the identity is not served it.
+    ///
+    /// The endpoint's implementation refuses every grant, so a call that misses the cache and
+    /// the store fails before any network call.
+    #[tokio::test]
+    async fn a_relayed_call_is_served_only_its_callers_authorization() {
+        let _lock = sequential_mutex_lock().await;
+
+        let (_execution, _auth_dir) = setup_test_env().await;
+        let (first_dir, second_dir) = (generate_tempdir(), generate_tempdir());
+        let (first, second) = (relayed_from(&first_dir), relayed_from(&second_dir));
+        let identity = "relayed-authz-identity";
+        let repository: RepositoryId = "00112233445566778899aabbccddeeff"
+            .parse()
+            .expect("a valid repository id");
+        let exchange = move || async move {
+            lore_transport::auth::exchange::exchange(
+                &refusing_endpoint(),
+                identity,
+                repository,
+                "example.com".to_string(),
+                "",
+                "",
+            )
+            .await
+        };
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(async move {
+                LORE_CONTEXT
+                    .scope(first, async {
+                        token_store::store_user_token(
+                            &format!("{AUTH_ENDPOINT}/{repository}"),
+                            identity,
+                            SUPPLIED_JWT,
+                            vec!["example.com".into()],
+                        )
+                        .await
+                        .expect("Failed to store authorization token");
+                        assert_eq!(
+                            exchange().await.expect("the stored authorization is used"),
+                            SUPPLIED_JWT
+                        );
+                    })
+                    .await;
+                assert!(
+                    LORE_CONTEXT.scope(second, exchange()).await.is_err(),
+                    "a caller naming another store must not be served this one's authorization"
+                );
+            })
             .await
             .expect("Task failure");
     }

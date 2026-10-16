@@ -7,7 +7,6 @@ use std::sync::Arc;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use lore_transport::quic::storage_service::QueryStatus;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinSet;
 
@@ -26,7 +25,7 @@ use crate::util::serde::u8_as_bool;
 
 /// Result of a query against the immutable store for a single fragment.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryStoreImmutableQueryEventData {
     /// Address of fragment
@@ -99,7 +98,6 @@ async fn immutable_query_address(
     })
     .send();
 
-    // Verify the local payload
     if has_local_payload
         && let Ok((fragment, payload)) = repository
             .immutable_store()
@@ -136,8 +134,10 @@ async fn immutable_query_address(
             let fragment = if status == QueryStatus::ExistFullMatch
                 && let Ok((fragment, payload)) = remote_storage.get(&address).await
             {
-                maybe_fragment.replace(fragment);
-                maybe_payload.replace(payload);
+                if passes_receipt(&repository, address, fragment, &payload) {
+                    maybe_fragment.replace(fragment);
+                    maybe_payload.replace(payload);
+                }
                 fragment
             } else {
                 Fragment::default()
@@ -199,6 +199,25 @@ async fn immutable_query_address(
     }
 
     Ok(())
+}
+
+/// Whether the payload the remote served for `address` passes the check on receipt, as the
+/// command's trust of its remote asks ([`lore_storage::read::check_receipt`]). A payload that fails
+/// is logged, and the query reports it as served without walking it.
+fn passes_receipt(
+    repository: &RepositoryContext,
+    address: Address,
+    fragment: Fragment,
+    payload: &bytes::Bytes,
+) -> bool {
+    let options = crate::immutable::read_options_from_repository(repository).no_decompress();
+    match lore_storage::read::check_receipt(&(fragment, payload.clone()), address, options) {
+        Ok(_) => true,
+        Err(err) => {
+            lore_error!("Fragment {address} as the remote serves it fails its check: {err}");
+            false
+        }
+    }
 }
 
 fn immutable_query_subfragment(

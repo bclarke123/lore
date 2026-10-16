@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::branch;
@@ -84,7 +83,7 @@ impl EventError for InfoError {
 
 /// Event data reported with information about a single branch.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchInfoEventData {
     /// Branch identifier.
@@ -112,7 +111,10 @@ pub struct LoreBranchInfoEventData {
     pub archived: u8,
 }
 
-pub async fn info(repository: Arc<RepositoryContext>, branch: String) -> Result<(), InfoError> {
+pub(crate) async fn info(
+    repository: Arc<RepositoryContext>,
+    branch: String,
+) -> Result<(), InfoError> {
     let branch_name = if branch.is_empty() {
         let (_revision, branch) =
             crate::instance::load_current_anchor(&repository)
@@ -220,4 +222,12 @@ pub async fn info(repository: Arc<RepositoryContext>, branch: String) -> Result<
     .send();
 
     Ok(())
+}
+
+/// Boxed version of [`info`] for cross-crate use.
+pub fn info_boxed(
+    repository: Arc<RepositoryContext>,
+    branch: String,
+) -> crate::BoxFuture<'static, Result<(), InfoError>> {
+    Box::pin(info(repository, branch))
 }

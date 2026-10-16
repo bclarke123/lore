@@ -1,0 +1,424 @@
+// SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-License-Identifier: MIT
+use std::sync::Arc;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
+
+use axum::http::Method;
+use axum::http::StatusCode;
+use axum::http::header::ALLOW;
+use axum::http::header::CONTENT_TYPE;
+use axum_test::TestServer;
+use lore_base::runtime::LORE_CONTEXT;
+use lore_revision::fragment;
+use lore_revision::lore::RepositoryId;
+use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+use lore_server::http::presign_token::CURRENT_TOKEN_VERSION;
+use lore_server::http::presign_token::PresignTokenPayload;
+use lore_server::http::presign_token::sign;
+use lore_server::http::security_headers::ContentTypePolicy;
+use lore_server::http::server::LoreHttpServerSettings;
+use lore_server::http::server::PresignConfig;
+use lore_server::http::server::ServerHealth;
+use lore_server::http::server::ServerState;
+use lore_server::http::server::create_router;
+use rand::random;
+
+use crate::http::test_utils::content_type_policy;
+use crate::http::test_utils::presign_config;
+use crate::http::test_utils::presign_config_with_policy;
+use crate::store::test_support::test_store_create;
+
+fn valid_token(repository_id: &str, address: &str, config: &PresignConfig) -> String {
+    token_with_content_type(repository_id, address, config, None)
+}
+
+fn token_with_content_type(
+    repository_id: &str,
+    address: &str,
+    config: &PresignConfig,
+    content_type: Option<&str>,
+) -> String {
+    let expires_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let payload = PresignTokenPayload {
+        version: CURRENT_TOKEN_VERSION,
+        key_id: config.key_id.clone(),
+        repository: repository_id.to_string(),
+        address: address.to_string(),
+        expires_at,
+        content_type: content_type.map(String::from),
+        content_encoding: None,
+        content_disposition: None,
+    };
+    sign(&payload, &config.hmac_key)
+}
+
+fn build_test_server(
+    immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    mutable_store: Arc<dyn lore_storage::MutableStore>,
+    config: PresignConfig,
+) -> TestServer {
+    let test_health = ServerHealth::new_without_availability(immutable_store.clone());
+    let state = ServerState {
+        immutable_store,
+        mutable_store,
+        jwt_verifier: None,
+        repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
+        max_file_size: 100,
+        presign_config: Some(config),
+        local_auth: None,
+    };
+    let settings = LoreHttpServerSettings::test_default();
+    TestServer::new(create_router(state, test_health, &settings)).unwrap()
+}
+
+async fn redeem_with_content_type(content_type: Option<&str>) -> axum_test::TestResponse {
+    redeem_with_policy(content_type, ContentTypePolicy::default()).await
+}
+
+/// Stores random content, then redeems it with a token carrying `content_type`
+/// against a server whose allowlist comes from `policy`.
+async fn redeem_with_policy(
+    content_type: Option<&str>,
+    policy: ContentTypePolicy,
+) -> axum_test::TestResponse {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    let content_type = content_type.map(String::from);
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let repository = random::<RepositoryId>();
+            let (fragment_data, address, payload) = fragment::generate_random();
+            immutable_store
+                .clone()
+                .put(repository, address, fragment_data, Some(payload), false)
+                .await
+                .expect("Failed to put data in immutable store");
+
+            let config = presign_config_with_policy(policy);
+            let repo_hex = format!("{repository}");
+            let address_str = format!("{address}");
+            let token =
+                token_with_content_type(&repo_hex, &address_str, &config, content_type.as_deref());
+            let server = build_test_server(immutable_store, mutable_store, config);
+
+            server
+                .get(&format!("/v1/presigned/{repo_hex}/{address_str}"))
+                .add_query_param("token", token)
+                .await
+        })
+        .await
+}
+
+#[tokio::test]
+async fn returns_404_when_address_not_found() {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let repository = random::<RepositoryId>();
+            let address = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff-ffffffffffffffffffffffffffffffff";
+
+            let config = presign_config();
+            let repo_hex = format!("{repository}");
+            let token = valid_token(&repo_hex, address, &config);
+
+            let server = build_test_server(immutable_store, mutable_store, config);
+
+            let response = server
+                .get(&format!("/v1/presigned/{repo_hex}/{address}"))
+                .add_query_param("token", token)
+                .await;
+
+            assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn returns_401_for_expired_token() {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let repository = random::<RepositoryId>();
+            let address = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff-ffffffffffffffffffffffffffffffff";
+
+            let config = presign_config();
+            let repo_hex = format!("{repository}");
+
+            let payload = PresignTokenPayload {
+                version: CURRENT_TOKEN_VERSION,
+                key_id: config.key_id.clone(),
+                repository: repo_hex.clone(),
+                address: address.to_string(),
+                expires_at: 1,
+                content_type: None,
+                content_encoding: None,
+                content_disposition: None,
+            };
+            let token = sign(&payload, &config.hmac_key);
+
+            let server = build_test_server(immutable_store, mutable_store, config);
+
+            let response = server
+                .get(&format!("/v1/presigned/{repo_hex}/{address}"))
+                .add_query_param("token", token)
+                .await;
+
+            assert_eq!(response.status_code(), StatusCode::UNAUTHORIZED);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn returns_200_with_content_for_valid_token() {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let repository = random::<RepositoryId>();
+            let (fragment_data, address, payload) = fragment::generate_random();
+
+            immutable_store
+                .clone()
+                .put(
+                    repository,
+                    address,
+                    fragment_data,
+                    Some(payload.clone()),
+                    false,
+                )
+                .await
+                .expect("Failed to put data in immutable store");
+
+            let config = presign_config();
+            let repo_hex = format!("{repository}");
+            let address_str = format!("{address}");
+            let token = valid_token(&repo_hex, &address_str, &config);
+
+            let server = build_test_server(immutable_store, mutable_store, config);
+
+            let response = server
+                .get(&format!("/v1/presigned/{repo_hex}/{address_str}"))
+                .add_query_param("token", token)
+                .await;
+
+            assert_eq!(response.status_code(), StatusCode::OK);
+            assert_eq!(response.as_bytes(), &payload[..]);
+
+            let cache_control = response
+                .headers()
+                .get("cache-control")
+                .expect("missing Cache-Control header")
+                .to_str()
+                .unwrap();
+            assert!(
+                cache_control.starts_with("public, immutable, max-age="),
+                "unexpected Cache-Control value: {cache_control}"
+            );
+            let max_age: u64 = cache_control
+                .strip_prefix("public, immutable, max-age=")
+                .unwrap()
+                .parse()
+                .expect("max-age is not a number");
+            assert!(
+                max_age > 3590 && max_age <= 3600,
+                "max-age {max_age} not in expected range"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn returns_400_when_no_token_query_param() {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let repository = random::<RepositoryId>();
+            let address = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff-ffffffffffffffffffffffffffffffff";
+
+            let config = presign_config();
+            let repo_hex = format!("{repository}");
+
+            let server = build_test_server(immutable_store, mutable_store, config);
+
+            let response = server
+                .get(&format!("/v1/presigned/{repo_hex}/{address}"))
+                .await;
+
+            assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.text(),
+                "Failed to deserialize query string: missing field `token`"
+            );
+        })
+    .await;
+}
+
+#[tokio::test]
+async fn head_is_rejected_without_redeeming_content() {
+    let (immutable_store, mutable_store, _execution) =
+        test_store_create().await.expect("Failed to create stores");
+    let server = build_test_server(immutable_store, mutable_store, presign_config());
+
+    let response = server
+        .method(
+            Method::HEAD,
+            "/v1/presigned/not-a-repository/not-an-address",
+        )
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(response.headers().get(ALLOW).unwrap(), "GET");
+}
+
+#[tokio::test]
+async fn non_get_methods_advertise_get_only() {
+    let (immutable_store, mutable_store, _execution) =
+        test_store_create().await.expect("Failed to create stores");
+    let server = build_test_server(immutable_store, mutable_store, presign_config());
+
+    for method in [
+        Method::OPTIONS,
+        Method::POST,
+        Method::PUT,
+        Method::PATCH,
+        Method::DELETE,
+        Method::TRACE,
+        Method::CONNECT,
+    ] {
+        let response = server
+            .method(method, "/v1/presigned/not-a-repository/not-an-address")
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers().get(ALLOW).unwrap(), "GET");
+    }
+}
+
+#[tokio::test]
+async fn redeem_serves_allowlisted_content_type_verbatim() {
+    let response = redeem_with_content_type(Some("image/png")).await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(response.headers().get(CONTENT_TYPE).unwrap(), "image/png");
+}
+
+/// The S3 default type must round-trip verbatim, so a caller that mints
+/// with forwarded S3 metadata reads back the same value it sent.
+#[tokio::test]
+async fn redeem_serves_s3_binary_octet_stream_verbatim() {
+    let response = redeem_with_content_type(Some("binary/octet-stream")).await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "binary/octet-stream"
+    );
+    assert_eq!(
+        response.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert_eq!(
+        response.headers().get("content-security-policy").unwrap(),
+        "default-src 'none'; sandbox"
+    );
+}
+
+#[tokio::test]
+async fn redeem_coerces_disallowed_content_type_to_octet_stream() {
+    let response = redeem_with_content_type(Some("text/html")).await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "application/octet-stream"
+    );
+    // The dangerous input must not also strip the protections.
+    assert_eq!(
+        response.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert_eq!(
+        response.headers().get("content-security-policy").unwrap(),
+        "default-src 'none'; sandbox"
+    );
+}
+
+#[tokio::test]
+async fn redeem_coerces_missing_content_type_to_octet_stream() {
+    let response = redeem_with_content_type(None).await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "application/octet-stream"
+    );
+}
+
+#[tokio::test]
+async fn redeem_falls_back_to_octet_stream_for_unserializable_allowed_type() {
+    // A legacy token whose allowed media type carries a control-char
+    // parameter must not 500 — redeem falls back to octet-stream.
+    let response = redeem_with_content_type(Some("image/png; x=\u{7}")).await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "application/octet-stream"
+    );
+}
+
+/// A type added through `presigned_url_extra_content_types` is served verbatim,
+/// and the protections still apply to it.
+#[tokio::test]
+async fn redeem_serves_configured_extra_content_type_verbatim() {
+    let response = redeem_with_policy(
+        Some("application/zip"),
+        content_type_policy(&["application/zip"], &[]),
+    )
+    .await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "application/zip"
+    );
+    assert_eq!(
+        response.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert_eq!(
+        response.headers().get("content-security-policy").unwrap(),
+        "default-src 'none'; sandbox"
+    );
+}
+
+/// A built-in type removed through `presigned_url_denied_content_types` is
+/// coerced, even though an already-issued token carries it.
+#[tokio::test]
+async fn redeem_coerces_configured_denied_content_type() {
+    let response =
+        redeem_with_policy(Some("image/png"), content_type_policy(&[], &["image/png"])).await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "application/octet-stream"
+    );
+}
+
+#[tokio::test]
+async fn redeem_sets_security_headers() {
+    let response = redeem_with_content_type(Some("image/png")).await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert_eq!(
+        response.headers().get("content-security-policy").unwrap(),
+        "default-src 'none'; sandbox"
+    );
+}

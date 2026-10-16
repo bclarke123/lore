@@ -6,7 +6,6 @@ use std::sync::Arc;
 use lore_base::lore_spawn;
 use lore_base::types::LockData;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinSet;
 
@@ -99,7 +98,7 @@ impl EventError for AcquireError {
 
 /// Data for an event that marks the start of a lock acquire report.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileAcquireBeginEventData {
     /// Number of acquire entries that follow.
@@ -110,7 +109,7 @@ pub struct LoreLockFileAcquireBeginEventData {
 
 /// Data for an event reporting a path whose lock is being acquired.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileAcquireEventData {
     /// The path whose lock is being acquired.
@@ -311,45 +310,4 @@ pub async fn acquire(
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Builds a batch error shaped like the one a batch task produces: the
-    /// remote's denial forwarded under the generic acquire context.
-    fn denied_batch_error() -> AcquireError {
-        AcquireError::internal("resource already locked").forward("Failed to acquire the lock")
-    }
-
-    #[test]
-    fn batch_denial_reason_survives_the_fold() {
-        let denial = denied_batch_error();
-        let reported = denial.to_string();
-
-        let (locks, num_batch_success, first_batch_error) = fold_batch_results::<LockData, _>(
-            vec![Err(denial), Err(AcquireError::internal("a later batch"))],
-            0,
-        );
-
-        assert!(locks.is_empty());
-        assert_eq!(num_batch_success, 0);
-        assert_eq!(
-            first_batch_error
-                .expect("a failing batch keeps its error")
-                .to_string(),
-            reported
-        );
-    }
-
-    #[test]
-    fn batch_denial_reason_reaches_the_message() {
-        let reported = denied_batch_error().to_string();
-
-        assert!(
-            reported.ends_with("resource already locked"),
-            "the remote's reason is not in the reported message: {reported}"
-        );
-    }
 }

@@ -26,9 +26,13 @@ pub mod mutable_store;
 pub mod options;
 pub mod packstore;
 pub mod read;
+#[cfg(not(feature = "test-util"))]
+mod read_flight;
+#[cfg(feature = "test-util")]
+pub mod read_flight;
 pub mod store_types;
-#[cfg(test)]
-pub(crate) mod test_util;
+#[cfg(feature = "test-util")]
+pub mod test_util;
 pub(crate) mod typed_bytes;
 pub(crate) mod types;
 pub mod write;
@@ -124,10 +128,11 @@ pub use packstore::CallerBuffer;
 pub use packstore::PackStore;
 pub use packstore::PackStoreRef;
 pub use packstore::PackfileError;
+pub use packstore::PackfileSize;
 pub use read::REMOTE_FETCH_INFLIGHT;
-pub use read::decompress_and_verify;
+pub use read::check_payload_sizes;
+pub use read::expand_payload;
 pub use read::load_fragment;
-pub use read::load_raw_local;
 pub use read::read;
 pub use read::read_into;
 pub use read::read_into_buffer;
@@ -138,6 +143,7 @@ pub use read::read_resolved_into_buffer;
 pub use read::read_resolved_into_file;
 pub use read::read_resolved_stream;
 pub use read::read_stream;
+pub use read::remote_fetch_bytes;
 pub use read::remote_fetch_inflight;
 pub use read::write_all_to_file;
 // Re-export store types
@@ -181,6 +187,7 @@ pub use write::store_fragment;
 pub use write::store_raw_local;
 pub use write::stored_in_flight;
 pub use write::write_content;
+pub use write::write_content_borrowed;
 pub use write::write_from_file;
 pub use write::write_raw;
 pub use write::write_resolved;

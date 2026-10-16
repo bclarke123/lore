@@ -107,7 +107,7 @@ impl EventError for LayerError {
 
 /// Data for the event emitted when a layer is added.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLayerAddEventData {
     /// Path in the outer repository where the layer is placed.
@@ -124,7 +124,7 @@ pub struct LoreLayerAddEventData {
 
 /// Data for the event describing a single configured layer.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLayerEntryEventData {
     /// Path in the outer repository where the layer is placed.
@@ -141,7 +141,7 @@ pub struct LoreLayerEntryEventData {
 
 /// Data for the event describing a layer that has staged changes.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLayerStagedEntryEventData {
     /// Path in the outer repository where the layer is placed.
@@ -154,7 +154,7 @@ pub struct LoreLayerStagedEntryEventData {
 
 /// Data for the event emitted when a layer is removed.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLayerRemoveEventData {
     /// Path in the outer repository where the layer was placed.
@@ -279,7 +279,7 @@ impl Layer {
         &self,
         repository: Arc<RepositoryContext>,
     ) -> Result<LayerState, LayerError> {
-        let repository = Arc::new(repository.to_layer_context(self.repository).await);
+        let repository = repository.to_layer_context(self.repository).await;
 
         let state_current = State::deserialize(repository.clone(), self.current)
             .await
@@ -315,7 +315,7 @@ pub async fn add(
     let state_staged = state_staged.unwrap_or_else(|| _state_current.clone());
 
     lore_debug!("Resolve repository layer source {source_repository} path {source_path}");
-    let layer_repository = Arc::new(repository.to_layer_context(source_repository).await);
+    let layer_repository = repository.to_layer_context(source_repository).await;
 
     let layer_remote = layer_repository
         .remote()
@@ -477,7 +477,7 @@ pub async fn add(
     let target_states = layer_repository.filter.mount_states(&target_path);
     // The target directory and the files cloned under it are in the same filesystem, so one
     // operation covers both.
-    with_operation(layer_repository.file_system(), true, async |operation| {
+    with_operation(layer_repository.file_system(), async |operation| {
         operation
             .create_dir_all(&target_path)
             .await
@@ -631,7 +631,7 @@ pub async fn remove(
 
     let force = execution_context().globals().force();
     // The walk reads the same files the removal then deletes, so one operation covers both.
-    with_operation(repository.file_system(), true, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         walk_layer_subtree(
             &operation,
             layer_repository.clone(),
@@ -800,6 +800,34 @@ pub fn target_paths<'a>(layers: impl IntoIterator<Item = &'a Layer>) -> Vec<Stri
         .collect()
 }
 
+/// Where a walk over the parent's tree switches to each layer's staged tree rather than treating
+/// the mount's contents as parent adds: the node the layer's source path names, at the path the
+/// layer is mounted at. A layer whose staged tree holds no such node is left out.
+pub(crate) async fn mounts(layers: &[(Layer, LayerState)]) -> Arc<Vec<state::LayerMountInfo>> {
+    let mut mounts = Vec::with_capacity(layers.len());
+    for (layer, layer_state) in layers {
+        let Ok(source) = layer_state
+            .state_staged
+            .find_node_link(layer_state.repository.clone(), &layer.source_path)
+            .await
+        else {
+            lore_debug!(
+                "Skipping layer mount {} — source path {} not found in layer state",
+                layer.target_path,
+                layer.source_path
+            );
+            continue;
+        };
+        mounts.push(state::LayerMountInfo {
+            target_path: layer.target_path.clone(),
+            repository: layer_state.repository.clone(),
+            state: layer_state.state_staged.clone(),
+            source_node: source.node,
+        });
+    }
+    Arc::new(mounts)
+}
+
 /// For operations that cascade into every configured layer.
 ///
 /// Each context costs its own connection until UCS-19226 lands, so they are
@@ -811,7 +839,7 @@ pub async fn list_with_context(
     futures::future::try_join_all(layers.into_iter().map(|layer| {
         let repository = repository.clone();
         async move {
-            let context = Arc::new(repository.to_layer_context(layer.repository).await);
+            let context = repository.to_layer_context(layer.repository).await;
             Ok((layer, context))
         }
     }))
@@ -833,7 +861,7 @@ pub struct StagedLayerInfo {
 ///
 /// Mirrors `link::list::list_staged` for use by the CLI's per-layer message
 /// prompt.
-pub async fn list_staged(
+pub(crate) async fn list_staged(
     repository: Arc<RepositoryContext>,
 ) -> Result<Vec<StagedLayerInfo>, LayerError> {
     let layers = list(repository.clone()).await?;
@@ -842,7 +870,7 @@ pub async fn list_staged(
         let Some(staged) = layer.staged_revision() else {
             continue;
         };
-        let layer_repository = Arc::new(repository.to_layer_context(layer.repository).await);
+        let layer_repository = repository.to_layer_context(layer.repository).await;
         let staged_state = State::deserialize(layer_repository.clone(), staged)
             .await
             .forward::<LayerError>("Failed to deserialize layer staged state")?;
@@ -881,19 +909,32 @@ pub async fn list_staged(
     Ok(result)
 }
 
-pub async fn sync(
+/// Boxed version of [`list_staged`] for cross-crate use.
+pub fn list_staged_boxed(
     repository: Arc<RepositoryContext>,
+) -> crate::BoxFuture<'static, Result<Vec<StagedLayerInfo>, LayerError>> {
+    Box::pin(list_staged(repository))
+}
+
+/// Carries the layer's mount to `state_target`, and to the view `repository_target` holds.
+///
+/// `repository_current` is the layer context the mount stands under, which is `repository_target`
+/// itself for a sync carrying the mount between revisions under one view.
+pub async fn sync(
+    repository_current: Arc<RepositoryContext>,
+    repository_target: Arc<RepositoryContext>,
     state_current: Arc<State>,
     state_target: Arc<State>,
     target_path: RelativePath,
     source_path: RelativePath,
     options: SyncOptions,
 ) -> Result<(), LayerError> {
-    let filesystem = repository.file_system();
-    with_operation(filesystem, true, async |operation| {
+    let filesystem = repository_target.file_system();
+    with_operation(filesystem, async |operation| {
         sync_in_operation(
             operation,
-            repository,
+            repository_current,
+            repository_target,
             state_current,
             state_target,
             target_path,
@@ -909,7 +950,8 @@ pub async fn sync(
 #[allow(clippy::too_many_arguments)]
 async fn sync_in_operation(
     operation: Arc<InstanceOperationImpl>,
-    repository: Arc<RepositoryContext>,
+    repository_current: Arc<RepositoryContext>,
+    repository_target: Arc<RepositoryContext>,
     state_current: Arc<State>,
     state_target: Arc<State>,
     target_path: RelativePath,
@@ -917,9 +959,20 @@ async fn sync_in_operation(
     options: SyncOptions,
 ) -> Result<(), LayerError> {
     let stats: Arc<SyncRealizeStats> = Arc::default();
-    let current =
-        drawn_subtree_state(&repository, &state_current, &source_path, &target_path).await;
-    let target = drawn_subtree_state(&repository, &state_target, &source_path, &target_path).await;
+    let current = drawn_subtree_state(
+        &repository_current,
+        &state_current,
+        &source_path,
+        &target_path,
+    )
+    .await;
+    let target = drawn_subtree_state(
+        &repository_target,
+        &state_target,
+        &source_path,
+        &target_path,
+    )
+    .await;
     let current_tree = NodeMapping {
         repository: current.mapping.repository.clone(),
         state: current.mapping.state.clone(),
@@ -981,10 +1034,10 @@ async fn sync_in_operation(
             changes.len()
         );
         sync::sync_verify_filesystem(
-            repository.clone(),
+            repository_target.clone(),
             Arc::new(sync::SyncVerifyArgs {
                 changes: changes.clone(),
-                repository_current: repository.clone(),
+                repository_current,
                 operation: operation.clone(),
                 current: current_tree,
                 options: options.clone(),
@@ -997,7 +1050,7 @@ async fn sync_in_operation(
     };
 
     crate::fs::realize::realize_changes(
-        repository.clone(),
+        repository_target.clone(),
         operation.clone(),
         changes,
         None,
@@ -1277,18 +1330,12 @@ pub async fn store_staged_or_clear(
     layer: &Layer,
     state: &LayerState,
 ) -> Result<Hash, LayerError> {
-    let has_staged = state
+    let signature = if state
         .state_staged
-        .node_has_staged_children(state.repository.clone(), crate::node::ROOT_NODE)
+        .node_has_staged_or_dirty_children(state.repository.clone(), crate::node::ROOT_NODE)
         .await
-        .forward::<LayerError>("Failed to check staged nodes")?;
-    let has_dirty = state
-        .state_staged
-        .node_has_dirty_children(state.repository.clone(), crate::node::ROOT_NODE)
-        .await
-        .forward::<LayerError>("Failed to check dirty nodes")?;
-
-    let signature = if has_staged || has_dirty {
+        .forward::<LayerError>("Failed to check staged and dirty nodes")?
+    {
         state.state_staged.mark_dirty();
         state
             .state_staged

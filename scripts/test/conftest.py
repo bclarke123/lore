@@ -5,24 +5,23 @@ import logging
 import os
 import platform
 import shutil
+import signal
 import subprocess
-import tempfile
-import typing
-import uuid
-
 import sys
+import tempfile
+import uuid
 from pathlib import Path
 from time import monotonic, sleep
 
 import pytest
-
 from cleanup_util import remove_tree
-from lore import Lore
 from lore_server import (
     _get_shared_tmp_dir,
     _get_worker_id,
     _SessionCleanup,
     allocate_free_port,
+    ends_with_launcher,
+    ends_with_session,
     generate_server_config,
     launch_lore_server,
     lore_local_server,
@@ -30,10 +29,14 @@ from lore_server import (
 from service_util import (
     LORE_SERVICE_LISTENING_MESSAGE,
     LORE_SERVICE_SOCKET_VAR,
-    MACHINE_SETTINGS_PREFIX,
+    service_claim_path,
+    LORE_TEST_SERVICE_SOCKET_VAR,
+    LORE_TEST_SHARED_SERVICE_VAR,
     service_supported,
     stop_lore_service,
 )
+
+from lore import Lore, lore_test_env
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +135,22 @@ def pytest_addoption(parser):
             "failing test left behind, including the server log."
         ),
     )
+    parser.addoption(
+        "--swfs",
+        action="store_true",
+        default=False,
+        help=(
+            "Run the tests that mount a repository through SWFS. Off by "
+            "default, because mounting needs two things the harness cannot "
+            "arrange for itself: a client built with `--features swfs` "
+            "against SWFS_LIB_DIR, and the epicvfs filesystem driver started, "
+            "which takes an elevated session. Neither is visible from the "
+            "outside -- the binary reports no feature list -- and a run "
+            "without them does not fail, it hangs: the SWFS library parks the "
+            "service process when it cannot reach the driver, so the client "
+            "waiting on it blocks until the per-test timeout kills the worker."
+        ),
+    )
 
 
 @pytest.fixture(scope="session")
@@ -146,6 +165,7 @@ def new_lore_repo(
     lore_remote_url,
     tmp_path_factory,
     global_dir_name,
+    lore_subprocess_env,
     keep_test_data,
 ):
     """
@@ -175,7 +195,7 @@ def new_lore_repo(
             lore_executable_path=lore_executable_path,
             path=path,
             name=name,
-            global_dir=global_dir_name,
+            base_env=lore_subprocess_env,
             environment_vars=environment_vars,
             remote_path=remote_path,
             remote_url=remote_url,
@@ -264,6 +284,22 @@ def global_dir_name(tmp_path_factory, keep_test_data):
         remove_tree(path, label="global directory")
 
 
+@pytest.fixture(scope="function")
+def lore_subprocess_env(global_dir_name):
+    """Environment for spawning Lore as a subprocess outside the `Lore` wrapper.
+
+    Use this when a test needs to spawn the Lore binary directly, such as when
+    killing a process mid-operation or reading streaming output. The returned
+    environment isolates the command to this test's global directory and
+    credentials.
+
+    For commands run through a `Lore` instance, use `repo.sandboxed_env()`
+    instead, which includes repository-specific environment variables and
+    names the service executable when `LORE_USE_SERVICE` is set.
+    """
+    return lore_test_env(global_dir_name)
+
+
 def _wait_for_service_ready(service_process, log_path: Path, timeout=30):
     """Block until the service reports that it has bound its socket.
 
@@ -285,20 +321,34 @@ def _wait_for_service_ready(service_process, log_path: Path, timeout=30):
     pytest.fail("Timed out waiting for Lore background service to accept connections")
 
 
-class TrackedServices(object):
-    def __init__(self, lore_executable_path: str, global_dir_name: str):
+class TrackedServices:
+    def __init__(
+        self,
+        lore_executable_path: str,
+        lore_subprocess_env: dict[str, str],
+        global_dir_name: str,
+    ):
         self.lore_executable_path = lore_executable_path
+        self.lore_subprocess_env = lore_subprocess_env
         self.global_dir_name = global_dir_name
-        self.service_processes: typing.Dict[str | None, subprocess.Popen | None] = {}
+        self.service_processes: dict[str | None, subprocess.Popen | None] = {}
 
     def start(self, directory: str | None = None):
         """Starts the service, optionally with a chosen working directory. The service
         shares the test's isolated global config so shared stores it creates land
         where the client looks for them."""
+        process, log_path = self.launch(directory)
+        _wait_for_service_ready(process, log_path)
+
+        return process
+
+    def launch(self, directory: str | None = None):
+        """Starts the service as `start` does without waiting for it to accept
+        connections, for a test that does not expect it to become ready. Returns
+        the process and the file its output goes to."""
         assert self.service_processes.get(directory) is None
 
-        env = os.environ.copy()
-        env["LORE_GLOBAL_PATH"] = self.global_dir_name
+        env = self.lore_subprocess_env.copy()
 
         # Redirected to a file rather than a pipe: the readiness line is read
         # from it, and a pipe nobody drains would stall a service that outlives
@@ -316,13 +366,13 @@ class TrackedServices(object):
                 stdin=subprocess.DEVNULL,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
+                **ends_with_launcher(),
             )
-        # Tracked before the wait, so that a service which fails to become ready
+        # Tracked before any wait, so that a service which fails to become ready
         # is still ended when the test does rather than outliving the run.
         self.service_processes[directory] = process
-        _wait_for_service_ready(process, log_path)
 
-        return process
+        return process, log_path
 
     def terminate(self, directory: str | None = None):
         process = self.service_processes.get(directory)
@@ -369,12 +419,14 @@ class TrackedServices(object):
         )
     ],
 )
-def lore_service_runner(lore_executable_path, global_dir_name):
+def lore_service_runner(lore_executable_path, lore_subprocess_env, global_dir_name):
     """Provides a utility able to start the Lore service process, and cleans up any un-terminated service when the test
     ends.
     Automatically marks any test using this as skipped if services aren't supported and as part of the lore_service
     xdist_group"""
-    tracked_services = TrackedServices(lore_executable_path, global_dir_name)
+    tracked_services = TrackedServices(
+        lore_executable_path, lore_subprocess_env, global_dir_name
+    )
 
     yield tracked_services
 
@@ -396,7 +448,10 @@ def lore_service_socket():
     Set on the test process's own environment because every Lore command and
     every service in the suite is started from a copy of it, including the
     services a command starts on its own. Under xdist each worker is its own
-    process and so gets its own socket."""
+    process and so gets its own socket.
+
+    A service claims the socket name with a lock file beside it, which it
+    leaves in place when it exits, so the run removes its own at the end."""
     socket_name = f"lore_service-test-{uuid.uuid4().hex[:12]}"
     logger.info("Using Lore service socket %s for this run", socket_name)
     os.environ[LORE_SERVICE_SOCKET_VAR] = socket_name
@@ -404,10 +459,37 @@ def lore_service_socket():
     yield socket_name
 
     del os.environ[LORE_SERVICE_SOCKET_VAR]
+    if hasattr(os, "getuid"):
+        service_claim_path(socket_name).unlink(missing_ok=True)
+
+
+@pytest.fixture(autouse=True)
+def _relays_to_the_shared_service(request, monkeypatch):
+    """Carries out every command of the test in the service named by
+    `LORE_TEST_SERVICE_SOCKET`, one started before the run and shared by every
+    test in it.
+
+    A test that manages a service of its own, through `lore_service_runner`,
+    keeps it and this run's socket, and a test marked `runs_in_process` keeps
+    its commands in their own process. No executable is named, so a command that
+    finds the shared service gone fails rather than starting one of its own.
+    Each call carries the test's global and auth paths, which the service reads
+    in place of its own.
+    """
+    socket_name = os.environ.get(LORE_TEST_SERVICE_SOCKET_VAR)
+    if (
+        socket_name
+        and "lore_service_runner" not in request.fixturenames
+        and request.node.get_closest_marker("runs_in_process") is None
+    ):
+        monkeypatch.setenv("LORE_USE_SERVICE", "1")
+        monkeypatch.setenv(LORE_SERVICE_SOCKET_VAR, socket_name)
+        # Blank rather than unset, so `name_service_executable` leaves it so.
+        monkeypatch.setenv("LORE_SERVICE_EXECUTABLE", " ")
 
 
 @pytest.fixture(scope="function")
-def no_lore_service(lore_service_runner):
+def stops_background_services(lore_service_runner):
     """Leaves no service running for a test whose commands must start one, and
     stops whatever they started once the test ends.
 
@@ -431,9 +513,14 @@ def lore_executable_path(request):
     """
     Validates and returns the path of the Lore executable
     """
+    return _lore_executable_path(request.config)
+
+
+def _lore_executable_path(config) -> str:
+    """The Lore executable under test, exiting the run if there is none."""
     executable_path = os.getenv("LORE_EXECUTABLE_PATH")
     if not executable_path:
-        binary = request.config.getoption("--lore-client-binary")
+        binary = config.getoption("--lore-client-binary")
         if binary in ("release", "debug"):
             executable = "lore.exe" if sys.platform == "win32" else "lore"
             executable_path = str(Path.cwd() / "target" / binary / executable)
@@ -677,8 +764,12 @@ def auto_lore_local_server(
         (server_root, server_env) = lore_local_server_config
         try:
             server_proc, server_log_path, server_log_fd = launch_lore_server(
-                server_root, server_env, lore_server_executable_path
+                server_root,
+                server_env,
+                lore_server_executable_path,
+                outlives_launcher=True,
             )
+            ends_with_session(server_proc.pid)
             info_path.write_text(
                 json.dumps(
                     {
@@ -719,6 +810,11 @@ def auto_lore_local_server(
         yield
 
 
+# Names the directory the suite stands in for the machine's Lore settings with,
+# so that a test can tell it apart from a developer's own.
+MACHINE_SETTINGS_PREFIX = "lore_machine_settings_"
+
+
 def _sandbox_machine_settings(config):
     """Keeps the machine's Lore settings out of this run.
 
@@ -747,13 +843,75 @@ def _sandbox_machine_settings(config):
     logger.info("Standing in for the machine's Lore settings with %s", machine_settings)
 
 
+def _interrupt(signum, frame):
+    """Ends the run as Ctrl+C does, so that its cleanups run."""
+    raise KeyboardInterrupt
+
+
+def _interrupt_on_termination(config):
+    """Ends the run as Ctrl+C does on SIGTERM or SIGHUP, so that its cleanups
+    stop what outlives the process that launched it: the shared service, and the
+    server every xdist worker shares. Only the process running the session: a
+    worker that ends takes what it launched with it."""
+    if hasattr(config, "workerinput"):
+        return
+    for name in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _interrupt)
+
+
+def _start_shared_service(config):
+    """Starts the service `LORE_TEST_SHARED_SERVICE` asks for, from the build
+    under test, names it in `LORE_TEST_SERVICE_SOCKET` for the run, and stops it
+    when the run ends.
+
+    Started once, by the process running the session: xdist starts its workers
+    after this, and each inherits the variable rather than starting a service of
+    its own. A run that already names a service in `LORE_TEST_SERVICE_SOCKET`
+    uses that one. The socket name is generated, so that runs proceed side by
+    side.
+
+    A run ended by Ctrl+C, SIGTERM or SIGHUP stops the service in its cleanups.
+    One killed outright leaves that to the kernel, which `ends_with_launcher`
+    asks on Linux.
+    """
+    if (
+        not os.environ.get(LORE_TEST_SHARED_SERVICE_VAR)
+        or os.environ.get(LORE_TEST_SERVICE_SOCKET_VAR)
+        or hasattr(config, "workerinput")
+    ):
+        return
+    service_dir = tempfile.mkdtemp(prefix="lore_shared_service_")
+    config.add_cleanup(lambda: shutil.rmtree(service_dir, ignore_errors=True))
+    socket_name = f"lore_service-shared-{uuid.uuid4().hex[:12]}"
+    env = lore_test_env(service_dir)
+    env[LORE_SERVICE_SOCKET_VAR] = socket_name
+    services = TrackedServices(_lore_executable_path(config), env, service_dir)
+    if hasattr(os, "getuid"):
+        config.add_cleanup(
+            lambda: service_claim_path(socket_name).unlink(missing_ok=True)
+        )
+    config.add_cleanup(services.terminate_all)
+    services.start(service_dir)
+    os.environ[LORE_TEST_SERVICE_SOCKET_VAR] = socket_name
+    config.add_cleanup(lambda: os.environ.pop(LORE_TEST_SERVICE_SOCKET_VAR, None))
+    logger.info("Relaying the run to the Lore service on socket %s", socket_name)
+
+
 def pytest_configure(config):
     """Register the session cleanup plugin early so its pytest_sessionfinish
     hook fires on the controller process."""
     _sandbox_machine_settings(config)
+    _interrupt_on_termination(config)
+    _start_shared_service(config)
     config.pluginmanager.register(_SessionCleanup(), "lore_session_cleanup")
     config.addinivalue_line(
         "markers", "regression: mark tests that don't run on every CI"
+    )
+    config.addinivalue_line(
+        "markers",
+        "runs_in_process(reason): keep the test's commands in their own process when "
+        "LORE_TEST_SERVICE_SOCKET relays the rest of the run to a service",
     )
     config.addinivalue_line(
         "markers",

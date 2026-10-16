@@ -27,13 +27,17 @@ mod storage_remote_tests {
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
     use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use lore_server::authnz::repository_catalog::BaselineRepositoryCatalog;
     use lore_server::grpc::server::FeatureSettings;
     use lore_server::grpc::server::GrpcServerBuilder;
+    use lore_server::grpc::server::GrpcTimeouts;
     use lore_server::hooks::HookDispatcher;
     use lore_server::quic::quinn::QuinnConfigBuilder;
     use lore_server::quic::quinn::QuinnServer;
     use lore_server::quic::tests::TestHandlerFactory;
     use lore_server::quic::tests::server_certs;
+    use lore_server::settings::BaselineAccess;
+    use lore_storage::immutable_store::CopyBehavior;
     use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
 
@@ -44,17 +48,7 @@ mod storage_remote_tests {
 
     /// What a `PUT_ITEM_COMPLETE` callback records per item: `(id, address, code, stored_local,
     /// stored_remote)`.
-    type PutOutcomes = Arc<
-        Mutex<
-            Vec<(
-                u64,
-                lore_base::types::Address,
-                lore_revision::event::LoreErrorCode,
-                u8,
-                u8,
-            )>,
-        >,
-    >;
+    type PutOutcomes = Arc<Mutex<Vec<(u64, lore_base::types::Address, i32, u8, u8)>>>;
 
     /// What a streaming `GET_DATA` callback records per event: `(offset, bytes)`.
     type StreamChunks = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
@@ -283,7 +277,7 @@ mod storage_remote_tests {
             source_address: lore_base::types::Address,
             destination_partition: lore_base::types::Partition,
             destination_context: lore_base::types::Context,
-            durable: bool,
+            behavior: CopyBehavior,
         ) -> Result<(), lore_storage::StoreError> {
             self.inner
                 .clone()
@@ -292,7 +286,7 @@ mod storage_remote_tests {
                     source_address,
                     destination_partition,
                     destination_context,
-                    durable,
+                    behavior,
                 )
                 .await
         }
@@ -347,6 +341,11 @@ mod storage_remote_tests {
 
         #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
+            let repository_catalog = Arc::new(BaselineRepositoryCatalog::new(
+                BaselineAccess::Reachable,
+                backend_immutable.clone(),
+                backend_mutable.clone(),
+            ));
             let outcome = GrpcServerBuilder::new()
                 .with_environment(EnvironmentConfig::default())
                 .with_feature(FeatureSettings::default())
@@ -361,12 +360,19 @@ mod storage_remote_tests {
                 .with_http2_config(
                     None,
                     None,
-                    Duration::from_secs(30),
+                    GrpcTimeouts {
+                        request_handler: Duration::from_secs(30),
+                        authorization: Duration::from_secs(30),
+                    },
                     Default::default(),
                     Default::default(),
                     None,
                 )
-                .with_jwt_verifier(None, Arc::new(AllowAllRepositoryAuthorizer))
+                .with_jwt_verifier(
+                    None,
+                    Arc::new(AllowAllRepositoryAuthorizer),
+                    repository_catalog,
+                )
                 .unwrap()
                 .serve_with_listener(listener, async {
                     shutdown_rx.await.ok();
@@ -721,7 +727,6 @@ mod storage_remote_tests {
         use lore_base::types::Context;
         use lore_base::types::Partition;
         use lore_revision::event::LoreBytes;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
         use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
@@ -736,7 +741,7 @@ mod storage_remote_tests {
                     let payload = b"phase-d remote upload payload".to_vec();
                     let partition = Partition::from([0xa7u8; 16]);
 
-                    let captured: Arc<Mutex<Vec<(u64, Address, LoreErrorCode)>>> =
+                    let captured: Arc<Mutex<Vec<(u64, Address, i32)>>> =
                         Arc::new(Mutex::new(Vec::new()));
                     let captured_for_cb = captured.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
@@ -744,7 +749,7 @@ mod storage_remote_tests {
                             captured_for_cb.lock().unwrap().push((
                                 data.id,
                                 data.address,
-                                data.error_code,
+                                data.error.error_code,
                             ));
                         }
                     }));
@@ -776,7 +781,7 @@ mod storage_remote_tests {
                     assert_eq!(events.len(), 1, "exactly one PUT_ITEM_COMPLETE expected");
                     let (id, address, code) = events[0];
                     assert_eq!(id, 1);
-                    assert_eq!(code, LoreErrorCode::None);
+                    assert_eq!(code, 0);
                     assert_ne!(address.hash, lore_base::types::Hash::default());
 
                     let server_match =
@@ -805,7 +810,6 @@ mod storage_remote_tests {
         use lore_base::types::Context;
         use lore_base::types::Partition;
         use lore_revision::event::LoreBytes;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
         use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
@@ -820,7 +824,7 @@ mod storage_remote_tests {
                     let payload = b"local-only put (remote_write=0)".to_vec();
                     let partition = Partition::from([0xa8u8; 16]);
 
-                    let captured: Arc<Mutex<Vec<(u64, Address, LoreErrorCode)>>> =
+                    let captured: Arc<Mutex<Vec<(u64, Address, i32)>>> =
                         Arc::new(Mutex::new(Vec::new()));
                     let captured_for_cb = captured.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
@@ -828,7 +832,7 @@ mod storage_remote_tests {
                             captured_for_cb.lock().unwrap().push((
                                 data.id,
                                 data.address,
-                                data.error_code,
+                                data.error.error_code,
                             ));
                         }
                     }));
@@ -858,7 +862,7 @@ mod storage_remote_tests {
 
                     let events = captured.lock().unwrap().clone();
                     let (_, address, code) = events[0];
-                    assert_eq!(code, LoreErrorCode::None);
+                    assert_eq!(code, 0);
 
                     let server_match =
                         query_one(&server.backend_immutable.clone(), partition, address)
@@ -887,7 +891,6 @@ mod storage_remote_tests {
         use lore_base::types::Context;
         use lore_base::types::Fragment;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-get".to_string());
@@ -920,8 +923,7 @@ mod storage_remote_tests {
 
                     let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
                     let received_for_cb = received.clone();
-                    let outcomes: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> =
-                        Arc::new(Mutex::new(Vec::new()));
+                    let outcomes: Arc<Mutex<Vec<(u64, i32)>>> = Arc::new(Mutex::new(Vec::new()));
                     let outcomes_for_cb = outcomes.clone();
                     let callback: LoreEventCallback =
                         Some(Box::new(move |event: &LoreEvent| match event {
@@ -938,7 +940,7 @@ mod storage_remote_tests {
                                 outcomes_for_cb
                                     .lock()
                                     .unwrap()
-                                    .push((data.id, data.error_code));
+                                    .push((data.id, data.error.error_code));
                             }
                             _ => {}
                         }));
@@ -964,7 +966,7 @@ mod storage_remote_tests {
 
                     let outcomes = outcomes.lock().unwrap().clone();
                     assert_eq!(outcomes.len(), 1);
-                    assert_eq!(outcomes[0], (7, LoreErrorCode::None));
+                    assert_eq!(outcomes[0], (7, 0));
 
                     let received = received.lock().unwrap().clone();
                     assert_eq!(received, payload_bytes, "fetched bytes must match remote");
@@ -993,13 +995,89 @@ mod storage_remote_tests {
             .await
     }
 
+    /// A storage handle holds the session pool its calls to a partition under one correlation id
+    /// share, replaces it for a call under another, and drops it when it closes. A replacement
+    /// leaves the pool held for another partition in place. Each get asks for an address of its
+    /// own, so each reaches the remote and takes a session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_storage_handle_keeps_its_session_pool_for_its_correlation_id() -> TestResult {
+        let execution = setup_execution("storage-remote-session-per-handle".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = lore_base::types::Partition::from([0xd4u8; 16]);
+                    let other = lore_base::types::Partition::from([0xd5u8; 16]);
+                    let handle_id = open_remote_handle(&server).await;
+                    let endpoint =
+                        lore::storage::handle::lookup(lore::storage::handle::LoreStore {
+                            handle_id,
+                        })
+                        .and_then(|store| store.remote.clone())
+                        .expect("a handle with a remote");
+                    let get_under = async |id: u64, partition, correlation_id: &str| {
+                        let payload = bytes::Bytes::from(format!("{transport:?} get {id}"));
+                        let address = seed_server(&server, partition, &payload).await;
+                        let globals = LoreGlobalArgs {
+                            correlation_id: correlation_id.into(),
+                            ..Default::default()
+                        };
+                        let results = run_get_batch_under(
+                            globals,
+                            handle_id,
+                            vec![get_item(id, partition, address)],
+                        )
+                        .await;
+                        assert_eq!(
+                            results.codes.get(&id),
+                            Some(&0),
+                            "{transport:?}: get {id} must succeed",
+                        );
+                        Arc::downgrade(
+                            &endpoint
+                                .pools
+                                .get(partition, correlation_id)
+                                .expect("the handle holds the pool its get took"),
+                        )
+                    };
+
+                    let first = get_under(1, partition, "first").await;
+                    let again = get_under(2, partition, "first").await;
+                    assert!(
+                        first.ptr_eq(&again),
+                        "{transport:?}: calls under one correlation id must share a pool",
+                    );
+                    let kept = get_under(3, other, "first").await;
+
+                    let second = get_under(4, partition, "second").await;
+                    assert!(!first.ptr_eq(&second));
+                    assert!(
+                        first.upgrade().is_none(),
+                        "{transport:?}: the replaced pool must be dropped",
+                    );
+                    assert!(
+                        kept.ptr_eq(&get_under(5, other, "first").await),
+                        "{transport:?}: a replacement must keep another partition's pool",
+                    );
+
+                    close_handle(handle_id).await;
+                    assert!(
+                        second.upgrade().is_none() && kept.upgrade().is_none(),
+                        "{transport:?}: closing the handle must drop its pools",
+                    );
+                }
+                Ok(())
+            })
+            .await
+    }
+
     /// What an item delivering into its own buffer reported: whether any `GET_DATA` arrived, the
     /// content size the header carried, and the code the item completed with.
     #[derive(Clone, Copy, Default)]
     struct DataOutOutcome {
         data_events: usize,
         size_content: Option<u64>,
-        code: Option<lore_revision::event::LoreErrorCode>,
+        code: Option<i32>,
     }
 
     fn data_out_sink() -> (Arc<Mutex<DataOutOutcome>>, LoreEventCallback) {
@@ -1010,7 +1088,7 @@ mod storage_remote_tests {
             match event {
                 LoreEvent::StorageGetData(_) => outcome.data_events += 1,
                 LoreEvent::StorageGetHeader(d) => outcome.size_content = Some(d.size_content),
-                LoreEvent::StorageGetItemComplete(d) => outcome.code = Some(d.error_code),
+                LoreEvent::StorageGetItemComplete(d) => outcome.code = Some(d.error.error_code),
                 _ => {}
             }
         }));
@@ -1030,7 +1108,6 @@ mod storage_remote_tests {
         use lore_base::types::Fragment;
         use lore_base::types::Partition;
         use lore_revision::event::LoreBytesMut;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-get-data-out".to_string());
@@ -1087,7 +1164,7 @@ mod storage_remote_tests {
                     assert_eq!(status, 0, "get must succeed against a remote-only address");
 
                     let outcome = *outcome.lock().unwrap();
-                    assert_eq!(outcome.code, Some(LoreErrorCode::None));
+                    assert_eq!(outcome.code, Some(0));
                     assert_eq!(outcome.data_events, 0, "no GET_DATA may be emitted");
                     assert_eq!(outcome.size_content, Some(content.len() as u64));
                     assert_eq!(buffer, content, "the buffer must hold the remote content");
@@ -1111,7 +1188,6 @@ mod storage_remote_tests {
         use lore_base::types::Fragment;
         use lore_base::types::Partition;
         use lore_revision::event::LoreBytesMut;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-get-data-out-lz4".to_string());
@@ -1176,7 +1252,7 @@ mod storage_remote_tests {
                     );
 
                     let outcome = *outcome.lock().unwrap();
-                    assert_eq!(outcome.code, Some(LoreErrorCode::None));
+                    assert_eq!(outcome.code, Some(0));
                     assert_eq!(outcome.data_events, 0, "no GET_DATA may be emitted");
                     assert_eq!(outcome.size_content, Some(content.len() as u64));
                     assert_eq!(buffer, content, "the buffer must hold the expanded content");
@@ -1203,7 +1279,6 @@ mod storage_remote_tests {
         use lore_base::types::Partition;
         use lore_revision::event::LoreBytes;
         use lore_revision::event::LoreBytesMut;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-resolved-data-out".to_string());
@@ -1218,12 +1293,11 @@ mod storage_remote_tests {
                         .collect();
 
                     let writer = open_remote_handle(&server).await;
-                    let put_codes: Arc<Mutex<Vec<LoreErrorCode>>> =
-                        Arc::new(Mutex::new(Vec::new()));
+                    let put_codes: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
                     let put_cb = put_codes.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
                         if let LoreEvent::StoragePutItemComplete(d) = e {
-                            put_cb.lock().unwrap().push(d.error_code);
+                            put_cb.lock().unwrap().push(d.error.error_code);
                         }
                     }));
                     put_resolved::put_resolved(
@@ -1247,7 +1321,7 @@ mod storage_remote_tests {
                         callback,
                     )
                     .await;
-                    assert_eq!(put_codes.lock().unwrap().clone(), vec![LoreErrorCode::None]);
+                    assert_eq!(put_codes.lock().unwrap().clone(), vec![0]);
                     close_handle(writer).await;
 
                     // A fresh handle so the content is reached across the wire rather than out of
@@ -1270,6 +1344,7 @@ mod storage_remote_tests {
                                 context: Context::default(),
                                 local_cache: 0,
                                 streaming: 0,
+                                fragments: 0,
                             }]),
                         },
                         callback,
@@ -1281,7 +1356,7 @@ mod storage_remote_tests {
                     );
 
                     let outcome = *outcome.lock().unwrap();
-                    assert_eq!(outcome.code, Some(LoreErrorCode::None));
+                    assert_eq!(outcome.code, Some(0));
                     assert_eq!(outcome.data_events, 0, "no GET_DATA may be emitted");
                     assert_eq!(outcome.size_content, Some(content.len() as u64));
                     assert_eq!(
@@ -1311,7 +1386,6 @@ mod storage_remote_tests {
         use lore_base::types::Fragment;
         use lore_base::types::Partition;
         use lore_base::types::fragment_flags::FragmentFlags;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
         use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
@@ -1344,15 +1418,14 @@ mod storage_remote_tests {
 
                     let handle_id = open_remote_handle(&server).await;
 
-                    let outcomes: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> =
-                        Arc::new(Mutex::new(Vec::new()));
+                    let outcomes: Arc<Mutex<Vec<(u64, i32)>>> = Arc::new(Mutex::new(Vec::new()));
                     let outcomes_for_cb = outcomes.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
                         if let LoreEvent::StorageGetItemComplete(data) = event {
                             outcomes_for_cb
                                 .lock()
                                 .unwrap()
-                                .push((data.id, data.error_code));
+                                .push((data.id, data.error.error_code));
                         }
                     }));
                     let status = get::get(
@@ -1372,7 +1445,7 @@ mod storage_remote_tests {
                     )
                     .await;
                     assert_eq!(status, 0);
-                    assert_eq!(outcomes.lock().unwrap()[0].1, LoreErrorCode::None);
+                    assert_eq!(outcomes.lock().unwrap()[0].1, 0);
 
                     let local = lore::storage::handle::immutable_for_test(
                         lore::storage::handle::LoreStore { handle_id },
@@ -1408,7 +1481,6 @@ mod storage_remote_tests {
         use lore_base::types::Context;
         use lore_base::types::Fragment;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
         use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
@@ -1438,11 +1510,11 @@ mod storage_remote_tests {
                         .expect("seed server");
                     let handle_id = open_remote_handle(&server).await;
 
-                    let outcomes: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
+                    let outcomes: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
                     let outcomes_for_cb = outcomes.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
                         if let LoreEvent::StorageGetItemComplete(data) = event {
-                            outcomes_for_cb.lock().unwrap().push(data.error_code);
+                            outcomes_for_cb.lock().unwrap().push(data.error.error_code);
                         }
                     }));
                     let status = get::get(
@@ -1462,7 +1534,7 @@ mod storage_remote_tests {
                     )
                     .await;
                     assert_eq!(status, 0);
-                    assert_eq!(outcomes.lock().unwrap()[0], LoreErrorCode::None);
+                    assert_eq!(outcomes.lock().unwrap()[0], 0);
 
                     let local = lore::storage::handle::immutable_for_test(
                         lore::storage::handle::LoreStore { handle_id },
@@ -1484,6 +1556,469 @@ mod storage_remote_tests {
             .await
     }
 
+    /// A repository context for `repository_id` over `stores`, reaching the remote through
+    /// `remote`.
+    fn cache_test_context(
+        repository_id: lore_revision::lore::RepositoryId,
+        (immutable_store, mutable_store): (
+            Arc<dyn lore_storage::ImmutableStore>,
+            Arc<dyn lore_storage::MutableStore>,
+        ),
+        remote: Result<Arc<lore_transport::Connection>, lore_transport::ProtocolError>,
+    ) -> Arc<lore_revision::repository::RepositoryContext> {
+        Arc::new(lore_revision::repository::RepositoryContext::new(
+            lore_revision::repository::RepositoryContextCreationArgs {
+                paths: None,
+                immutable_store,
+                mutable_store,
+                id: repository_id,
+                instance_id: lore_revision::instance::InstanceId::default(),
+                remote,
+                filter: Arc::new(lore_revision::filter::Filter::default()),
+                filesystem_provider: None,
+            },
+        ))
+    }
+
+    /// A server and the repositories a `State::cache_fragments` test works through: one over the
+    /// server's own stores, with no remote, where the test builds its state, and a client over
+    /// in-memory stores connected to the server, which caches nothing it reads by itself.
+    struct CacheTest {
+        server: TestServer,
+        repository_id: lore_revision::lore::RepositoryId,
+        server_repository: Arc<lore_revision::repository::RepositoryContext>,
+        client_stores: (
+            Arc<dyn lore_storage::ImmutableStore>,
+            Arc<dyn lore_storage::MutableStore>,
+        ),
+        client_repository: Arc<lore_revision::repository::RepositoryContext>,
+    }
+
+    impl CacheTest {
+        async fn start(
+            transport: Transport,
+            repository_id: lore_revision::lore::RepositoryId,
+        ) -> Result<Self, Box<dyn Error>> {
+            let server = start_server(transport).await;
+            let server_repository = cache_test_context(
+                repository_id,
+                (
+                    server.backend_immutable.clone(),
+                    server.backend_mutable.clone(),
+                ),
+                Err(lore_transport::ProtocolError::from(
+                    lore_base::error::NoRemote,
+                )),
+            );
+            let client_stores = lore_revision::repository::create_client_memory_stores().await?;
+            let remote = lore_transport::connection::connect(
+                server.url.as_str(),
+                "cache-test",
+                repository_id,
+                1,
+                "",
+                "",
+                lore_transport::auth::AuthMode::Auto,
+            )
+            .await?;
+            let client_repository =
+                cache_test_context(repository_id, client_stores.clone(), Ok(remote));
+            client_repository.set_disable_cache(true);
+            Ok(Self {
+                server,
+                repository_id,
+                server_repository,
+                client_stores,
+                client_repository,
+            })
+        }
+
+        /// A repository over the client's stores, with no remote.
+        fn offline(&self) -> Arc<lore_revision::repository::RepositoryContext> {
+            cache_test_context(
+                self.repository_id,
+                self.client_stores.clone(),
+                Err(lore_transport::ProtocolError::from(
+                    lore_base::error::NoRemote,
+                )),
+            )
+        }
+    }
+
+    /// `State::cache_fragments` retains the state and tree records even when their fragments
+    /// lack `PayloadLocalCachePriority`, so both can be read without a remote.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn state_fragment_cache_makes_historical_state_available_offline() -> TestResult {
+        use lore_base::types::Address;
+        use lore_base::types::fragment_flags::FragmentFlags;
+        use lore_revision::lore::RepositoryId;
+        use lore_revision::node::Node;
+        use lore_revision::node::ROOT_NODE;
+        use lore_revision::repository::RepositoryWriteToken;
+        use lore_revision::state::State;
+        use lore_storage::hash::hash_string;
+
+        let execution = setup_execution("storage-remote-historical-state-cache".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let repository_id = RepositoryId::from([0xd2u8; 16]);
+                    let test = CacheTest::start(transport, repository_id).await?;
+                    let write_token = RepositoryWriteToken::acquire(std::path::Path::new(
+                        "historical-state-cache-test",
+                    ))
+                    .await;
+                    let state = State::new();
+                    let node = Node {
+                        name_hash: hash_string("held"),
+                        ..Default::default()
+                    };
+                    state
+                        .node_add(test.server_repository.clone(), ROOT_NODE, node, "held")
+                        .await?;
+                    let revision = state
+                        .serialize(test.server_repository.clone(), &write_token)
+                        .await?;
+
+                    for hash in [revision, state.tree_hash()] {
+                        let address = Address::zero_context_hash(hash);
+                        let (mut fragment, payload) = test
+                            .server
+                            .backend_immutable
+                            .clone()
+                            .get(repository_id, address)
+                            .await?
+                            .into_payload()?;
+                        fragment.flags &= !FragmentFlags::PayloadLocalCachePriority;
+                        test.server
+                            .backend_immutable
+                            .clone()
+                            .put(repository_id, address, fragment, Some(payload), true)
+                            .await?;
+                    }
+
+                    State::deserialize(test.client_repository.clone(), revision)
+                        .await?
+                        .cache_fragments(test.client_repository.clone(), false)
+                        .await?;
+
+                    let offline = test.offline();
+                    State::deserialize(offline.clone(), revision)
+                        .await?
+                        .tree(offline)
+                        .await?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// With `file_metadata`, `State::cache_fragments` caches every file metadata block, so each
+    /// reads without a remote. The custom metadata the slots name is left alone: the remote lacks
+    /// it, and caching succeeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_metadata_cache_makes_file_metadata_blocks_available_offline() -> TestResult {
+        use lore_base::types::Hash;
+        use lore_revision::lore::RepositoryId;
+        use lore_revision::node::Node;
+        use lore_revision::node::NodeFileMetadata;
+        use lore_revision::node::NodeFileMetadataBlock;
+        use lore_revision::node::ROOT_NODE;
+        use lore_revision::node::node_to_file_metadata;
+        use lore_revision::repository::RepositoryWriteToken;
+        use lore_revision::state::State;
+        use lore_storage::hash::hash_string;
+
+        let execution = setup_execution("storage-remote-file-metadata-cache".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let test =
+                        CacheTest::start(transport, RepositoryId::from([0xd3u8; 16])).await?;
+                    let write_token = RepositoryWriteToken::acquire(std::path::Path::new(
+                        "file-metadata-cache-test",
+                    ))
+                    .await;
+                    let state = State::new();
+                    let mut described = Vec::new();
+                    for index in 0..1200 {
+                        let name = format!("file{index}");
+                        let node = Node {
+                            name_hash: hash_string(&name),
+                            ..Default::default()
+                        };
+                        let node = state
+                            .node_add(test.server_repository.clone(), ROOT_NODE, node, &name)
+                            .await?;
+                        if [0, 600, 1100].contains(&index) {
+                            described.push(node);
+                        }
+                    }
+
+                    let mut expected = Vec::new();
+                    for (index, &node) in described.iter().enumerate() {
+                        let history = Hash::from_u64(index as u64 + 1);
+                        let metadata_node = node_to_file_metadata(node);
+                        let block_index = NodeFileMetadataBlock::index(metadata_node);
+                        let block = state
+                            .block_file_metadata(test.server_repository.clone(), block_index)
+                            .await?;
+                        {
+                            let mut writer = block.write();
+                            let slot = writer.node(NodeFileMetadata::index(metadata_node));
+                            slot.revision[0] = history;
+                            slot.metadata = Hash::from_u64(9);
+                            writer.mark_dirty();
+                        }
+                        state.block_file_metadata_modified(block, block_index);
+                        expected.push((
+                            block_index,
+                            NodeFileMetadata::index(metadata_node),
+                            history,
+                        ));
+                    }
+                    assert_eq!(
+                        expected[0].0 + 2,
+                        expected[2].0,
+                        "the slots span three blocks"
+                    );
+                    state.mark_dirty();
+                    let revision = state
+                        .serialize(test.server_repository.clone(), &write_token)
+                        .await?;
+
+                    State::deserialize(test.client_repository.clone(), revision)
+                        .await?
+                        .cache_fragments(test.client_repository.clone(), true)
+                        .await?;
+
+                    let offline = test.offline();
+                    let offline_state = State::deserialize(offline.clone(), revision).await?;
+                    for (block_index, node_index, history) in expected {
+                        let block = offline_state
+                            .block_file_metadata(offline.clone(), block_index)
+                            .await?;
+                        assert_eq!(
+                            block.read().node_block().node[node_index].revision[0],
+                            history
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// With `file_metadata`, `State::cache_fragments` fails when the remote lacks a file metadata
+    /// block. Without it, caching disregards the failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_metadata_cache_fails_on_a_block_the_remote_lacks() -> TestResult {
+        use lore_base::types::Address;
+        use lore_base::types::Hash;
+        use lore_revision::lore::RepositoryId;
+        use lore_revision::node::Node;
+        use lore_revision::node::NodeFileMetadata;
+        use lore_revision::node::NodeFileMetadataBlock;
+        use lore_revision::node::ROOT_NODE;
+        use lore_revision::node::node_to_file_metadata;
+        use lore_revision::repository::RepositoryWriteToken;
+        use lore_revision::state::State;
+        use lore_storage::StoreObliterateStats;
+        use lore_storage::TypedBytes;
+        use lore_storage::hash::hash_string;
+
+        let execution = setup_execution("storage-remote-file-metadata-cache-failure".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let test =
+                        CacheTest::start(transport, RepositoryId::from([0xd4u8; 16])).await?;
+                    let write_token = RepositoryWriteToken::acquire(std::path::Path::new(
+                        "file-metadata-cache-failure-test",
+                    ))
+                    .await;
+                    let state = State::new();
+                    let node = Node {
+                        name_hash: hash_string("described"),
+                        ..Default::default()
+                    };
+                    let node = state
+                        .node_add(test.server_repository.clone(), ROOT_NODE, node, "described")
+                        .await?;
+                    let metadata_node = node_to_file_metadata(node);
+                    let block_index = NodeFileMetadataBlock::index(metadata_node);
+                    let block = state
+                        .block_file_metadata(test.server_repository.clone(), block_index)
+                        .await?;
+                    {
+                        let mut writer = block.write();
+                        writer.node(NodeFileMetadata::index(metadata_node)).revision[0] =
+                            Hash::from_u64(1);
+                        writer.mark_dirty();
+                    }
+                    state.block_file_metadata_modified(block, block_index);
+                    state.mark_dirty();
+                    let revision = state
+                        .serialize(test.server_repository.clone(), &write_token)
+                        .await?;
+
+                    let tree = state.tree(test.server_repository.clone()).await?;
+                    let blocks = lore_revision::immutable::read(
+                        test.server_repository.clone(),
+                        Address::zero_context_hash(tree.hash_file_metadata),
+                        None,
+                        lore_revision::immutable::read_options_from_repository(
+                            &test.server_repository,
+                        ),
+                    )
+                    .await?;
+                    for &hash in blocks.as_type_slice::<Hash>() {
+                        if !hash.is_zero() {
+                            test.server
+                                .backend_immutable
+                                .clone()
+                                .obliterate(
+                                    test.repository_id,
+                                    Address::zero_context_hash(hash),
+                                    Arc::new(StoreObliterateStats::default()),
+                                )
+                                .await?;
+                        }
+                    }
+
+                    let client_state =
+                        State::deserialize(test.client_repository.clone(), revision).await?;
+                    client_state
+                        .cache_fragments(test.client_repository.clone(), false)
+                        .await?;
+                    assert!(
+                        client_state
+                            .cache_fragments(test.client_repository.clone(), true)
+                            .await
+                            .is_err(),
+                        "a block the remote lacks fails the file metadata cache"
+                    );
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// The diagnostic immutable query checks the payload the remote serves as the command's trust of
+    /// its remote asks: a list that does not hash to its address is reported as served and not
+    /// walked, and a command trusting the remote walks it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_immutable_query_walks_a_remote_list_only_where_it_passes_its_check() -> TestResult
+    {
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Fragment;
+        use lore_base::types::FragmentReference;
+        use lore_base::types::Hash;
+        use lore_base::types::fragment_flags::FragmentFlags;
+        use lore_revision::event::LoreEndEventData;
+        use lore_revision::interface::ExecutionContext;
+        use lore_revision::lore::RepositoryId;
+        use lore_revision::relay::EventDispatcher;
+
+        for (trust_remote, walked) in [(0u8, false), (1, true)] {
+            let subfragments: Arc<Mutex<Vec<u8>>> = Arc::default();
+            let ended = Arc::new(tokio::sync::Notify::new());
+            let (queried, end) = (subfragments.clone(), ended.clone());
+            let callback: LoreEventCallback =
+                Some(Box::new(move |event: &LoreEvent| match event {
+                    LoreEvent::RepositoryStoreImmutableQuery(data) => {
+                        queried.lock().unwrap().push(data.subfragment);
+                    }
+                    LoreEvent::End(_) => end.notify_one(),
+                    _ => {}
+                }));
+            let execution = Arc::new(ExecutionContext::new_server(
+                LoreGlobalArgs {
+                    trust_remote,
+                    ..LoreGlobalArgs::default()
+                },
+                EventDispatcher::new(callback),
+                "storage-remote-immutable-query".to_string(),
+            ));
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let repository_id = RepositoryId::from([0xd6 + trust_remote; 16]);
+                    let test = CacheTest::start(Transport::Grpc, repository_id).await?;
+                    let context = Context::from([0xd6; 16]);
+                    let leaf = b"a leaf named by a list the remote serves altered";
+                    let leaf_address = Address {
+                        hash: lore_storage::hash::hash_slice(leaf),
+                        context,
+                    };
+                    let plain = Fragment {
+                        flags: 0,
+                        size_payload: leaf.len() as u32,
+                        size_content: leaf.len() as u64,
+                    };
+                    test.server
+                        .backend_immutable
+                        .clone()
+                        .put(
+                            repository_id,
+                            leaf_address,
+                            plain,
+                            Some(bytes::Bytes::from_static(leaf)),
+                            false,
+                        )
+                        .await?;
+                    let reference = FragmentReference {
+                        hash: leaf_address.hash,
+                        offset_content: 0,
+                    };
+                    let list =
+                        bytes::Bytes::copy_from_slice(zerocopy::IntoBytes::as_bytes(&reference));
+                    let list_address = Address {
+                        hash: Hash::from([0xd6u8; 32]),
+                        context,
+                    };
+                    let fragmented = Fragment {
+                        flags: FragmentFlags::PayloadFragmented.bits(),
+                        size_payload: list.len() as u32,
+                        size_content: leaf.len() as u64,
+                    };
+                    test.server
+                        .backend_immutable
+                        .clone()
+                        .put(repository_id, list_address, fragmented, Some(list), false)
+                        .await?;
+
+                    lore_revision::repository::store::immutable_query(
+                        test.client_repository.clone(),
+                        list_address.to_string(),
+                        false,
+                        true,
+                    )
+                    .await?;
+                    LoreEvent::End(LoreEndEventData::default()).send();
+                    Ok::<(), Box<dyn Error>>(())
+                })
+                .await?;
+
+            tokio::time::timeout(Duration::from_secs(10), ended.notified()).await?;
+            let subfragments = subfragments.lock().unwrap().clone();
+            assert_eq!(
+                subfragments
+                    .iter()
+                    .filter(|&&subfragment| subfragment == 0)
+                    .count(),
+                2,
+                "the list is queried locally and remotely"
+            );
+            assert_eq!(
+                subfragments.contains(&1),
+                walked,
+                "the list is walked, trust_remote {trust_remote}"
+            );
+        }
+        Ok(())
+    }
+
     /// `local_cache=1` on a put item tags the resulting fragment with
     /// `PayloadLocalCachePriority`. A subsequent local query of the address shows the flag
     /// is preserved so future remote reads of this content cache regardless of the reader's
@@ -1497,7 +2032,6 @@ mod storage_remote_tests {
         use lore_base::types::Context;
         use lore_base::types::Partition;
         use lore_revision::event::LoreBytes;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-put-localcache".to_string());
@@ -1511,7 +2045,7 @@ mod storage_remote_tests {
                     let partition = Partition::from([0xc9u8; 16]);
                     let context = Context::from([0xa9u8; 16]);
 
-                    let captured: Arc<Mutex<Vec<(Address, LoreErrorCode)>>> =
+                    let captured: Arc<Mutex<Vec<(Address, i32)>>> =
                         Arc::new(Mutex::new(Vec::new()));
                     let captured_for_cb = captured.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
@@ -1519,7 +2053,7 @@ mod storage_remote_tests {
                             captured_for_cb
                                 .lock()
                                 .unwrap()
-                                .push((data.address, data.error_code));
+                                .push((data.address, data.error.error_code));
                         }
                     }));
                     let item = LoreStoragePutItem {
@@ -1545,7 +2079,7 @@ mod storage_remote_tests {
                     .await;
                     assert_eq!(status, 0);
                     let (address, code) = captured.lock().unwrap()[0];
-                    assert_eq!(code, LoreErrorCode::None);
+                    assert_eq!(code, 0);
                     drop(payload);
 
                     let local = lore::storage::handle::immutable_for_test(
@@ -1584,18 +2118,18 @@ mod storage_remote_tests {
         use lore::storage::put::LoreStoragePutItem;
         use lore_base::types::Context;
         use lore_revision::event::LoreBytes;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
-        let captured: Arc<Mutex<Vec<(u64, lore_base::types::Address, LoreErrorCode)>>> =
+        let captured: Arc<Mutex<Vec<(u64, lore_base::types::Address, i32)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let captured_for_cb = captured.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
             if let LoreEvent::StoragePutItemComplete(data) = event {
-                captured_for_cb
-                    .lock()
-                    .unwrap()
-                    .push((data.id, data.address, data.error_code));
+                captured_for_cb.lock().unwrap().push((
+                    data.id,
+                    data.address,
+                    data.error.error_code,
+                ));
             }
         }));
         let item = LoreStoragePutItem {
@@ -1621,7 +2155,7 @@ mod storage_remote_tests {
         .await;
         assert_eq!(status, 0);
         let events = captured.lock().unwrap().clone();
-        assert_eq!(events[0].2, LoreErrorCode::None);
+        assert_eq!(events[0].2, 0);
         events[0].1
     }
 
@@ -1630,21 +2164,13 @@ mod storage_remote_tests {
         source_partition: lore_base::types::Partition,
         source_address: lore_base::types::Address,
         target_partition: lore_base::types::Partition,
-    ) -> (
-        i32,
-        Vec<(
-            u64,
-            lore_base::types::Address,
-            lore_revision::event::LoreErrorCode,
-        )>,
-    ) {
+    ) -> (i32, Vec<(u64, lore_base::types::Address, i32)>) {
         use lore::storage::copy;
         use lore::storage::copy::LoreStorageCopyArgs;
         use lore::storage::copy::LoreStorageCopyItem;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
-        let captured: Arc<Mutex<Vec<(u64, lore_base::types::Address, LoreErrorCode)>>> =
+        let captured: Arc<Mutex<Vec<(u64, lore_base::types::Address, i32)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let captured_for_cb = captured.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
@@ -1652,7 +2178,7 @@ mod storage_remote_tests {
                 captured_for_cb.lock().unwrap().push((
                     data.id,
                     data.source_address,
-                    data.error_code,
+                    data.error.error_code,
                 ));
             }
         }));
@@ -1698,18 +2224,18 @@ mod storage_remote_tests {
         use lore::storage::put::LoreStoragePutItem;
         use lore_base::types::Context;
         use lore_revision::event::LoreBytes;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
-        let captured: Arc<Mutex<Vec<(u64, lore_base::types::Address, LoreErrorCode)>>> =
+        let captured: Arc<Mutex<Vec<(u64, lore_base::types::Address, i32)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let captured_for_cb = captured.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
             if let LoreEvent::StoragePutItemComplete(data) = event {
-                captured_for_cb
-                    .lock()
-                    .unwrap()
-                    .push((data.id, data.address, data.error_code));
+                captured_for_cb.lock().unwrap().push((
+                    data.id,
+                    data.address,
+                    data.error.error_code,
+                ));
             }
         }));
         let item = LoreStoragePutItem {
@@ -1735,14 +2261,13 @@ mod storage_remote_tests {
         .await;
         assert_eq!(status, 0);
         let events = captured.lock().unwrap().clone();
-        assert_eq!(events[0].2, LoreErrorCode::None);
+        assert_eq!(events[0].2, 0);
         events[0].1
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn copy_tier1_server_side_when_source_on_both() -> TestResult {
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
@@ -1767,7 +2292,7 @@ mod storage_remote_tests {
                         copy_one_item(handle_id, source_partition, address, target_partition).await;
                     assert_eq!(status, 0);
                     assert_eq!(events.len(), 1);
-                    assert_eq!(events[0].2, LoreErrorCode::None);
+                    assert_eq!(events[0].2, 0);
                     assert_eq!(events[0].1, address);
 
                     let on_server =
@@ -1790,7 +2315,6 @@ mod storage_remote_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn copy_tier2_upload_fallback_when_local_source_only() -> TestResult {
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
@@ -1821,7 +2345,7 @@ mod storage_remote_tests {
                     let (status, events) =
                         copy_one_item(handle_id, source_partition, address, target_partition).await;
                     assert_eq!(status, 0);
-                    assert_eq!(events[0].2, LoreErrorCode::None);
+                    assert_eq!(events[0].2, 0);
                     assert_eq!(events[0].1, address);
 
                     let on_server =
@@ -1847,35 +2371,16 @@ mod storage_remote_tests {
         address: lore_base::types::Address,
     ) -> (
         i32,
-        Vec<(
-            u64,
-            lore_base::types::Address,
-            u8,
-            u8,
-            u8,
-            u8,
-            lore_revision::event::LoreErrorCode,
-        )>,
+        Vec<(u64, lore_base::types::Address, u8, u8, u8, u8, i32)>,
     ) {
         use lore::storage::obliterate;
         use lore::storage::obliterate::LoreStorageObliterateArgs;
         use lore::storage::obliterate::LoreStorageObliterateItem;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         #[allow(clippy::type_complexity)]
         let captured: Arc<
-            Mutex<
-                Vec<(
-                    u64,
-                    lore_base::types::Address,
-                    u8,
-                    u8,
-                    u8,
-                    u8,
-                    LoreErrorCode,
-                )>,
-            >,
+            Mutex<Vec<(u64, lore_base::types::Address, u8, u8, u8, u8, i32)>>,
         > = Arc::new(Mutex::new(Vec::new()));
         let captured_for_cb = captured.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
@@ -1887,7 +2392,7 @@ mod storage_remote_tests {
                     data.remote_success,
                     data.local_skipped,
                     data.remote_skipped,
-                    data.error_code,
+                    data.error.error_code,
                 ));
             }
         }));
@@ -1916,7 +2421,6 @@ mod storage_remote_tests {
     async fn obliterate_runs_local_and_remote_in_parallel_with_independent_outcomes() -> TestResult
     {
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
 
         let execution = setup_execution("storage-remote-obliterate".to_string());
         LORE_CONTEXT
@@ -1942,11 +2446,7 @@ mod storage_remote_tests {
                     assert_eq!(id, 31);
                     assert_eq!(local_success, 1, "local obliterate must succeed");
                     assert_eq!(remote_success, 1, "without JWT the admin path is allowed",);
-                    assert_eq!(
-                        error_code,
-                        LoreErrorCode::None,
-                        "Remote obliterate should have succeeded",
-                    );
+                    assert_eq!(error_code, 0, "Remote obliterate should have succeeded",);
 
                     close_handle(handle_id).await;
                 }
@@ -1994,7 +2494,6 @@ mod storage_remote_tests {
         use lore_base::types::Context;
         use lore_base::types::Fragment;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-query-multiplex".to_string());
@@ -2033,7 +2532,7 @@ mod storage_remote_tests {
 
                     let handle_id = open_remote_handle(&server).await;
 
-                    let captured: Arc<Mutex<Vec<(u64, Address, LoreErrorCode)>>> =
+                    let captured: Arc<Mutex<Vec<(u64, Address, i32)>>> =
                         Arc::new(Mutex::new(Vec::new()));
                     let captured_for_cb = captured.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
@@ -2041,7 +2540,7 @@ mod storage_remote_tests {
                             captured_for_cb.lock().unwrap().push((
                                 data.id,
                                 data.address,
-                                data.error_code,
+                                data.error.error_code,
                             ));
                         }
                     }));
@@ -2076,7 +2575,7 @@ mod storage_remote_tests {
                     for (i, (id, addr, code)) in events.iter().enumerate() {
                         assert_eq!(*id, i as u64);
                         assert_eq!(*addr, addresses[i]);
-                        assert_eq!(*code, LoreErrorCode::None);
+                        assert_eq!(*code, 0);
                     }
 
                     close_handle(handle_id).await;
@@ -2089,22 +2588,13 @@ mod storage_remote_tests {
     async fn upload_items(
         handle_id: u64,
         items: Vec<lore::storage::upload::LoreStorageUploadItem>,
-    ) -> (
-        i32,
-        Vec<(
-            u64,
-            lore_base::types::Address,
-            u8,
-            lore_revision::event::LoreErrorCode,
-        )>,
-    ) {
+    ) -> (i32, Vec<(u64, lore_base::types::Address, u8, i32)>) {
         use lore::storage::upload;
         use lore::storage::upload::LoreStorageUploadArgs;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         #[allow(clippy::type_complexity)]
-        let captured: Arc<Mutex<Vec<(u64, lore_base::types::Address, u8, LoreErrorCode)>>> =
+        let captured: Arc<Mutex<Vec<(u64, lore_base::types::Address, u8, i32)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let captured_for_cb = captured.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
@@ -2113,7 +2603,7 @@ mod storage_remote_tests {
                     data.id,
                     data.address,
                     data.already_durable,
-                    data.error_code,
+                    data.error.error_code,
                 ));
             }
         }));
@@ -2134,15 +2624,7 @@ mod storage_remote_tests {
         handle_id: u64,
         partition: lore_base::types::Partition,
         address: lore_base::types::Address,
-    ) -> (
-        i32,
-        Vec<(
-            u64,
-            lore_base::types::Address,
-            u8,
-            lore_revision::event::LoreErrorCode,
-        )>,
-    ) {
+    ) -> (i32, Vec<(u64, lore_base::types::Address, u8, i32)>) {
         upload_items(
             handle_id,
             vec![lore::storage::upload::LoreStorageUploadItem {
@@ -2161,7 +2643,6 @@ mod storage_remote_tests {
         use lore_base::types::Context;
         use lore_base::types::Hash;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
@@ -2204,12 +2685,12 @@ mod storage_remote_tests {
                     assert_eq!(events.len(), 2, "one terminal event per item");
                     assert_eq!(
                         (events[0].2, events[0].3),
-                        (0, LoreErrorCode::None),
+                        (0, 0),
                         "the local-only payload uploads",
                     );
                     assert_eq!(
                         (events[1].2, events[1].3),
-                        (0, LoreErrorCode::AddressNotFound),
+                        (0, lore_base::error::AddressNotFound::FFI_CODE),
                         "the absent address reports its own miss",
                     );
 
@@ -2232,7 +2713,6 @@ mod storage_remote_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn upload_local_only_payload_pushes_to_remote_and_marks_durable() -> TestResult {
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
@@ -2252,7 +2732,7 @@ mod storage_remote_tests {
                     assert_eq!(status, 0, "upload must succeed");
                     assert_eq!(events.len(), 1);
                     let (_, _, already_durable, error_code) = events[0];
-                    assert_eq!(error_code, LoreErrorCode::None);
+                    assert_eq!(error_code, 0);
                     assert_eq!(already_durable, 0, "first upload was not yet durable");
 
                     let on_server =
@@ -2268,7 +2748,7 @@ mod storage_remote_tests {
                     let (status2, events2) = upload_one_item(handle_id, partition, address).await;
                     assert_eq!(status2, 0);
                     let (_, _, already_durable2, error_code2) = events2[0];
-                    assert_eq!(error_code2, LoreErrorCode::None);
+                    assert_eq!(error_code2, 0);
                     assert_eq!(
                         already_durable2, 1,
                         "second upload must short-circuit as already_durable=1",
@@ -2287,7 +2767,6 @@ mod storage_remote_tests {
         use lore_base::types::Context;
         use lore_base::types::Hash;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
 
         let execution = setup_execution("storage-remote-upload-unknown".to_string());
         LORE_CONTEXT
@@ -2302,7 +2781,7 @@ mod storage_remote_tests {
                     };
                     let (_, events) = upload_one_item(handle_id, partition, address).await;
                     let (_, _, already_durable, error_code) = events[0];
-                    assert_eq!(error_code, LoreErrorCode::AddressNotFound);
+                    assert_eq!(error_code, lore_base::error::AddressNotFound::FFI_CODE);
                     assert_eq!(already_durable, 0);
 
                     close_handle(handle_id).await;
@@ -2318,7 +2797,6 @@ mod storage_remote_tests {
         use lore_base::types::Context;
         use lore_base::types::Hash;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
 
         let execution = setup_execution("storage-remote-upload-zero".to_string());
         LORE_CONTEXT
@@ -2334,7 +2812,7 @@ mod storage_remote_tests {
                     let (status, events) = upload_one_item(handle_id, partition, address).await;
                     assert_eq!(status, 0);
                     let (_, _, already_durable, error_code) = events[0];
-                    assert_eq!(error_code, LoreErrorCode::None);
+                    assert_eq!(error_code, 0);
                     assert_eq!(already_durable, 1);
 
                     close_handle(handle_id).await;
@@ -2412,13 +2890,103 @@ mod storage_remote_tests {
             .await
     }
 
+    /// Copies of one source to several target contexts, in one call, each reach the server, over
+    /// both transports. Push copies an association from the zero-context source this way. A copy
+    /// response names only its source, so a client that merged the copies by source answered all
+    /// of them with the first one's result, and the server held only one target.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copies_of_one_source_to_many_contexts_each_reach_the_server() -> TestResult {
+        use lore::storage::copy;
+        use lore::storage::copy::LoreStorageCopyArgs;
+        use lore::storage::copy::LoreStorageCopyItem;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+        use lore_revision::interface::LoreArray;
+        use lore_storage::immutable_store::query_one;
+        use lore_storage::store_types::StoreMatch;
+
+        const TARGETS: u8 = 8;
+
+        let execution = setup_execution("storage-remote-copy-many-contexts".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = Partition::from([0xc5u8; 16]);
+                    let handle_id = open_remote_handle(&server).await;
+                    let source = put_local_and_remote_via_handle(
+                        handle_id,
+                        partition,
+                        b"copied to many contexts",
+                    )
+                    .await;
+                    let targets: Vec<Address> = (1..=TARGETS)
+                        .map(|index| Address {
+                            hash: source.hash,
+                            context: Context::from([index; 16]),
+                        })
+                        .collect();
+
+                    let completed: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+                    let completed_for_cb = completed.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                        if let LoreEvent::StorageCopyItemComplete(data) = event {
+                            completed_for_cb.lock().unwrap().push(data.error.error_code);
+                        }
+                    }));
+                    let items = targets
+                        .iter()
+                        .zip(0u64..)
+                        .map(|(target, id)| LoreStorageCopyItem {
+                            id,
+                            source_partition: partition,
+                            target_partition: partition,
+                            source_address: source,
+                            target_context: target.context,
+                        })
+                        .collect();
+                    let status = copy::copy(
+                        LoreGlobalArgs::default(),
+                        LoreStorageCopyArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id },
+                            items: LoreArray::from_vec(items),
+                        },
+                        callback,
+                    )
+                    .await;
+
+                    assert_eq!(status, 0, "{transport:?}");
+                    assert_eq!(
+                        *completed.lock().unwrap(),
+                        vec![0; TARGETS as usize],
+                        "{transport:?}"
+                    );
+                    for target in targets {
+                        let on_server =
+                            query_one(&server.backend_immutable.clone(), partition, target)
+                                .await
+                                .unwrap();
+                        assert_eq!(
+                            on_server.match_made,
+                            StoreMatch::MatchFull,
+                            "{transport:?}: the server must hold {target}",
+                        );
+                    }
+
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
     /// Copy idempotency: re-copying onto an already-populated target tuple succeeds with the
     /// same `error_code = None` and produces no observable change. Exercises the remote path
     /// (idempotent on both server-side `session.copy` and the local mirror).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn copy_idempotent_when_target_already_present() -> TestResult {
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
@@ -2442,7 +3010,7 @@ mod storage_remote_tests {
                     let (status1, events1) =
                         copy_one_item(handle_id, source_partition, address, target_partition).await;
                     assert_eq!(status1, 0);
-                    assert_eq!(events1[0].2, LoreErrorCode::None);
+                    assert_eq!(events1[0].2, 0);
                     let target_after_first =
                         query_one(&server.backend_immutable.clone(), target_partition, address)
                             .await
@@ -2452,7 +3020,7 @@ mod storage_remote_tests {
                     let (status2, events2) =
                         copy_one_item(handle_id, source_partition, address, target_partition).await;
                     assert_eq!(status2, 0);
-                    assert_eq!(events2[0].2, LoreErrorCode::None);
+                    assert_eq!(events2[0].2, 0);
                     assert_eq!(events2[0].1, address);
                     let target_after_second =
                         query_one(&server.backend_immutable.clone(), target_partition, address)
@@ -2476,7 +3044,6 @@ mod storage_remote_tests {
         use lore_base::types::Context;
         use lore_base::types::Hash;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
 
         let execution = setup_execution("storage-remote-copy-tier3".to_string());
         LORE_CONTEXT
@@ -2496,7 +3063,7 @@ mod storage_remote_tests {
                         copy_one_item(handle_id, source_partition, address, target_partition).await;
                     assert_eq!(
                         events[0].2,
-                        LoreErrorCode::AddressNotFound,
+                        lore_base::error::AddressNotFound::FFI_CODE,
                         "tier-3: no local payload + server-side copy fails ⇒ ADDRESS_NOT_FOUND",
                     );
 
@@ -2518,7 +3085,6 @@ mod storage_remote_tests {
         use lore_base::types::Address;
         use lore_base::types::Context;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
         use lore_revision::interface::LoreString;
         use lore_storage::immutable_store::query_one;
@@ -2539,7 +3105,7 @@ mod storage_remote_tests {
                     let path = temp_file.path().to_string_lossy().into_owned();
                     let partition = Partition::from([0xb1u8; 16]);
 
-                    let captured: Arc<Mutex<Vec<(u64, Address, LoreErrorCode)>>> =
+                    let captured: Arc<Mutex<Vec<(u64, Address, i32)>>> =
                         Arc::new(Mutex::new(Vec::new()));
                     let captured_for_cb = captured.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
@@ -2547,7 +3113,7 @@ mod storage_remote_tests {
                             captured_for_cb.lock().unwrap().push((
                                 data.id,
                                 data.address,
-                                data.error_code,
+                                data.error.error_code,
                             ));
                         }
                     }));
@@ -2576,7 +3142,7 @@ mod storage_remote_tests {
                     assert_eq!(events.len(), 1, "exactly one PUT_ITEM_COMPLETE expected");
                     let (id, address, code) = events[0];
                     assert_eq!(id, 7);
-                    assert_eq!(code, LoreErrorCode::None);
+                    assert_eq!(code, 0);
                     assert_ne!(address.hash, lore_base::types::Hash::default());
 
                     let server_match =
@@ -2609,7 +3175,6 @@ mod storage_remote_tests {
         use lore_base::types::Fragment;
         use lore_base::types::FragmentFlags;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
         use lore_revision::interface::LoreString;
 
@@ -2649,7 +3214,7 @@ mod storage_remote_tests {
                     let target_path_buf = target_dir.path().join("target");
                     let target_path = target_path_buf.to_string_lossy().into_owned();
 
-                    let captured: Arc<Mutex<Vec<(u64, Address, LoreErrorCode)>>> =
+                    let captured: Arc<Mutex<Vec<(u64, Address, i32)>>> =
                         Arc::new(Mutex::new(Vec::new()));
                     let captured_for_cb = captured.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
@@ -2657,7 +3222,7 @@ mod storage_remote_tests {
                             captured_for_cb.lock().unwrap().push((
                                 data.id,
                                 data.address,
-                                data.error_code,
+                                data.error.error_code,
                             ));
                         }
                     }));
@@ -2685,7 +3250,7 @@ mod storage_remote_tests {
                     assert_eq!(events.len(), 1, "exactly one GET_ITEM_COMPLETE expected");
                     let (id, _addr, code) = events[0];
                     assert_eq!(id, 11);
-                    assert_eq!(code, LoreErrorCode::None);
+                    assert_eq!(code, 0);
 
                     let written = std::fs::read(&target_path).expect("read target file");
                     assert_eq!(
@@ -2733,7 +3298,6 @@ mod storage_remote_tests {
         use lore_base::types::Context;
         use lore_base::types::Partition;
         use lore_revision::event::LoreBytes;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
         use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
@@ -2752,7 +3316,7 @@ mod storage_remote_tests {
                     let payload = b"bound-offline must not upload".to_vec();
                     let partition = Partition::from([0xb1u8; 16]);
 
-                    let captured: Arc<Mutex<Vec<(u64, Address, LoreErrorCode)>>> =
+                    let captured: Arc<Mutex<Vec<(u64, Address, i32)>>> =
                         Arc::new(Mutex::new(Vec::new()));
                     let captured_for_cb = captured.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
@@ -2760,7 +3324,7 @@ mod storage_remote_tests {
                             captured_for_cb.lock().unwrap().push((
                                 data.id,
                                 data.address,
-                                data.error_code,
+                                data.error.error_code,
                             ));
                         }
                     }));
@@ -2793,7 +3357,7 @@ mod storage_remote_tests {
 
                     let events = captured.lock().unwrap().clone();
                     let (_, address, code) = events[0];
-                    assert_eq!(code, LoreErrorCode::None);
+                    assert_eq!(code, 0);
 
                     let server_match =
                         query_one(&server.backend_immutable.clone(), partition, address)
@@ -2823,7 +3387,6 @@ mod storage_remote_tests {
         use lore_base::types::Fragment;
         use lore_base::types::Hash;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-bound-local".to_string());
@@ -2858,15 +3421,14 @@ mod storage_remote_tests {
                     };
                     let handle_id = open_remote_handle_with_globals(&server, bound).await;
 
-                    let captured: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> =
-                        Arc::new(Mutex::new(Vec::new()));
+                    let captured: Arc<Mutex<Vec<(u64, i32)>>> = Arc::new(Mutex::new(Vec::new()));
                     let captured_for_cb = captured.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
                         if let LoreEvent::StorageGetItemComplete(data) = event {
                             captured_for_cb
                                 .lock()
                                 .unwrap()
-                                .push((data.id, data.error_code));
+                                .push((data.id, data.error.error_code));
                         }
                     }));
 
@@ -2892,7 +3454,7 @@ mod storage_remote_tests {
                     assert_eq!(events.len(), 1, "exactly one GET_ITEM_COMPLETE expected");
                     assert_eq!(
                         events[0].1,
-                        LoreErrorCode::AddressNotFound,
+                        lore_base::error::AddressNotFound::FFI_CODE,
                         "bound-local handle must NOT fetch remote on local miss; got {:?}",
                         events[0].1,
                     );
@@ -3006,7 +3568,6 @@ mod storage_remote_tests {
         use lore::storage::get;
         use lore::storage::get::LoreStorageGetArgs;
         use lore::storage::get::LoreStorageGetItem;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-bound-offline-get".to_string());
@@ -3022,15 +3583,14 @@ mod storage_remote_tests {
                     };
                     let handle_id = open_remote_handle_with_globals(&server, bound).await;
 
-                    let captured: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> =
-                        Arc::new(Mutex::new(Vec::new()));
+                    let captured: Arc<Mutex<Vec<(u64, i32)>>> = Arc::new(Mutex::new(Vec::new()));
                     let captured_for_cb = captured.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
                         if let LoreEvent::StorageGetItemComplete(data) = event {
                             captured_for_cb
                                 .lock()
                                 .unwrap()
-                                .push((data.id, data.error_code));
+                                .push((data.id, data.error.error_code));
                         }
                     }));
                     let _ = get::get(
@@ -3051,7 +3611,7 @@ mod storage_remote_tests {
                     .await;
                     let events = captured.lock().unwrap().clone();
                     assert_eq!(events.len(), 1);
-                    assert_eq!(events[0].1, LoreErrorCode::AddressNotFound);
+                    assert_eq!(events[0].1, lore_base::error::AddressNotFound::FFI_CODE);
 
                     close_handle(handle_id).await;
                 }
@@ -3067,7 +3627,6 @@ mod storage_remote_tests {
         use lore::storage::get_metadata;
         use lore::storage::get_metadata::LoreStorageGetMetadataArgs;
         use lore::storage::get_metadata::LoreStorageGetMetadataItem;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-bound-local-getmd".to_string());
@@ -3083,15 +3642,14 @@ mod storage_remote_tests {
                     };
                     let handle_id = open_remote_handle_with_globals(&server, bound).await;
 
-                    let captured: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> =
-                        Arc::new(Mutex::new(Vec::new()));
+                    let captured: Arc<Mutex<Vec<(u64, i32)>>> = Arc::new(Mutex::new(Vec::new()));
                     let captured_for_cb = captured.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
                         if let LoreEvent::StorageGetMetadataItemComplete(data) = event {
                             captured_for_cb
                                 .lock()
                                 .unwrap()
-                                .push((data.id, data.error_code));
+                                .push((data.id, data.error.error_code));
                         }
                     }));
                     let _ = get_metadata::get_metadata(
@@ -3109,7 +3667,7 @@ mod storage_remote_tests {
                     .await;
                     let events = captured.lock().unwrap().clone();
                     assert_eq!(events.len(), 1);
-                    assert_eq!(events[0].1, LoreErrorCode::AddressNotFound);
+                    assert_eq!(events[0].1, lore_base::error::AddressNotFound::FFI_CODE);
 
                     close_handle(handle_id).await;
                 }
@@ -3127,7 +3685,6 @@ mod storage_remote_tests {
         use lore_base::types::Context;
         use lore_base::types::Hash;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-bound-remote-getmd-args".to_string());
@@ -3141,15 +3698,14 @@ mod storage_remote_tests {
                     };
                     let handle_id = open_remote_handle_with_globals(&server, bound).await;
 
-                    let captured: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> =
-                        Arc::new(Mutex::new(Vec::new()));
+                    let captured: Arc<Mutex<Vec<(u64, i32)>>> = Arc::new(Mutex::new(Vec::new()));
                     let captured_for_cb = captured.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
                         if let LoreEvent::StorageGetMetadataItemComplete(data) = event {
                             captured_for_cb
                                 .lock()
                                 .unwrap()
-                                .push((data.id, data.error_code));
+                                .push((data.id, data.error.error_code));
                         }
                     }));
                     let status = get_metadata::get_metadata(
@@ -3184,10 +3740,7 @@ mod storage_remote_tests {
                     events.sort_by_key(|(id, _)| *id);
                     assert_eq!(
                         events,
-                        vec![
-                            (1, LoreErrorCode::InvalidArguments),
-                            (2, LoreErrorCode::None),
-                        ],
+                        vec![(1, lore_base::error::InvalidArguments::FFI_CODE), (2, 0),],
                         "a remote-bound handle answers the argument checks as a local one does, \
                          without reaching the wire",
                     );
@@ -3331,7 +3884,6 @@ mod storage_remote_tests {
         use lore::storage::copy::LoreStorageCopyItem;
         use lore_base::types::Context;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
         use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
@@ -3361,11 +3913,11 @@ mod storage_remote_tests {
                     let target_partition = Partition::from([0xc6u8; 16]);
                     let target_context = Context::from([0xa6u8; 16]);
 
-                    let captured: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
+                    let captured: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
                     let captured_for_cb = captured.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
                         if let LoreEvent::StorageCopyItemComplete(data) = event {
-                            captured_for_cb.lock().unwrap().push(data.error_code);
+                            captured_for_cb.lock().unwrap().push(data.error.error_code);
                         }
                     }));
                     let status = copy::copy(
@@ -3384,7 +3936,7 @@ mod storage_remote_tests {
                     )
                     .await;
                     assert_eq!(status, 0);
-                    assert_eq!(captured.lock().unwrap()[0], LoreErrorCode::None);
+                    assert_eq!(captured.lock().unwrap()[0], 0);
                     drop(payload);
 
                     let server_match = query_one(
@@ -3423,7 +3975,6 @@ mod storage_remote_tests {
         use lore_base::types::Context;
         use lore_base::types::Fragment;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-bound-remote-get".to_string());
@@ -3460,7 +4011,7 @@ mod storage_remote_tests {
 
                     let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
                     let received_for_cb = received.clone();
-                    let outcomes: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
+                    let outcomes: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
                     let outcomes_for_cb = outcomes.clone();
                     let callback: LoreEventCallback =
                         Some(Box::new(move |event: &LoreEvent| match event {
@@ -3474,7 +4025,7 @@ mod storage_remote_tests {
                                 received_for_cb.lock().unwrap().extend_from_slice(slice);
                             }
                             LoreEvent::StorageGetItemComplete(data) => {
-                                outcomes_for_cb.lock().unwrap().push(data.error_code);
+                                outcomes_for_cb.lock().unwrap().push(data.error.error_code);
                             }
                             _ => {}
                         }));
@@ -3495,7 +4046,7 @@ mod storage_remote_tests {
                     )
                     .await;
                     assert_eq!(status, 0);
-                    assert_eq!(outcomes.lock().unwrap()[0], LoreErrorCode::None);
+                    assert_eq!(outcomes.lock().unwrap()[0], 0);
                     assert_eq!(*received.lock().unwrap(), payload_bytes);
 
                     close_handle(handle_id).await;
@@ -3517,7 +4068,6 @@ mod storage_remote_tests {
         use lore_base::types::Context;
         use lore_base::types::Hash;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-bound-remote-copy".to_string());
@@ -3531,11 +4081,11 @@ mod storage_remote_tests {
                 };
                 let handle_id = open_remote_handle_with_globals(&server, bound).await;
 
-                let captured: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
+                let captured: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
                 let captured_for_cb = captured.clone();
                 let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
                     if let LoreEvent::StorageCopyItemComplete(data) = event {
-                        captured_for_cb.lock().unwrap().push(data.error_code);
+                        captured_for_cb.lock().unwrap().push(data.error.error_code);
                     }
                 }));
                 let _ = copy::copy(
@@ -3560,7 +4110,7 @@ mod storage_remote_tests {
                 assert_eq!(events.len(), 1);
                 assert_eq!(
                     events[0],
-                    LoreErrorCode::AddressNotFound,
+                    lore_base::error::AddressNotFound::FFI_CODE,
                     "bound-remote copy must surface NotFound rather than fall through to upload",
                 );
 
@@ -3621,9 +4171,8 @@ mod storage_remote_tests {
 
     use lore_base::types::Hash;
     use lore_base::types::KeyType;
-    use lore_revision::event::LoreErrorCode;
 
-    const REMOTE_KEY_TYPE: KeyType = KeyType::BranchLatestPointer;
+    const REMOTE_KEY_TYPE: KeyType = KeyType::Untyped;
 
     fn remote_globals() -> LoreGlobalArgs {
         LoreGlobalArgs {
@@ -3640,21 +4189,20 @@ mod storage_remote_tests {
         partition: lore_base::types::Partition,
         key: Hash,
         value: Hash,
-    ) -> (i32, Vec<(u64, lore_revision::event::LoreErrorCode)>) {
+    ) -> (i32, Vec<(u64, i32)>) {
         use lore::storage::mutable_store;
         use lore::storage::mutable_store::LoreStorageMutableStoreArgs;
         use lore::storage::mutable_store::LoreStorageMutableStoreItem;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
-        let captured: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured: Arc<Mutex<Vec<(u64, i32)>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_for_cb = captured.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
             if let LoreEvent::StorageMutableStoreItemComplete(data) = event {
                 captured_for_cb
                     .lock()
                     .unwrap()
-                    .push((data.id, data.error_code));
+                    .push((data.id, data.error.error_code));
             }
         }));
         let status = mutable_store::mutable_store(
@@ -3683,21 +4231,20 @@ mod storage_remote_tests {
         globals: LoreGlobalArgs,
         partition: lore_base::types::Partition,
         key: Hash,
-    ) -> (i32, Hash, lore_revision::event::LoreErrorCode) {
+    ) -> (i32, Hash, i32) {
         use lore::storage::mutable_load;
         use lore::storage::mutable_load::LoreStorageMutableLoadArgs;
         use lore::storage::mutable_load::LoreStorageMutableLoadItem;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
-        let captured: Arc<Mutex<Vec<(Hash, LoreErrorCode)>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured: Arc<Mutex<Vec<(Hash, i32)>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_for_cb = captured.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
             if let LoreEvent::StorageMutableLoadItemComplete(data) = event {
                 captured_for_cb
                     .lock()
                     .unwrap()
-                    .push((data.value, data.error_code));
+                    .push((data.value, data.error.error_code));
             }
         }));
         let status = mutable_load::mutable_load(
@@ -3740,7 +4287,7 @@ mod storage_remote_tests {
                     )
                     .await;
                     assert_eq!(status, 0, "remote mutable store must succeed");
-                    assert_eq!(completes, vec![(1, LoreErrorCode::None)]);
+                    assert_eq!(completes, vec![(1, 0)]);
 
                     let on_server = server
                         .backend_mutable
@@ -3753,7 +4300,7 @@ mod storage_remote_tests {
                     let (load_status, loaded, code) =
                         mutable_load_via_handle(handle_id, remote_globals(), partition, key).await;
                     assert_eq!(load_status, 0);
-                    assert_eq!(code, LoreErrorCode::None);
+                    assert_eq!(code, 0);
                     assert_eq!(loaded, value);
 
                     close_handle(handle_id).await;
@@ -3791,15 +4338,14 @@ mod storage_remote_tests {
                     .await;
                     assert_eq!(status, 0);
 
-                    let captured: Arc<Mutex<Vec<(Hash, LoreErrorCode)>>> =
-                        Arc::new(Mutex::new(Vec::new()));
+                    let captured: Arc<Mutex<Vec<(Hash, i32)>>> = Arc::new(Mutex::new(Vec::new()));
                     let captured_for_cb = captured.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
                         if let LoreEvent::StorageMutableCompareAndSwapItemComplete(data) = event {
                             captured_for_cb
                                 .lock()
                                 .unwrap()
-                                .push((data.previous, data.error_code));
+                                .push((data.previous, data.error.error_code));
                         }
                     }));
                     let cas_status = mutable_compare_and_swap::mutable_compare_and_swap(
@@ -3822,7 +4368,7 @@ mod storage_remote_tests {
                     .await;
                     assert_eq!(cas_status, 0, "remote CAS must succeed");
                     let (previous, code) = captured.lock().unwrap()[0];
-                    assert_eq!(code, LoreErrorCode::None);
+                    assert_eq!(code, 0);
                     assert_eq!(
                         previous, current,
                         "previous must equal the matched expected"
@@ -3857,7 +4403,7 @@ mod storage_remote_tests {
                     let (status, value, code) =
                         mutable_load_via_handle(handle_id, remote_globals(), partition, key).await;
                     assert_ne!(status, 0);
-                    assert_eq!(code, LoreErrorCode::AddressNotFound);
+                    assert_eq!(code, lore_base::error::NotFound::FFI_CODE);
                     assert_eq!(value, Hash::default());
 
                     close_handle(handle_id).await;
@@ -3888,7 +4434,7 @@ mod storage_remote_tests {
                     )
                     .await;
                     assert_eq!(status, 0);
-                    assert_eq!(completes, vec![(1, LoreErrorCode::None)]);
+                    assert_eq!(completes, vec![(1, 0)]);
 
                     let server_result = server
                         .backend_mutable
@@ -3907,11 +4453,11 @@ mod storage_remote_tests {
                         key,
                     )
                     .await;
-                    assert_eq!(local_code, LoreErrorCode::None);
+                    assert_eq!(local_code, 0);
                     assert_eq!(local_value, value);
                     let (_s2, _v, remote_code) =
                         mutable_load_via_handle(handle_id, remote_globals(), partition, key).await;
-                    assert_eq!(remote_code, LoreErrorCode::AddressNotFound);
+                    assert_eq!(remote_code, lore_base::error::NotFound::FFI_CODE);
 
                     close_handle(handle_id).await;
                 }
@@ -3936,7 +4482,7 @@ mod storage_remote_tests {
                     let partition = lore_base::types::Partition::from([0xc1u8; 16]);
 
                     let entries: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
-                    let complete: Arc<Mutex<Option<LoreErrorCode>>> = Arc::new(Mutex::new(None));
+                    let complete: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
                     let entries_for_cb = entries.clone();
                     let complete_for_cb = complete.clone();
                     let callback: LoreEventCallback =
@@ -3945,7 +4491,7 @@ mod storage_remote_tests {
                                 *entries_for_cb.lock().unwrap() += 1;
                             }
                             LoreEvent::StorageMutableListItemComplete(data) => {
-                                *complete_for_cb.lock().unwrap() = Some(data.error_code);
+                                *complete_for_cb.lock().unwrap() = Some(data.error.error_code);
                             }
                             _ => {}
                         }));
@@ -4049,7 +4595,6 @@ mod storage_remote_tests {
         use lore_base::types::Context;
         use lore_base::types::Hash;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-get-resolved-miss".to_string());
@@ -4066,7 +4611,7 @@ mod storage_remote_tests {
 
                 let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
                 let received_for_cb = received.clone();
-                let outcomes: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> =
+                let outcomes: Arc<Mutex<Vec<(u64, i32)>>> =
                     Arc::new(Mutex::new(Vec::new()));
                 let outcomes_for_cb = outcomes.clone();
                 let callback: LoreEventCallback =
@@ -4084,7 +4629,7 @@ mod storage_remote_tests {
                             outcomes_for_cb
                                 .lock()
                                 .unwrap()
-                                .push((data.id, data.error_code));
+                                .push((data.id, data.error.error_code));
                         }
                         _ => {}
                     }));
@@ -4098,6 +4643,7 @@ mod storage_remote_tests {
                         context: Context::default(),
                         local_cache: 0,
                         streaming: 0,
+                        fragments: 0,
                     },
                     LoreStorageGetResolvedItem {
                         data_out: Default::default(),
@@ -4107,6 +4653,7 @@ mod storage_remote_tests {
                         context: Context::default(),
                         local_cache: 0,
                         streaming: 0,
+                        fragments: 0,
                     },
                 ];
                 get_resolved::get_resolved(
@@ -4128,12 +4675,12 @@ mod storage_remote_tests {
                 );
                 assert_eq!(
                     outcomes[0],
-                    (1, LoreErrorCode::AddressNotFound),
+                    (1, lore_base::error::AddressNotFound::FFI_CODE),
                     "the unseeded key must report a miss"
                 );
                 assert_eq!(
                     outcomes[1],
-                    (2, LoreErrorCode::None),
+                    (2, 0),
                     "the seeded key must still be served after the miss"
                 );
 
@@ -4143,7 +4690,7 @@ mod storage_remote_tests {
                     "the surviving item must deliver its payload"
                 );
 
-                let followup: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> =
+                let followup: Arc<Mutex<Vec<(u64, i32)>>> =
                     Arc::new(Mutex::new(Vec::new()));
                 let followup_for_cb = followup.clone();
                 let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
@@ -4151,7 +4698,7 @@ mod storage_remote_tests {
                         followup_for_cb
                             .lock()
                             .unwrap()
-                            .push((data.id, data.error_code));
+                            .push((data.id, data.error.error_code));
                     }
                 }));
                 get_resolved::get_resolved(
@@ -4166,6 +4713,7 @@ mod storage_remote_tests {
                             context: Context::default(),
                             local_cache: 0,
                             streaming: 0,
+                            fragments: 0,
                         }]),
                     },
                     callback,
@@ -4175,7 +4723,7 @@ mod storage_remote_tests {
                 let followup = followup.lock().unwrap().clone();
                 assert_eq!(
                     followup,
-                    vec![(3, LoreErrorCode::None)],
+                    vec![(3, 0)],
                     "the session must still serve resolves after an earlier miss"
                 );
 
@@ -4203,7 +4751,6 @@ mod storage_remote_tests {
         use lore_base::types::KeyType;
         use lore_base::types::Partition;
         use lore_revision::event::LoreBytes;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-put-get-resolved".to_string());
@@ -4224,7 +4771,7 @@ mod storage_remote_tests {
                             put_for_cb.lock().unwrap().push((
                                 data.id,
                                 data.address,
-                                data.error_code,
+                                data.error.error_code,
                                 data.stored_local,
                                 data.stored_remote,
                             ));
@@ -4257,7 +4804,7 @@ mod storage_remote_tests {
                     let put_outcomes = put_outcomes.lock().unwrap().clone();
                     assert_eq!(put_outcomes.len(), 1);
                     let (_, published_address, code, stored_local, stored_remote) = put_outcomes[0];
-                    assert_eq!(code, LoreErrorCode::None);
+                    assert_eq!(code, 0);
                     assert_eq!(
                         stored_remote, 1,
                         "remote_write=1 against a live server must report remote placement"
@@ -4283,7 +4830,7 @@ mod storage_remote_tests {
                     let reader_handle = open_remote_handle(&server).await;
                     let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
                     let received_for_cb = received.clone();
-                    let outcomes: Arc<Mutex<Vec<(u64, Address, LoreErrorCode)>>> =
+                    let outcomes: Arc<Mutex<Vec<(u64, Address, i32)>>> =
                         Arc::new(Mutex::new(Vec::new()));
                     let outcomes_for_cb = outcomes.clone();
                     let callback: LoreEventCallback =
@@ -4301,7 +4848,7 @@ mod storage_remote_tests {
                                 outcomes_for_cb.lock().unwrap().push((
                                     data.id,
                                     data.address,
-                                    data.error_code,
+                                    data.error.error_code,
                                 ));
                             }
                             _ => {}
@@ -4321,6 +4868,7 @@ mod storage_remote_tests {
                                 context: Context::default(),
                                 local_cache: 0,
                                 streaming: 0,
+                                fragments: 0,
                             }]),
                         },
                         callback,
@@ -4329,7 +4877,7 @@ mod storage_remote_tests {
 
                     let outcomes = outcomes.lock().unwrap().clone();
                     assert_eq!(outcomes.len(), 1);
-                    assert_eq!(outcomes[0].2, LoreErrorCode::None, "resolve must succeed");
+                    assert_eq!(outcomes[0].2, 0, "resolve must succeed");
                     assert_eq!(
                         outcomes[0].1, published_address,
                         "get_resolved must report the address put_resolved published"
@@ -4363,7 +4911,6 @@ mod storage_remote_tests {
         use lore_base::types::KeyType;
         use lore_base::types::Partition;
         use lore_revision::event::LoreBytes;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-put-resolved-delete".to_string());
@@ -4388,13 +4935,12 @@ mod storage_remote_tests {
                     };
 
                     let put_once = async |item: LoreStoragePutResolvedItem| {
-                        let codes: Arc<Mutex<Vec<LoreErrorCode>>> =
-                            Arc::new(Mutex::new(Vec::new()));
+                        let codes: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
                         let codes_for_cb = codes.clone();
                         let callback: LoreEventCallback =
                             Some(Box::new(move |event: &LoreEvent| {
                                 if let LoreEvent::StoragePutItemComplete(data) = event {
-                                    codes_for_cb.lock().unwrap().push(data.error_code);
+                                    codes_for_cb.lock().unwrap().push(data.error.error_code);
                                 }
                             }));
                         put_resolved::put_resolved(
@@ -4407,17 +4953,16 @@ mod storage_remote_tests {
                         )
                         .await;
                         let codes = codes.lock().unwrap().clone();
-                        assert_eq!(codes, vec![LoreErrorCode::None]);
+                        assert_eq!(codes, vec![0]);
                     };
 
                     let resolve_once = async || {
-                        let codes: Arc<Mutex<Vec<LoreErrorCode>>> =
-                            Arc::new(Mutex::new(Vec::new()));
+                        let codes: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
                         let codes_for_cb = codes.clone();
                         let callback: LoreEventCallback =
                             Some(Box::new(move |event: &LoreEvent| {
                                 if let LoreEvent::StorageGetItemComplete(data) = event {
-                                    codes_for_cb.lock().unwrap().push(data.error_code);
+                                    codes_for_cb.lock().unwrap().push(data.error.error_code);
                                 }
                             }));
                         get_resolved::get_resolved(
@@ -4432,6 +4977,7 @@ mod storage_remote_tests {
                                     context: Context::default(),
                                     local_cache: 0,
                                     streaming: 0,
+                                    fragments: 0,
                                 }]),
                             },
                             callback,
@@ -4447,11 +4993,7 @@ mod storage_remote_tests {
                         len: payload.len(),
                     }))
                     .await;
-                    assert_eq!(
-                        resolve_once().await,
-                        LoreErrorCode::None,
-                        "the key resolves once published"
-                    );
+                    assert_eq!(resolve_once().await, 0, "the key resolves once published");
 
                     put_once(publish(LoreBytes {
                         ptr: std::ptr::null(),
@@ -4461,7 +5003,7 @@ mod storage_remote_tests {
 
                     assert_eq!(
                         resolve_once().await,
-                        LoreErrorCode::AddressNotFound,
+                        lore_base::error::AddressNotFound::FFI_CODE,
                         "the key must stop resolving once deleted"
                     );
                     assert!(
@@ -4493,7 +5035,6 @@ mod storage_remote_tests {
         use lore_base::types::KeyType;
         use lore_base::types::Partition;
         use lore_revision::event::LoreBytes;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-put-resolved-local".to_string());
@@ -4507,13 +5048,12 @@ mod storage_remote_tests {
 
                     let handle_id = open_remote_handle(&server).await;
 
-                    let outcomes: Arc<Mutex<Vec<(LoreErrorCode, u8, u8)>>> =
-                        Arc::new(Mutex::new(Vec::new()));
+                    let outcomes: Arc<Mutex<Vec<(i32, u8, u8)>>> = Arc::new(Mutex::new(Vec::new()));
                     let outcomes_for_cb = outcomes.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
                         if let LoreEvent::StoragePutItemComplete(data) = event {
                             outcomes_for_cb.lock().unwrap().push((
-                                data.error_code,
+                                data.error.error_code,
                                 data.stored_local,
                                 data.stored_remote,
                             ));
@@ -4544,7 +5084,7 @@ mod storage_remote_tests {
 
                     assert_eq!(
                         outcomes.lock().unwrap().clone(),
-                        vec![(LoreErrorCode::None, 1, 0)],
+                        vec![(0, 1, 0)],
                         "a local-only publish must report local placement and not remote"
                     );
 
@@ -4588,7 +5128,6 @@ mod storage_remote_tests {
         use lore_base::types::Context;
         use lore_base::types::KeyType;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-get-resolved-cache".to_string());
@@ -4604,15 +5143,14 @@ mod storage_remote_tests {
 
                     let handle_id = open_remote_handle(&server).await;
 
-                    let outcomes: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> =
-                        Arc::new(Mutex::new(Vec::new()));
+                    let outcomes: Arc<Mutex<Vec<(u64, i32)>>> = Arc::new(Mutex::new(Vec::new()));
                     let outcomes_for_cb = outcomes.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
                         if let LoreEvent::StorageGetItemComplete(data) = event {
                             outcomes_for_cb
                                 .lock()
                                 .unwrap()
-                                .push((data.id, data.error_code));
+                                .push((data.id, data.error.error_code));
                         }
                     }));
 
@@ -4625,6 +5163,7 @@ mod storage_remote_tests {
                             context: Context::default(),
                             local_cache: 1,
                             streaming: 0,
+                            fragments: 0,
                         },
                         LoreStorageGetResolvedItem {
                             data_out: Default::default(),
@@ -4634,6 +5173,7 @@ mod storage_remote_tests {
                             context: Context::default(),
                             local_cache: 0,
                             streaming: 0,
+                            fragments: 0,
                         },
                     ];
                     get_resolved::get_resolved(
@@ -4649,9 +5189,7 @@ mod storage_remote_tests {
                     let outcomes = outcomes.lock().unwrap().clone();
                     assert_eq!(outcomes.len(), 2);
                     assert!(
-                        outcomes
-                            .iter()
-                            .all(|(_, code)| *code == LoreErrorCode::None),
+                        outcomes.iter().all(|(_, code)| *code == 0),
                         "both resolves must succeed against the remote: {outcomes:?}"
                     );
 
@@ -4704,7 +5242,6 @@ mod storage_remote_tests {
         use lore_base::types::KeyType;
         use lore_base::types::Partition;
         use lore_revision::event::LoreBytes;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-shared-content".to_string());
@@ -4722,12 +5259,13 @@ mod storage_remote_tests {
                     let handle_id = open_remote_handle(&server).await;
 
                     for (n, key) in keys.iter().enumerate() {
-                        let outs: Arc<Mutex<Vec<(LoreErrorCode, u8)>>> =
-                            Arc::new(Mutex::new(Vec::new()));
+                        let outs: Arc<Mutex<Vec<(i32, u8)>>> = Arc::new(Mutex::new(Vec::new()));
                         let cb = outs.clone();
                         let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
                             if let LoreEvent::StoragePutItemComplete(d) = e {
-                                cb.lock().unwrap().push((d.error_code, d.stored_remote));
+                                cb.lock()
+                                    .unwrap()
+                                    .push((d.error.error_code, d.stored_remote));
                             }
                         }));
                         put_resolved::put_resolved(
@@ -4753,7 +5291,7 @@ mod storage_remote_tests {
                         .await;
                         assert_eq!(
                             outs.lock().unwrap().clone(),
-                            vec![(LoreErrorCode::None, 1)],
+                            vec![(0, 1)],
                             "publish {n} must succeed and report remote placement"
                         );
 
@@ -4769,11 +5307,11 @@ mod storage_remote_tests {
                     }
 
                     let reader = open_remote_handle(&server).await;
-                    let codes: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
+                    let codes: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
                     let cb = codes.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
                         if let LoreEvent::StorageGetItemComplete(d) = e {
-                            cb.lock().unwrap().push(d.error_code);
+                            cb.lock().unwrap().push(d.error.error_code);
                         }
                     }));
                     get_resolved::get_resolved(
@@ -4788,6 +5326,7 @@ mod storage_remote_tests {
                                 context: Context::default(),
                                 local_cache: 0,
                                 streaming: 0,
+                                fragments: 0,
                             }]),
                         },
                         callback,
@@ -4795,7 +5334,7 @@ mod storage_remote_tests {
                     .await;
                     assert_eq!(
                         codes.lock().unwrap().clone(),
-                        vec![LoreErrorCode::None],
+                        vec![0],
                         "the second key must resolve for a client that never published it"
                     );
 
@@ -4821,7 +5360,6 @@ mod storage_remote_tests {
         use lore_base::types::KeyType;
         use lore_base::types::Partition;
         use lore_revision::event::LoreBytes;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-failed-upload".to_string());
@@ -4839,13 +5377,12 @@ mod storage_remote_tests {
                     // and a signalled-but-still-listening one answers it.
                     server.shutdown().await;
 
-                    let outs: Arc<Mutex<Vec<(LoreErrorCode, u8, u8)>>> =
-                        Arc::new(Mutex::new(Vec::new()));
+                    let outs: Arc<Mutex<Vec<(i32, u8, u8)>>> = Arc::new(Mutex::new(Vec::new()));
                     let cb = outs.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
                         if let LoreEvent::StoragePutItemComplete(d) = e {
                             cb.lock().unwrap().push((
-                                d.error_code,
+                                d.error.error_code,
                                 d.stored_local,
                                 d.stored_remote,
                             ));
@@ -4885,8 +5422,7 @@ mod storage_remote_tests {
                         "the local write still succeeded, so the content is held locally"
                     );
                     assert_eq!(
-                        code,
-                        LoreErrorCode::None,
+                        code, 0,
                         "a failed upload is not an error; `put`'s remote write is best-effort"
                     );
                     assert!(
@@ -4929,7 +5465,6 @@ mod storage_remote_tests {
         use lore_base::types::KeyType;
         use lore_base::types::Partition;
         use lore_revision::event::LoreBytes;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         const CHUNK: u64 = 64 * 1024;
@@ -4943,11 +5478,13 @@ mod storage_remote_tests {
                 let payload: Vec<u8> = (0..(CHUNK as u32 * 6)).map(|i| (i % 251) as u8).collect();
                 let handle_id = open_remote_handle(&server).await;
 
-                let outs: Arc<Mutex<Vec<(LoreErrorCode, u8)>>> = Arc::new(Mutex::new(Vec::new()));
+                let outs: Arc<Mutex<Vec<(i32, u8)>>> = Arc::new(Mutex::new(Vec::new()));
                 let cb = outs.clone();
                 let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
                     if let LoreEvent::StoragePutItemComplete(d) = e {
-                        cb.lock().unwrap().push((d.error_code, d.stored_remote));
+                        cb.lock()
+                            .unwrap()
+                            .push((d.error.error_code, d.stored_remote));
                     }
                 }));
                 put_resolved::put_resolved(
@@ -4976,8 +5513,7 @@ mod storage_remote_tests {
                 assert_eq!(outcomes.len(), 1, "one item, one completion");
                 let (code, stored_remote) = outcomes[0];
                 assert_eq!(
-                    code,
-                    LoreErrorCode::None,
+                    code, 0,
                     "a failed upload still leaves a good local write, as `put` contracts",
                 );
                 assert_eq!(
@@ -5019,7 +5555,6 @@ mod storage_remote_tests {
         use lore_base::types::KeyType;
         use lore_base::types::Partition;
         use lore_revision::event::LoreBytes;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-fragmented-resolve".to_string());
@@ -5032,12 +5567,13 @@ mod storage_remote_tests {
                     let payload: Vec<u8> = (0..(512 * 1024u32)).map(|i| (i % 251) as u8).collect();
                     let handle_id = open_remote_handle(&server).await;
 
-                    let outs: Arc<Mutex<Vec<(LoreErrorCode, u8)>>> =
-                        Arc::new(Mutex::new(Vec::new()));
+                    let outs: Arc<Mutex<Vec<(i32, u8)>>> = Arc::new(Mutex::new(Vec::new()));
                     let cb = outs.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
                         if let LoreEvent::StoragePutItemComplete(d) = e {
-                            cb.lock().unwrap().push((d.error_code, d.stored_remote));
+                            cb.lock()
+                                .unwrap()
+                                .push((d.error.error_code, d.stored_remote));
                         }
                     }));
                     put_resolved::put_resolved(
@@ -5063,7 +5599,7 @@ mod storage_remote_tests {
                     .await;
                     assert_eq!(
                         outs.lock().unwrap().clone(),
-                        vec![(LoreErrorCode::None, 1)],
+                        vec![(0, 1)],
                         "a fragmented publish must succeed and report the whole tree remote"
                     );
 
@@ -5080,7 +5616,7 @@ mod storage_remote_tests {
                     let reader = open_remote_handle(&server).await;
                     let got: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
                     let got_cb = got.clone();
-                    let codes: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
+                    let codes: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
                     let codes_cb = codes.clone();
                     let callback: LoreEventCallback =
                         Some(Box::new(move |e: &LoreEvent| match e {
@@ -5094,7 +5630,7 @@ mod storage_remote_tests {
                                 got_cb.lock().unwrap().extend_from_slice(slice);
                             }
                             LoreEvent::StorageGetItemComplete(d) => {
-                                codes_cb.lock().unwrap().push(d.error_code);
+                                codes_cb.lock().unwrap().push(d.error.error_code);
                             }
                             _ => {}
                         }));
@@ -5110,12 +5646,13 @@ mod storage_remote_tests {
                                 context: Context::default(),
                                 local_cache: 0,
                                 streaming: 0,
+                                fragments: 0,
                             }]),
                         },
                         callback,
                     )
                     .await;
-                    assert_eq!(codes.lock().unwrap().clone(), vec![LoreErrorCode::None]);
+                    assert_eq!(codes.lock().unwrap().clone(), vec![0]);
                     assert_eq!(
                         got.lock().unwrap().len(),
                         payload.len(),
@@ -5146,7 +5683,6 @@ mod storage_remote_tests {
         use lore_base::types::Hash;
         use lore_base::types::Partition;
         use lore_revision::event::LoreBytes;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-resolve-streaming".to_string());
@@ -5159,12 +5695,11 @@ mod storage_remote_tests {
                     let payload: Vec<u8> = (0..(512 * 1024u32)).map(|i| (i % 251) as u8).collect();
                     let handle_id = open_remote_handle(&server).await;
 
-                    let put_codes: Arc<Mutex<Vec<LoreErrorCode>>> =
-                        Arc::new(Mutex::new(Vec::new()));
+                    let put_codes: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
                     let cb = put_codes.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
                         if let LoreEvent::StoragePutItemComplete(d) = e {
-                            cb.lock().unwrap().push(d.error_code);
+                            cb.lock().unwrap().push(d.error.error_code);
                         }
                     }));
                     put_resolved::put_resolved(
@@ -5188,14 +5723,14 @@ mod storage_remote_tests {
                         callback,
                     )
                     .await;
-                    assert_eq!(put_codes.lock().unwrap().clone(), vec![LoreErrorCode::None]);
+                    assert_eq!(put_codes.lock().unwrap().clone(), vec![0]);
 
                     let reader = open_remote_handle(&server).await;
                     let chunks: StreamChunks = Arc::new(Mutex::new(Vec::new()));
                     let chunks_cb = chunks.clone();
                     let header: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
                     let header_cb = header.clone();
-                    let codes: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
+                    let codes: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
                     let codes_cb = codes.clone();
                     let callback: LoreEventCallback =
                         Some(Box::new(move |e: &LoreEvent| match e {
@@ -5212,7 +5747,7 @@ mod storage_remote_tests {
                                 chunks_cb.lock().unwrap().push((d.offset, slice.to_vec()));
                             }
                             LoreEvent::StorageGetItemComplete(d) => {
-                                codes_cb.lock().unwrap().push(d.error_code);
+                                codes_cb.lock().unwrap().push(d.error.error_code);
                             }
                             _ => {}
                         }));
@@ -5228,13 +5763,14 @@ mod storage_remote_tests {
                                 context: Context::default(),
                                 local_cache: 0,
                                 streaming: 1,
+                                fragments: 0,
                             }]),
                         },
                         callback,
                     )
                     .await;
 
-                    assert_eq!(codes.lock().unwrap().clone(), vec![LoreErrorCode::None]);
+                    assert_eq!(codes.lock().unwrap().clone(), vec![0]);
                     assert_eq!(
                         header.lock().unwrap().clone(),
                         vec![payload.len() as u64],
@@ -5258,6 +5794,206 @@ mod storage_remote_tests {
                         assembled, payload,
                         "streamed bytes must match what was published"
                     );
+
+                    close_handle(reader).await;
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// What one get-resolved item with `fragments` set delivered: the header's content
+    /// size, the item's error code, each `GET_FRAGMENT` as offset, fragment and payload, and how
+    /// many `GET_DATA` events arrived beside them.
+    #[derive(Default)]
+    struct FragmentRead {
+        size_content: Vec<u64>,
+        codes: Vec<i32>,
+        leaves: Vec<(u64, lore_base::types::Fragment, Vec<u8>)>,
+        data_events: usize,
+    }
+
+    async fn put_resolved_content(
+        handle_id: u64,
+        partition: lore_base::types::Partition,
+        key: lore_base::types::Hash,
+        content: &[u8],
+    ) {
+        use lore::storage::put_resolved;
+        use lore::storage::put_resolved::LoreStoragePutResolvedArgs;
+        use lore::storage::put_resolved::LoreStoragePutResolvedItem;
+        use lore_base::types::Context;
+        use lore_revision::event::LoreBytes;
+        use lore_revision::interface::LoreArray;
+
+        let codes: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+        let codes_cb = codes.clone();
+        let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
+            if let LoreEvent::StoragePutItemComplete(d) = e {
+                codes_cb.lock().unwrap().push(d.error.error_code);
+            }
+        }));
+        put_resolved::put_resolved(
+            LoreGlobalArgs::default(),
+            LoreStoragePutResolvedArgs {
+                handle: lore::storage::handle::LoreStore { handle_id },
+                items: LoreArray::from_vec(vec![LoreStoragePutResolvedItem {
+                    id: 1,
+                    partition,
+                    key,
+                    context: Context::default(),
+                    data: LoreBytes {
+                        ptr: content.as_ptr().cast(),
+                        len: content.len(),
+                    },
+                    remote_write: 1,
+                    local_cache: 0,
+                    fixed_size_chunk: 64 * 1024,
+                }]),
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(codes.lock().unwrap().clone(), vec![0]);
+    }
+
+    async fn read_fragments(
+        handle_id: u64,
+        partition: lore_base::types::Partition,
+        key: lore_base::types::Hash,
+        data_out: lore_revision::event::LoreBytesMut,
+    ) -> FragmentRead {
+        use lore::storage::get_resolved;
+        use lore::storage::get_resolved::LoreStorageGetResolvedArgs;
+        use lore::storage::get_resolved::LoreStorageGetResolvedItem;
+        use lore_base::types::Context;
+        use lore_revision::interface::LoreArray;
+
+        let read: Arc<Mutex<FragmentRead>> = Arc::default();
+        let read_cb = read.clone();
+        let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
+            let mut read = read_cb.lock().unwrap();
+            match e {
+                LoreEvent::StorageGetHeader(d) => read.size_content.push(d.size_content),
+                LoreEvent::StorageGetData(_) => read.data_events += 1,
+                LoreEvent::StorageGetFragment(d) => {
+                    // Safety: the view is valid for the length given during the callback.
+                    let payload = unsafe {
+                        std::slice::from_raw_parts(d.bytes.ptr.cast::<u8>(), d.bytes.len)
+                    };
+                    read.leaves.push((d.offset, d.fragment, payload.to_vec()));
+                }
+                LoreEvent::StorageGetItemComplete(d) => read.codes.push(d.error.error_code),
+                _ => {}
+            }
+        }));
+        get_resolved::get_resolved(
+            LoreGlobalArgs::default(),
+            LoreStorageGetResolvedArgs {
+                handle: lore::storage::handle::LoreStore { handle_id },
+                items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                    data_out,
+                    id: 2,
+                    partition,
+                    key,
+                    context: Context::default(),
+                    local_cache: 0,
+                    streaming: 0,
+                    fragments: 1,
+                }]),
+            },
+            callback,
+        )
+        .await;
+        std::mem::take(&mut *read.lock().unwrap())
+    }
+
+    /// Bytes nothing compresses: splitmix64 over a counter leaves no repetition for an encoder to
+    /// find.
+    fn incompressible(length: u64) -> Vec<u8> {
+        (0..length)
+            .map(|i| {
+                let mut v = i.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                v = (v ^ (v >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                v = (v ^ (v >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                (v ^ (v >> 31)) as u8
+            })
+            .collect()
+    }
+
+    /// `fragments` delivers each leaf in content order with its fragment and its payload as stored:
+    /// zstd leaves compressed, a leaf stored uncompressed as it is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_resolved_fragments_arrive_as_stored() -> TestResult {
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_storage::FragmentFlags;
+
+        let execution = setup_execution("storage-remote-resolve-fragments".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = Partition::from([0xdau8; 16]);
+                    let fragmented = Hash::hash_buffer(b"fragmented-key");
+                    let single = Hash::hash_buffer(b"single-leaf-key");
+                    let compressible: Vec<u8> =
+                        (0..(512 * 1024u32)).map(|i| (i % 251) as u8).collect();
+                    let incompressible = incompressible(48 * 1024);
+                    let handle_id = open_remote_handle(&server).await;
+                    put_resolved_content(handle_id, partition, fragmented, &compressible).await;
+                    put_resolved_content(handle_id, partition, single, &incompressible).await;
+                    let reader = open_remote_handle(&server).await;
+
+                    let read =
+                        read_fragments(reader, partition, fragmented, Default::default()).await;
+                    assert_eq!(read.codes, vec![0]);
+                    assert_eq!(read.size_content, vec![compressible.len() as u64]);
+                    assert_eq!(read.data_events, 0, "fragments replace GET_DATA");
+                    assert_eq!(read.leaves.len(), 8, "one fragment per 64 KiB leaf");
+                    let mut expected_offset = 0u64;
+                    for (offset, fragment, payload) in &read.leaves {
+                        assert_eq!(*offset, expected_offset, "offsets count content");
+                        assert_eq!(
+                            fragment.flags & FragmentFlags::PayloadCompressed,
+                            FragmentFlags::PayloadCompressedZstd.bits(),
+                            "a leaf stored with zstd arrives as stored"
+                        );
+                        assert_eq!(payload.len(), fragment.size_payload as usize);
+                        assert!(payload.len() < fragment.size_content as usize);
+                        let (_, content) = lore_storage::decompress(*fragment, payload).unwrap();
+                        let start = *offset as usize;
+                        let end = start + fragment.size_content as usize;
+                        assert_eq!(content.as_ref(), &compressible[start..end]);
+                        expected_offset += fragment.size_content;
+                    }
+                    assert_eq!(expected_offset, compressible.len() as u64);
+
+                    let read = read_fragments(reader, partition, single, Default::default()).await;
+                    assert_eq!(read.codes, vec![0]);
+                    assert_eq!(read.leaves.len(), 1);
+                    let (offset, fragment, payload) = &read.leaves[0];
+                    assert_eq!(*offset, 0);
+                    assert_eq!(
+                        fragment.flags & FragmentFlags::PayloadCompressed,
+                        0,
+                        "a leaf stored uncompressed arrives as stored"
+                    );
+                    assert_eq!(payload, &incompressible);
+
+                    let mut buffer = vec![0u8; incompressible.len()];
+                    let data_out = lore_revision::event::LoreBytesMut {
+                        ptr: buffer.as_mut_ptr().cast(),
+                        len: buffer.len(),
+                    };
+                    let read = read_fragments(reader, partition, single, data_out).await;
+                    assert_eq!(
+                        read.codes,
+                        vec![lore_base::error::InvalidArguments::FFI_CODE],
+                        "fragment delivery has no caller-buffer form"
+                    );
+                    assert!(read.leaves.is_empty());
 
                     close_handle(reader).await;
                     close_handle(handle_id).await;
@@ -5301,7 +6037,6 @@ mod storage_remote_tests {
         use lore_base::types::Hash;
         use lore_base::types::KeyType;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-file-resolved-round-trip".to_string());
@@ -5323,7 +6058,7 @@ mod storage_remote_tests {
                             put_for_cb.lock().unwrap().push((
                                 data.id,
                                 data.address,
-                                data.error_code,
+                                data.error.error_code,
                                 data.stored_local,
                                 data.stored_remote,
                             ));
@@ -5354,7 +6089,7 @@ mod storage_remote_tests {
                     assert_eq!(put_outcomes.len(), 1);
                     let (_, published_address, code, _stored_local, stored_remote) =
                         put_outcomes[0];
-                    assert_eq!(code, LoreErrorCode::None);
+                    assert_eq!(code, 0);
                     assert_eq!(
                         stored_remote, 1,
                         "remote_write=1 against a live server must report remote placement"
@@ -5375,7 +6110,7 @@ mod storage_remote_tests {
 
                     let reader_handle = open_remote_handle(&server).await;
                     let (_target_guard, target) = temp_file("target", None);
-                    let outcomes: Arc<Mutex<Vec<(u64, Address, LoreErrorCode)>>> =
+                    let outcomes: Arc<Mutex<Vec<(u64, Address, i32)>>> =
                         Arc::new(Mutex::new(Vec::new()));
                     let outcomes_for_cb = outcomes.clone();
                     let data_events = Arc::new(Mutex::new(0usize));
@@ -5389,7 +6124,7 @@ mod storage_remote_tests {
                                 outcomes_for_cb.lock().unwrap().push((
                                     data.id,
                                     data.address,
-                                    data.error_code,
+                                    data.error.error_code,
                                 ));
                             }
                             _ => {}
@@ -5419,7 +6154,7 @@ mod storage_remote_tests {
 
                     let outcomes = outcomes.lock().unwrap().clone();
                     assert_eq!(outcomes.len(), 1);
-                    assert_eq!(outcomes[0].2, LoreErrorCode::None, "resolve must succeed");
+                    assert_eq!(outcomes[0].2, 0, "resolve must succeed");
                     assert_eq!(
                         outcomes[0].1, published_address,
                         "get_file_resolved must report the address put_file_resolved published"
@@ -5459,7 +6194,6 @@ mod storage_remote_tests {
         use lore_base::types::Hash;
         use lore_base::types::KeyType;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-file-resolved-fragmented".to_string());
@@ -5474,12 +6208,13 @@ mod storage_remote_tests {
 
                     let handle_id = open_remote_handle(&server).await;
 
-                    let outs: Arc<Mutex<Vec<(LoreErrorCode, u8)>>> =
-                        Arc::new(Mutex::new(Vec::new()));
+                    let outs: Arc<Mutex<Vec<(i32, u8)>>> = Arc::new(Mutex::new(Vec::new()));
                     let cb = outs.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
                         if let LoreEvent::StoragePutItemComplete(d) = e {
-                            cb.lock().unwrap().push((d.error_code, d.stored_remote));
+                            cb.lock()
+                                .unwrap()
+                                .push((d.error.error_code, d.stored_remote));
                         }
                     }));
                     put_file_resolved::put_file_resolved(
@@ -5502,7 +6237,7 @@ mod storage_remote_tests {
                     .await;
                     assert_eq!(
                         outs.lock().unwrap().clone(),
-                        vec![(LoreErrorCode::None, 1)],
+                        vec![(0, 1)],
                         "a fragmented file publish must succeed and report the whole tree remote"
                     );
 
@@ -5518,11 +6253,11 @@ mod storage_remote_tests {
 
                     let reader = open_remote_handle(&server).await;
                     let (_target_guard, target) = temp_file("fragmented-target", None);
-                    let codes: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
+                    let codes: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
                     let codes_cb = codes.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
                         if let LoreEvent::StorageGetItemComplete(d) = e {
-                            codes_cb.lock().unwrap().push(d.error_code);
+                            codes_cb.lock().unwrap().push(d.error.error_code);
                         }
                     }));
                     get_file_resolved::get_file_resolved(
@@ -5543,7 +6278,7 @@ mod storage_remote_tests {
                         callback,
                     )
                     .await;
-                    assert_eq!(codes.lock().unwrap().clone(), vec![LoreErrorCode::None]);
+                    assert_eq!(codes.lock().unwrap().clone(), vec![0]);
 
                     let written = std::fs::read(&target).expect("read target file");
                     assert_eq!(
@@ -5575,7 +6310,6 @@ mod storage_remote_tests {
         use lore_base::types::Context;
         use lore_base::types::Hash;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-file-resolved-range".to_string());
@@ -5589,11 +6323,11 @@ mod storage_remote_tests {
                     let (_source_guard, source) = temp_file("range", Some(&payload));
 
                     let handle_id = open_remote_handle(&server).await;
-                    let codes: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
+                    let codes: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
                     let codes_cb = codes.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
                         if let LoreEvent::StoragePutItemComplete(d) = e {
-                            codes_cb.lock().unwrap().push(d.error_code);
+                            codes_cb.lock().unwrap().push(d.error.error_code);
                         }
                     }));
                     put_file_resolved::put_file_resolved(
@@ -5614,17 +6348,17 @@ mod storage_remote_tests {
                         callback,
                     )
                     .await;
-                    assert_eq!(codes.lock().unwrap().clone(), vec![LoreErrorCode::None]);
+                    assert_eq!(codes.lock().unwrap().clone(), vec![0]);
 
                     let reader = open_remote_handle(&server).await;
                     let (_target_guard, target) = temp_file("range-target", None);
                     let start = 100_000usize;
                     let length = 300_000usize;
-                    let codes: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
+                    let codes: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
                     let codes_cb = codes.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
                         if let LoreEvent::StorageGetItemComplete(d) = e {
-                            codes_cb.lock().unwrap().push(d.error_code);
+                            codes_cb.lock().unwrap().push(d.error.error_code);
                         }
                     }));
                     get_file_resolved::get_file_resolved(
@@ -5645,7 +6379,7 @@ mod storage_remote_tests {
                         callback,
                     )
                     .await;
-                    assert_eq!(codes.lock().unwrap().clone(), vec![LoreErrorCode::None]);
+                    assert_eq!(codes.lock().unwrap().clone(), vec![0]);
 
                     let written = std::fs::read(&target).expect("read target file");
                     assert_eq!(written.len(), length, "the file must be sized to the range");
@@ -5675,7 +6409,6 @@ mod storage_remote_tests {
         use lore_base::types::Hash;
         use lore_base::types::KeyType;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         let execution = setup_execution("storage-remote-file-resolved-delete".to_string());
@@ -5691,12 +6424,11 @@ mod storage_remote_tests {
                     let handle_id = open_remote_handle(&server).await;
 
                     for (id, path) in [(1u64, &source), (2u64, &empty)] {
-                        let codes: Arc<Mutex<Vec<LoreErrorCode>>> =
-                            Arc::new(Mutex::new(Vec::new()));
+                        let codes: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
                         let codes_cb = codes.clone();
                         let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
                             if let LoreEvent::StoragePutItemComplete(d) = e {
-                                codes_cb.lock().unwrap().push(d.error_code);
+                                codes_cb.lock().unwrap().push(d.error.error_code);
                             }
                         }));
                         put_file_resolved::put_file_resolved(
@@ -5719,7 +6451,7 @@ mod storage_remote_tests {
                         .await;
                         assert_eq!(
                             codes.lock().unwrap().clone(),
-                            vec![LoreErrorCode::None],
+                            vec![0],
                             "publish {id} must succeed"
                         );
                     }
@@ -5736,11 +6468,11 @@ mod storage_remote_tests {
 
                     let reader = open_remote_handle(&server).await;
                     let (_target_guard, target) = temp_file("delete-target", None);
-                    let codes: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
+                    let codes: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
                     let codes_cb = codes.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
                         if let LoreEvent::StorageGetItemComplete(d) = e {
-                            codes_cb.lock().unwrap().push(d.error_code);
+                            codes_cb.lock().unwrap().push(d.error.error_code);
                         }
                     }));
                     get_file_resolved::get_file_resolved(
@@ -5763,7 +6495,7 @@ mod storage_remote_tests {
                     .await;
                     assert_eq!(
                         codes.lock().unwrap().clone(),
-                        vec![LoreErrorCode::AddressNotFound],
+                        vec![lore_base::error::AddressNotFound::FFI_CODE],
                         "a retracted key must resolve to nothing for a fresh client"
                     );
                     assert!(
@@ -5891,7 +6623,7 @@ mod storage_remote_tests {
         partition: lore_base::types::Partition,
         keys: &[lore_base::types::Hash],
         payload: &[u8],
-    ) -> Vec<(lore_revision::event::LoreErrorCode, u8)> {
+    ) -> Vec<(i32, u8)> {
         use lore::storage::put_resolved;
         use lore::storage::put_resolved::LoreStoragePutResolvedArgs;
         use lore::storage::put_resolved::LoreStoragePutResolvedItem;
@@ -5899,12 +6631,13 @@ mod storage_remote_tests {
         use lore_revision::event::LoreBytes;
         use lore_revision::interface::LoreArray;
 
-        let outs: Arc<Mutex<Vec<(lore_revision::event::LoreErrorCode, u8)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let outs: Arc<Mutex<Vec<(i32, u8)>>> = Arc::new(Mutex::new(Vec::new()));
         let cb = outs.clone();
         let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
             if let LoreEvent::StoragePutItemComplete(d) = e {
-                cb.lock().unwrap().push((d.error_code, d.stored_remote));
+                cb.lock()
+                    .unwrap()
+                    .push((d.error.error_code, d.stored_remote));
             }
         }));
         let items = keys
@@ -5945,7 +6678,6 @@ mod storage_remote_tests {
         use lore_base::types::Hash;
         use lore_base::types::KeyType;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
 
         let execution = setup_execution("storage-remote-publish-dedup".to_string());
         LORE_CONTEXT
@@ -5970,7 +6702,7 @@ mod storage_remote_tests {
                 let outs = publish_keys_concurrently(handle_id, partition, &keys, &payload).await;
                 assert_eq!(outs.len(), 2);
                 for (code, stored_remote) in &outs {
-                    assert_eq!(*code, LoreErrorCode::None);
+                    assert_eq!(*code, 0);
                     assert_eq!(*stored_remote, 1, "both must report the content remote");
                 }
 
@@ -6006,7 +6738,6 @@ mod storage_remote_tests {
         use lore_base::types::Hash;
         use lore_base::types::KeyType;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
 
         let execution = setup_execution("storage-remote-publish-no-inherit".to_string());
         LORE_CONTEXT
@@ -6033,7 +6764,7 @@ mod storage_remote_tests {
                 for (code, _) in &outs {
                     assert_eq!(
                         *code,
-                        LoreErrorCode::None,
+                        0,
                         "a refused upload is not an error; the local write stands"
                     );
                 }
@@ -6084,7 +6815,6 @@ mod storage_remote_tests {
         use lore_base::types::Hash;
         use lore_base::types::KeyType;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         const CHUNK: u64 = 64 * 1024;
@@ -6100,12 +6830,13 @@ mod storage_remote_tests {
                     let (_source_guard, source) = temp_file("identical", Some(&payload));
                     let handle_id = open_remote_handle(&server).await;
 
-                    let outs: Arc<Mutex<Vec<(LoreErrorCode, u8)>>> =
-                        Arc::new(Mutex::new(Vec::new()));
+                    let outs: Arc<Mutex<Vec<(i32, u8)>>> = Arc::new(Mutex::new(Vec::new()));
                     let cb = outs.clone();
                     let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
                         if let LoreEvent::StoragePutItemComplete(d) = e {
-                            cb.lock().unwrap().push((d.error_code, d.stored_remote));
+                            cb.lock()
+                                .unwrap()
+                                .push((d.error.error_code, d.stored_remote));
                         }
                     }));
                     put_file_resolved::put_file_resolved(
@@ -6128,7 +6859,7 @@ mod storage_remote_tests {
                     .await;
                     assert_eq!(
                         outs.lock().unwrap().clone(),
-                        vec![(LoreErrorCode::None, 1)],
+                        vec![(0, 1)],
                         "repeated leaves are one upload and many followers, and the tree is still \
                          whole on the remote"
                     );
@@ -6162,7 +6893,6 @@ mod storage_remote_tests {
         use lore_base::types::Hash;
         use lore_base::types::KeyType;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
         const CHUNK: u64 = 64 * 1024;
@@ -6177,11 +6907,13 @@ mod storage_remote_tests {
                 let (_source_guard, source) = temp_file("partial-tree", Some(&payload));
                 let handle_id = open_remote_handle(&server).await;
 
-                let outs: Arc<Mutex<Vec<(LoreErrorCode, u8)>>> = Arc::new(Mutex::new(Vec::new()));
+                let outs: Arc<Mutex<Vec<(i32, u8)>>> = Arc::new(Mutex::new(Vec::new()));
                 let cb = outs.clone();
                 let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
                     if let LoreEvent::StoragePutItemComplete(d) = e {
-                        cb.lock().unwrap().push((d.error_code, d.stored_remote));
+                        cb.lock()
+                            .unwrap()
+                            .push((d.error.error_code, d.stored_remote));
                     }
                 }));
                 put_file_resolved::put_file_resolved(
@@ -6205,7 +6937,7 @@ mod storage_remote_tests {
 
                 assert_eq!(
                     outs.lock().unwrap().clone(),
-                    vec![(LoreErrorCode::None, 0)],
+                    vec![(0, 0)],
                     "a failed leaf leaves a good local write and no remote placement",
                 );
 
@@ -6261,7 +6993,7 @@ mod storage_remote_tests {
     }
 
     struct GetBatchResults {
-        codes: HashMap<u64, lore_revision::event::LoreErrorCode>,
+        codes: HashMap<u64, i32>,
         bytes: HashMap<u64, Vec<u8>>,
         /// `GET_HEADER`'s `size_content` per item — the whole content's size, which a ranged
         /// read cannot infer from the bytes it got back.
@@ -6274,8 +7006,16 @@ mod storage_remote_tests {
         handle_id: u64,
         items: Vec<lore::storage::get::LoreStorageGetItem>,
     ) -> GetBatchResults {
-        let codes: Arc<Mutex<HashMap<u64, lore_revision::event::LoreErrorCode>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        run_get_batch_under(LoreGlobalArgs::default(), handle_id, items).await
+    }
+
+    /// [`run_get_batch`] under `globals`.
+    async fn run_get_batch_under(
+        globals: LoreGlobalArgs,
+        handle_id: u64,
+        items: Vec<lore::storage::get::LoreStorageGetItem>,
+    ) -> GetBatchResults {
+        let codes: Arc<Mutex<HashMap<u64, i32>>> = Arc::new(Mutex::new(HashMap::new()));
         let bytes: Arc<Mutex<HashMap<u64, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
         let headers: Arc<Mutex<HashMap<u64, u64>>> = Arc::new(Mutex::new(HashMap::new()));
         let first_offsets: Arc<Mutex<HashMap<u64, u64>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -6311,13 +7051,13 @@ mod storage_remote_tests {
                 codes_for_cb
                     .lock()
                     .unwrap()
-                    .insert(data.id, data.error_code);
+                    .insert(data.id, data.error.error_code);
             }
             _ => {}
         }));
 
         lore::storage::get::get(
-            LoreGlobalArgs::default(),
+            globals,
             lore::storage::get::LoreStorageGetArgs {
                 handle: lore::storage::handle::LoreStore { handle_id },
                 items: lore_revision::interface::LoreArray::from_vec(items),
@@ -6387,7 +7127,6 @@ mod storage_remote_tests {
         use lore_base::types::Context;
         use lore_base::types::Hash;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
 
         let execution = setup_execution("storage-remote-get-miss-batch".to_string());
         LORE_CONTEXT
@@ -6413,14 +7152,14 @@ mod storage_remote_tests {
 
                 assert_eq!(
                     results.codes.get(&99),
-                    Some(&LoreErrorCode::AddressNotFound),
+                    Some(&lore_base::error::AddressNotFound::FFI_CODE),
                     "the absent address must report AddressNotFound, not a transport error",
                 );
                 for (index, payload) in payloads.iter().enumerate() {
                     let id = index as u64;
                     assert_eq!(
                         results.codes.get(&id),
-                        Some(&LoreErrorCode::None),
+                        Some(&0),
                         "item {id} shares the stream with a miss and must still succeed",
                     );
                     assert_eq!(
@@ -6444,7 +7183,6 @@ mod storage_remote_tests {
     async fn get_with_a_range_falls_back_to_remote_and_returns_only_the_range() -> TestResult {
         use bytes::Bytes;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
 
         let execution = setup_execution("storage-remote-get-range".to_string());
         LORE_CONTEXT
@@ -6462,7 +7200,7 @@ mod storage_remote_tests {
                 )
                 .await;
 
-                assert_eq!(results.codes.get(&1), Some(&LoreErrorCode::None));
+                assert_eq!(results.codes.get(&1), Some(&0));
                 assert_eq!(results.headers.get(&1), Some(&(payload.len() as u64)));
                 assert_eq!(results.first_offsets.get(&1), Some(&40));
                 assert_eq!(
@@ -6488,7 +7226,6 @@ mod storage_remote_tests {
     async fn get_with_a_range_over_a_remote_fragment_tree_returns_only_the_range() -> TestResult {
         use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
 
         let execution = setup_execution("storage-remote-get-range-tree".to_string());
         LORE_CONTEXT
@@ -6522,11 +7259,7 @@ mod storage_remote_tests {
                 .await;
 
                 for id in [1u64, 2u64] {
-                    assert_eq!(
-                        results.codes.get(&id),
-                        Some(&LoreErrorCode::None),
-                        "item {id}"
-                    );
+                    assert_eq!(results.codes.get(&id), Some(&0), "item {id}");
                     assert_eq!(
                         results.headers.get(&id),
                         Some(&(content.len() as u64)),
@@ -6556,7 +7289,6 @@ mod storage_remote_tests {
     async fn get_with_an_offset_past_the_end_rejects_over_remote() -> TestResult {
         use bytes::Bytes;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
 
         let execution = setup_execution("storage-remote-get-range-past-end".to_string());
         LORE_CONTEXT
@@ -6577,7 +7309,7 @@ mod storage_remote_tests {
 
                 assert_eq!(
                     results.codes.get(&1),
-                    Some(&LoreErrorCode::InvalidArguments),
+                    Some(&lore_base::error::InvalidArguments::FFI_CODE),
                 );
                 assert!(
                     !results.bytes.contains_key(&1),
@@ -6597,7 +7329,6 @@ mod storage_remote_tests {
     async fn get_metadata_single_remote_item_resolves_without_spawning() -> TestResult {
         use bytes::Bytes;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
 
         let execution = setup_execution("storage-remote-get-metadata-single".to_string());
         LORE_CONTEXT
@@ -6610,12 +7341,12 @@ mod storage_remote_tests {
                 let address = seed_server(&server, partition, &payload).await;
                 let handle_id = open_remote_handle(&server).await;
 
-                let outcome: Arc<Mutex<Option<(LoreErrorCode, u32)>>> = Arc::new(Mutex::new(None));
+                let outcome: Arc<Mutex<Option<(i32, u32)>>> = Arc::new(Mutex::new(None));
                 let outcome_for_cb = outcome.clone();
                 let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
                     if let LoreEvent::StorageGetMetadataItemComplete(data) = event {
                         *outcome_for_cb.lock().unwrap() =
-                            Some((data.error_code, data.fragment.size_payload));
+                            Some((data.error.error_code, data.fragment.size_payload));
                     }
                 }));
 
@@ -6637,7 +7368,7 @@ mod storage_remote_tests {
                 assert_eq!(status, 0, "a server-held address must resolve");
 
                 let (code, size_payload) = outcome.lock().unwrap().expect("terminal event missing");
-                assert_eq!(code, LoreErrorCode::None);
+                assert_eq!(code, 0);
                 assert!(size_payload > 0, "the wire fetch must carry the fragment");
 
                 close_handle(handle_id).await;
@@ -6653,7 +7384,6 @@ mod storage_remote_tests {
         use lore_base::types::Context;
         use lore_base::types::Hash;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
 
         let execution = setup_execution("storage-remote-get-metadata-miss-batch".to_string());
         LORE_CONTEXT
@@ -6683,7 +7413,7 @@ mod storage_remote_tests {
 
                 let handle_id = open_remote_handle(&server).await;
 
-                let outcomes: Arc<Mutex<HashMap<u64, (LoreErrorCode, u32)>>> =
+                let outcomes: Arc<Mutex<HashMap<u64, (i32, u32)>>> =
                     Arc::new(Mutex::new(HashMap::new()));
                 let outcomes_for_cb = outcomes.clone();
                 let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
@@ -6691,7 +7421,7 @@ mod storage_remote_tests {
                         outcomes_for_cb
                             .lock()
                             .unwrap()
-                            .insert(data.id, (data.error_code, data.fragment.size_payload));
+                            .insert(data.id, (data.error.error_code, data.fragment.size_payload));
                     }
                 }));
 
@@ -6708,14 +7438,14 @@ mod storage_remote_tests {
                 let outcomes = outcomes.lock().unwrap().clone();
                 assert_eq!(
                     outcomes.get(&99).map(|(code, _)| *code),
-                    Some(LoreErrorCode::AddressNotFound),
+                    Some(lore_base::error::AddressNotFound::FFI_CODE),
                     "the absent address must report AddressNotFound",
                 );
                 for (index, payload) in payloads.iter().enumerate() {
                     let id = index as u64;
                     assert_eq!(
                         outcomes.get(&id).map(|(code, _)| *code),
-                        Some(LoreErrorCode::None),
+                        Some(0),
                         "metadata item {id} shares the stream with a miss and must still succeed",
                     );
                     assert_eq!(
@@ -6774,7 +7504,7 @@ mod storage_remote_tests {
             if address == self.target
                 && self
                     .remaining
-                    .fetch_update(
+                    .try_update(
                         std::sync::atomic::Ordering::SeqCst,
                         std::sync::atomic::Ordering::SeqCst,
                         |n| n.checked_sub(1),
@@ -6881,7 +7611,7 @@ mod storage_remote_tests {
             source_address: lore_base::types::Address,
             destination_partition: lore_base::types::Partition,
             destination_context: lore_base::types::Context,
-            durable: bool,
+            behavior: CopyBehavior,
         ) -> Result<(), lore_storage::StoreError> {
             self.inner
                 .clone()
@@ -6890,7 +7620,7 @@ mod storage_remote_tests {
                     source_address,
                     destination_partition,
                     destination_context,
-                    durable,
+                    behavior,
                 )
                 .await
         }
@@ -6901,7 +7631,6 @@ mod storage_remote_tests {
     async fn get_batch_survives_server_side_slow_down() -> TestResult {
         use bytes::Bytes;
         use lore_base::types::Partition;
-        use lore_revision::event::LoreErrorCode;
 
         let execution = setup_execution("storage-remote-get-slowdown-batch".to_string());
         LORE_CONTEXT
@@ -6962,7 +7691,7 @@ mod storage_remote_tests {
                     let id = index as u64;
                     assert_eq!(
                         results.codes.get(&id),
-                        Some(&LoreErrorCode::None),
+                        Some(&0),
                         "item {id} must succeed — a per-item SlowDown is retryable and must \
                          leave the stream serving its siblings",
                     );

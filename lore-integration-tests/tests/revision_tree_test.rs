@@ -893,7 +893,8 @@ mod add_tests {
     /// reference to an entry that is a link, and two entries claiming one name
     /// under a parent the same batch creates.
     ///
-    /// The last four are names the node name table refuses. They are checked
+    /// The rest are names the node name table refuses, among them the
+    /// repository's own directory in any ASCII case. They are checked
     /// here rather than at write time, so they fail as a rejection with nothing
     /// created — including when the offending entry sits between valid ones,
     /// which is the case that would otherwise apply part of the batch.
@@ -954,6 +955,18 @@ mod add_tests {
             (
                 18,
                 vec![entry(18, ROOT_NODE, &oversize, LoreNodeType::File)],
+            ),
+            (
+                22,
+                vec![entry(22, ROOT_NODE, ".urc", LoreNodeType::Directory)],
+            ),
+            (23, vec![entry(23, ROOT_NODE, ".LORE", LoreNodeType::File)]),
+            (
+                25,
+                vec![
+                    entry(24, ROOT_NODE, "dir", LoreNodeType::Directory),
+                    nested_entry(25, 0, ".Urc", LoreNodeType::Directory),
+                ],
             ),
             (
                 20,
@@ -3582,11 +3595,7 @@ mod interop_tests {
         let sink = stored.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
             if let LoreEvent::StoragePutItemComplete(data) = event {
-                assert_eq!(
-                    data.error_code,
-                    LoreErrorCode::None,
-                    "storing the payload must succeed"
-                );
+                assert_eq!(data.error.error_code, 0, "storing the payload must succeed");
                 *sink.lock().unwrap() = Some(data.address);
             }
         }));
@@ -3622,7 +3631,7 @@ mod interop_tests {
     async fn get_bytes(store_handle_id: u64, partition: Partition, address: Address) -> Vec<u8> {
         let read: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = read.clone();
-        let outcome: Arc<Mutex<Option<LoreErrorCode>>> = Arc::new(Mutex::new(None));
+        let outcome: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
         let outcome_sink = outcome.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| match event {
             LoreEvent::StorageGetData(data) => {
@@ -3634,7 +3643,7 @@ mod interop_tests {
                 }
             }
             LoreEvent::StorageGetItemComplete(data) => {
-                *outcome_sink.lock().unwrap() = Some(data.error_code);
+                *outcome_sink.lock().unwrap() = Some(data.error.error_code);
             }
             _ => {}
         }));
@@ -3657,7 +3666,7 @@ mod interop_tests {
         assert_eq!(status, 0, "reading {address:?} back must succeed");
         assert_eq!(
             *outcome.lock().unwrap(),
-            Some(LoreErrorCode::None),
+            Some(0),
             "the read of {address:?} must report success"
         );
         read.lock().unwrap().clone()

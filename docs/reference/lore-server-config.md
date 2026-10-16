@@ -82,12 +82,40 @@ With no config files loaded, the server runs as a self-contained, single-node in
 
 ## Server and endpoint settings
 
-The `[server]` table and its sub-tables configure the network endpoints and graceful-shutdown behavior.
+The `[server]` table and its sub-tables configure the network endpoints, graceful-shutdown behavior, and the disk space check on the local stores.
 
 | Field | Default | Description |
 | --- | --- | --- |
 | `server.connection_close_timeout_seconds` | `5` | Seconds to wait for open connections to close after a shutdown signal. |
 | `server.runtime_shutdown_timeout_seconds` | `25` | Seconds to wait for the async runtime to shut down after connections close. Accepts the alias `shutdown_delay_seconds`. |
+
+### Advertised endpoints
+
+`[environment.endpoint]` defines the external service endpoints advertised for the client.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `auth_url` | none | The authentication service clients log in at and exchange tokens with. Setting it requires `[server.auth]`. If `auth_url` and `[server.auth]` are not set, starts the server unauthenticated. |
+| `user_url` | `auth_url` | The user directory that clients use to resolve user IDs to display names, and back. If not set, uses `auth_url` as the user service. If both are unset, falls back to an offline resolver that returns user IDs as names. |
+
+```toml
+[environment.endpoint]
+auth_url = "ucs-auth://auth.example.com"
+user_url = "ucs-auth://directory.example.com"
+```
+
+### Local store disk space
+
+`[server.local_store_monitor]` configures the periodic check of the disk space left to the local stores (see [Store settings](#store-settings)). Only stores the server writes at are watched, so a `[local]` block left in a remote deployment's configuration is ignored, as is a composite immutable tier that names a path other than the first local tier's — every local tier is handed the store the first one creates.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `check_interval_seconds` | `30` | Seconds between checks. `0` turns the check off. |
+| `low_space_threshold_bytes` | `10737418240` | Warn while free space on a volume holding a local store is below this (10 GiB). |
+
+The reading is taken per volume, not per store: stores sharing a filesystem are checked once and named together in a single warning. The first check runs at startup, so a server starting on a full volume says so immediately. A store path that matches no mounted filesystem is warned about once and goes unmonitored until a mount covers it again.
+
+At startup the server also reports where each local store lands, warning when the configuration names no path, when the path is inside a system temporary directory (see [Zero-config defaults](#zero-config-defaults)), and when a composite tier names a path nothing is written at.
 
 ### QUIC endpoints
 
@@ -125,6 +153,7 @@ Each QUIC endpoint takes an optional `[server.quic.certificate]` (or `[server.qu
 | Field | Default | Description |
 | --- | --- | --- |
 | `enabled` | `true` | Whether to start the HTTP endpoint. |
+| `health_only` | `false` | Serve only `/health_check`, without repository or presigned URL routes. Requires `enabled = true`. |
 | `host` | `0.0.0.0` | Bind address. |
 | `port` | `41339` | Listen port. |
 | `max_file_size` | `10485760` | Maximum upload size in bytes (10 MiB). |
@@ -287,17 +316,42 @@ separate directory as `default.toml`, then point `LORE_CONFIG_PATH` at that
 directory. The server does not load the example in place.
 
 > [!IMPORTANT]
-> These flags govern only the gRPC router. The separate QUIC and HTTP listeners
-> accept writes, so a read-only process must also set
-> `server.quic.enabled = false` and `server.http.enabled = false`. Disabling HTTP
-> also removes `/health_check`. Use a gRPC readiness probe or an external
-> health-only endpoint.
->
-> These flags reduce exposure, not memory. The stores are unaffected.
+> These flags govern only the gRPC router. For a read-only process, disable
+> QUIC and either disable HTTP or enable its health-only mode. Set `server.quic.enabled = false` for the thin role. To serve HTTP health
+> without repository content routes, use the block below. The gRPC listener
+> continues serving thin RPCs on port 41337; this feature adds no gRPC Health RPCs.
 >
 > A service added in a later release defaults to enabled. It therefore mounts on
 > a restricted deployment without an edit. Check the `Registered public gRPC
 > services` line after an upgrade.
+
+```toml
+[server.http]
+enabled = true
+health_only = true
+host = "0.0.0.0"
+port = 41339
+store_health_check = true
+available_interval_seconds = 30
+available_timeout_seconds = 5
+```
+
+Health-only mode serves unauthenticated `GET /health_check`: cached store
+availability returns 200, or 503 when unavailable and `store_health_check` is true.
+Repository and presigned content routes return 404. The server ignores presign
+configuration in this mode. Omitting `health_only` keeps existing full HTTP
+behavior; `enabled = false` prevents the listener regardless of `health_only`.
+
+The health cache starts available and the monitor waits before its first sample.
+The interval above is thirty seconds; the monitor enforces a minimum ten-second
+interval. The store receives the configured five-second availability budget.
+Replicated-store availability reads a client health flag, rather than verifying
+an upstream transaction or continuously testing authentication and tables.
+
+Maintenance retains its existing 200 response without store checks. This single
+endpoint does not distinguish liveness from readiness: account for maintenance
+and store outages when choosing readiness and restart policies. A binary built
+with health-only support is required before using this configuration.
 
 #### Forwarded requests
 
@@ -346,14 +400,19 @@ When `[server.auth]` is present, `jwt_issuer` and `jwt_audience` are both mandat
 | --- | --- | --- |
 | `jwt_issuer` | required | Accepted JWT `iss` values, as a string or an array. Tokens whose issuer matches no entry are rejected. Two entries are for the duration of an issuer's `iss` cutover if the issuer is changed. The validator accepts tokens minted under both the old and the new value while both are in flight. |
 | `jwt_audience` | required | Array of accepted JWT `aud` values. A token's audience must match one entry. |
+| `jwt_typ` | none | Accepted JWT `typ` header values, as a string or an array. When set, a token whose header carries no `typ`, or a `typ` that doesn't match any of the entries, is rejected. If unset, the token value is not checked. `jwt_typ = "at+jwt"` is the RFC 9068 access-token profile for OAuth2/OIDC deployments, and should be used for OIDC-compliant setups. Values compare as media types: case-insensitively, and with or without the `application/` prefix, so `at+jwt` also accepts `application/at+jwt`. |
 | `jwk` | none | The optional `[server.auth.jwk]` override sub-table below. |
+| `oidc` | none | The optional `[server.auth.oidc]` sub-table below, which configures the OIDC provider info shown to clients. |
 | `permission_claim` | none | Dotted path of the JWT claim carrying the caller's allowed actions, e.g. `realm_access.roles` (Keycloak) or `groups` (Dex). When using `GlobalGrantsAuthorizer` (Tier 1), this JWT claim defines where the user's global permissions are read from. When `resource_claim` is set and `ResourceGrantsAuthorizer` (Tier 2) is in use, it instead names the field inside each resource entry holding the per-partition actions, defaulting to `permission`. |
 | `resource_claim` | none | Dotted path of the JWT claim carrying per-repository resource grants. If this is set, enables the granular `ResourceGrantsAuthorizer` (Tier 2) authorizer. |
 | `resource_id_claim` | `resource_id` | The field inside each resource entry that names the resource, for providers whose entry shape cannot be changed. Keycloak's UMA `authorization.permissions` entries carry the resource name in `rsname`, for example: set `resource_claim = "authorization.permissions"`, `resource_id_claim = "rsname"` and `permission_claim = "scopes"` to read them. Tier 2 only. |
 | `resource_id_template` | `urc-{id}` | Template that renders a repository id into the corresponding resource name. `{id}` is replaced by the repository id. When verifying permissions with `ResourceGrantsAuthorizer` (Tier 2), uses this string to search for the matching resource entry in the JWT. |
 | `resource_wildcard` | `urc-*` | The resource name that matches every repository. |
-| `identity_claim` | `sub` | The claim recorded and compared as the caller's identity. The value read from this claim will be recorded as the user ID in Lore revisions. Any unique string value can be used as the user ID. |
-| `baseline_access` | `denied` | What the repository listing answers for an authenticated caller with no explicit repository-specific grant: `denied` (the default) lists none, `reachable` lists every partition ID the server holds. Gates listing of the IDs only, never grants access to the contents. `denied` blocks no operation on a partition the caller holds a grant for. |
+| `baseline_access` | `denied` | What the `baseline` repository catalog answers to `lore repository list`: `denied` (the default) lists none, `reachable` lists every partition ID the server holds. Gates listing of the IDs only, never grants access to the contents. `denied` blocks no operation on a partition the caller holds a grant for. Not consulted by the `auth_service` catalog. A server with no `[server.auth]` lists everything it holds. |
+| `repository_catalog` | derived | Which catalog answers `lore repository list`: `auth_service` fetches the list from `UrcAuthApi` gRPC service's `LookupUserPermissions`. `baseline` fetches the list from the server's own store, based on `baseline_access` configuration rule. When unset, uses `auth_service` if `[environment.endpoint] auth_url` is set, and `baseline` otherwise. Set this to `auth_service` to keep an auth-service catalog on a deployment authorizing from token claims, or set it to `baseline` to list from the server store on a `UrcAuthApi` deployment. |
+| `repository_catalog_url` | `auth_url` | The `UrcAuthApi` endpoint the `auth_service` catalog asks. Defaults to `[environment.endpoint] auth_url`. This is required with `repository_catalog = "auth_service"` when `auth_url` is unset. The catalog forwards the caller's own token, so the endpoint must accept the tokens this server verifies. |
+
+The caller's identity, recorded as the creator of what the caller makes and compared wherever an identity is checked, is read from the token: its `identity` claim, or the namespaced alias `https://lore.org/claims/identity`, where the issuer mints one, and `sub` otherwise. No setting names it.
 
 `[server.auth.jwk]`:
 
@@ -368,6 +427,33 @@ When `[server.auth]` is present, `jwt_issuer` and `jwt_audience` are both mandat
 [server.auth]
 jwt_issuer = "https://accounts.example.com"
 jwt_audience = ["lore-service"]
+```
+
+`[server.auth.oidc]`:
+
+When this table is present, the environment service advertises an OIDC provider to clients. `GlobalGrantsAuthorizer` (Tier 1) and `ResourceGrantsAuthorizer` (Tier 2) require it, since without `[environment.endpoint] auth_url` clients have no other way to log in. If `auth_url` is set, it is optional, and advertises the OIDC path next to the auth service during a migration. The advertised OIDC issuer is the first `jwt_issuer` entry, which must be an issuer URL.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `client_id` | required | The public client ID clients present to the provider. |
+| `scopes` | `[]` | Default scopes clients request at login. Empty leaves the choice to the client. |
+| `preferred` | `false` | Whether a client should use OIDC auth rather than at `auth_url`, if both are configured. Used during migration to route clients to the old auth by default, while allowing testing of the new OIDC auth. |
+| `token_exchange_issuer` | `jwt_issuer` | The issuer of the RFC 8693 token-exchange endpoint that mints partition-scoped tokens. Defaults to the advertised issuer. Set it only when a separate token service does the partition scoped token exchange. Tier 2. |
+| `resource_template` | none | Template string for mapping a partition to an RFC 8707 resource, for example `https://lore.example.com/partitions/{id}`. `{id}` is replaced by the partition ID. Tier 2. |
+| `scope_template` | none | Template string for mapping a partition to a scope value, for example `partition:{id}`. For OIDC providers that use scope for token exchange, not `resource`. Tier 2. |
+
+`ResourceGrantsAuthorizer` (Tier 2, `resource_claim` set) requires one of `resource_template` and `scope_template`. The templates are mutually exclusive.
+
+```toml
+[server.auth]
+jwt_issuer = "https://accounts.example.com"
+jwt_audience = ["lore-service"]
+resource_claim = "resources"
+
+[server.auth.oidc]
+client_id = "lore-cli"
+scopes = ["openid", "offline_access"]
+resource_template = "https://lore.example.com/partitions/{id}"
 ```
 
 ## Store settings
@@ -393,7 +479,7 @@ Each mode reads its settings from a matching sub-table. The `local` mode uses `[
 | `path` | derived `<temp>/lore-server` | both | Filesystem location for the store. When empty, the server derives a path under the system temporary directory at startup (ephemeral — see [Zero-config defaults](#zero-config-defaults)). |
 | `flush_delay_seconds` | `10` | both | Seconds between background flushes to disk. |
 | `max_capacity` | none | immutable | Maximum number of entries before eviction. |
-| `max_size` | none | immutable | Maximum total store size in bytes before background compaction reclaims space. |
+| `max_size` | none | immutable | Maximum total store size in bytes before background compaction reclaims space. Compaction rewrites a group's packfiles only once at least 10% of their bytes are no longer referenced. |
 | `eviction_delay` | none | immutable | Interval in milliseconds between eviction passes. Defaults to 10 s when unset. |
 | `compaction_delay` | none | immutable | Interval in milliseconds between compaction passes. Defaults to 24 h when unset. |
 | `target_capacity_percentage` | `70` | immutable | Capacity-utilization target (percent) that eviction reclaims down to. Applies only when `max_capacity` is set; 0 or ≥100 is treated as `70`. |

@@ -246,11 +246,10 @@ fn file_action_to_v1_action(action: FileAction) -> thin_client_v1::Action {
 /// Convert an internal `NodeChange` into a v1 `DiffChange`. The
 /// `to.flags` drive `node_type` for non-delete actions; for deletes
 /// `from.flags` is the surviving record of what the path used to be.
-/// `content_from` / `content_to` carry the from / to side's CAS hash,
-/// or empty bytes for ADD (no from) and DELETE (no to).
 ///
 /// `link_repository_index` is passed through verbatim; the handler
 /// resolves it, since the per-stream partition table lives there.
+#[lore_macro::test_pub]
 pub(super) async fn node_change_to_diff_change(
     change: &NodeChange,
     link_repository_index: u32,
@@ -264,22 +263,8 @@ pub(super) async fn node_change_to_diff_change(
         .move_source()
         .map(|p| p.to_string())
         .unwrap_or_default();
-    let (content_from, address_from) = if action == thin_client_v1::Action::Add {
-        (Bytes::new(), None)
-    } else {
-        (
-            change.from.address.hash.into(),
-            Some(model_v1::Address::from(&change.from.address)),
-        )
-    };
-    let (content_to, address_to) = if action == thin_client_v1::Action::Delete {
-        (Bytes::new(), None)
-    } else {
-        (
-            change.to.address.hash.into(),
-            Some(model_v1::Address::from(&change.to.address)),
-        )
-    };
+    let content_from = (action != thin_client_v1::Action::Add).then(|| change.from.address.into());
+    let content_to = (action != thin_client_v1::Action::Delete).then(|| change.to.address.into());
     thin_client_v1::DiffChange {
         path: change.path().to_string(),
         path_from,
@@ -290,30 +275,30 @@ pub(super) async fn node_change_to_diff_change(
         automerged: change.flags.is_conflict_automerged(),
         link_repository_index,
         tracking: change.is_tracking_link().await,
-        address_from,
-        address_to,
     }
 }
 
-/// A link's content is the revision it is pinned to, so the revision
-/// signatures go in `content_from` / `content_to`.
+/// A link's content is the revision it is pinned to, which lives in the
+/// linked repository rather than this one.
+#[lore_macro::test_pub]
 pub(super) fn link_pin_change_to_diff_change(
     pin_change: &LinkPinChange,
     link_repository_index: u32,
 ) -> thin_client_v1::DiffChange {
+    let pinned_address = |revision: Hash| model_v1::Address {
+        hash: revision.into(),
+        context: pin_change.link_repository.into(),
+    };
     thin_client_v1::DiffChange {
         path: pin_change.link_path.clone(),
         path_from: String::new(),
         action: thin_client_v1::Action::Keep as i32,
         node_type: thin_client_v1::NodeType::Link as i32,
-        content_from: pin_change.revision_from.into(),
-        content_to: pin_change.revision_to.into(),
+        content_from: Some(pinned_address(pin_change.revision_from)),
+        content_to: Some(pinned_address(pin_change.revision_to)),
         automerged: false,
         link_repository_index,
         tracking: pin_change.tracking_to,
-        // Revision signatures, not content addresses: nothing to fetch.
-        address_from: None,
-        address_to: None,
     }
 }
 
@@ -322,6 +307,7 @@ pub(super) fn link_pin_change_to_diff_change(
 /// common-ancestor content for that path, so `change_from.content_from
 /// == change_to.content_from` per the proto contract. The two halves
 /// take separate indices: they can land in different partitions.
+#[lore_macro::test_pub]
 pub(super) async fn diff_conflict_from_pair(
     pair: &(NodeChange, NodeChange),
     link_repository_index_from: u32,
@@ -330,190 +316,5 @@ pub(super) async fn diff_conflict_from_pair(
     thin_client_v1::DiffConflict {
         change_from: Some(node_change_to_diff_change(&pair.0, link_repository_index_from).await),
         change_to: Some(node_change_to_diff_change(&pair.1, link_repository_index_to).await),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::str::FromStr;
-
-    use lore_proto::lore::thin_client::v1 as thin_client_v1;
-    use lore_revision::change::Flags;
-    use lore_revision::change::NodeChange;
-    use lore_revision::change::NodeChangeState;
-    use lore_revision::node::NodeFlags;
-    use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryContextCreationArgs;
-    use lore_revision::state;
-    use lore_revision::util::path::RelativePath;
-    use lore_storage::Address;
-    use lore_storage::Context;
-    use lore_storage::Hash;
-    use lore_transport::ProtocolError;
-
-    use super::*;
-
-    async fn test_context() -> Arc<RepositoryContext> {
-        let immutable = lore_storage::local::immutable_store::LocalImmutableStore::new(
-            None,
-            lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
-        )
-        .await
-        .expect("immutable store");
-        let mutable = Arc::new(
-            lore_storage::local::mutable_store::LocalMutableStore::new(
-                None::<&std::path::Path>,
-                lore_storage::MutableStoreSettings::default(),
-                immutable.clone(),
-            )
-            .await
-            .expect("mutable store"),
-        );
-        Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
-            paths: None,
-            immutable_store: immutable,
-            mutable_store: mutable,
-            id: Context::from(uuid::Uuid::now_v7()).into(),
-            instance_id: lore_revision::instance::InstanceId::generate(),
-            remote: Err(ProtocolError::from(lore_base::error::NoRemote)),
-            filter: Arc::default(),
-            filesystem_provider: None,
-        }))
-    }
-
-    fn make_change(action: lore_revision::change::FileAction) -> NodeChange {
-        let ctx = futures::executor::block_on(test_context());
-        let state = Arc::new(state::State::new());
-        let address = Address {
-            hash: Hash::hash_buffer(&[1, 2, 3]),
-            context: Context::default(),
-        };
-        NodeChange {
-            action,
-            flags: Flags::None,
-            from: NodeChangeState {
-                mapping: lore_revision::state::NodeMapping {
-                    path: RelativePath::from_str("dir/file.txt").unwrap(),
-                    node: 1,
-                    repository: ctx.clone(),
-                    state: state.clone(),
-                },
-                address,
-                observed: None,
-                mode: 0,
-                flags: NodeFlags::File,
-            },
-            to: NodeChangeState {
-                mapping: lore_revision::state::NodeMapping {
-                    path: RelativePath::from_str("dir/file.txt").unwrap(),
-                    node: 2,
-                    repository: ctx,
-                    state,
-                },
-                address,
-                observed: None,
-                mode: 0,
-                flags: NodeFlags::File,
-            },
-        }
-    }
-
-    /// `node_change_to_diff_change` is a pure projection — it copies the
-    /// caller-supplied `link_repository_index` into the wire message
-    /// unchanged. Partition-id → index resolution lives in the handler
-    /// (`PartitionTable`); this helper does not look at `repository.id`.
-    #[tokio::test]
-    async fn node_change_propagates_index_as_given() {
-        let change = make_change(lore_revision::change::FileAction::Add);
-
-        let mapped = node_change_to_diff_change(&change, 0).await;
-        assert_eq!(mapped.link_repository_index, 0);
-        assert_eq!(mapped.path, "dir/file.txt");
-        assert_eq!(mapped.action, thin_client_v1::Action::Add as i32);
-
-        let mapped = node_change_to_diff_change(&change, 7).await;
-        assert_eq!(mapped.link_repository_index, 7);
-    }
-
-    /// Tracking is a link property: a file change reports it as false.
-    #[tokio::test]
-    async fn node_change_on_file_is_not_tracking() {
-        let change = make_change(lore_revision::change::FileAction::Add);
-
-        let mapped = node_change_to_diff_change(&change, 0).await;
-        assert!(!mapped.tracking);
-    }
-
-    /// `node_type` reflects the surviving side: `to.flags` for non-delete
-    /// actions, `from.flags` for deletes. The index passed in is opaque
-    /// to the helper, but the surviving-side rule still drives `node_type`.
-    #[tokio::test]
-    async fn node_change_delete_node_type_comes_from_from_side() {
-        let mut change = make_change(lore_revision::change::FileAction::Delete);
-        change.from.flags = NodeFlags::Link;
-        change.to.flags = NodeFlags::NoFlags;
-
-        let mapped = node_change_to_diff_change(&change, 0).await;
-        assert_eq!(mapped.node_type, thin_client_v1::NodeType::Link as i32);
-    }
-
-    #[tokio::test]
-    async fn diff_conflict_pair_carries_per_half_indices() {
-        let from = make_change(lore_revision::change::FileAction::Keep);
-        let to = make_change(lore_revision::change::FileAction::Keep);
-
-        let mapped = diff_conflict_from_pair(&(from, to), 0, 3).await;
-        assert_eq!(
-            mapped.change_from.as_ref().unwrap().link_repository_index,
-            0,
-            "from-half carries its own index",
-        );
-        assert_eq!(
-            mapped.change_to.as_ref().unwrap().link_repository_index,
-            3,
-            "to-half carries its own index, distinct from from-half",
-        );
-    }
-
-    fn make_pin_change() -> LinkPinChange {
-        LinkPinChange {
-            link_path: "libs/shared".to_string(),
-            link_repository: lore_base::types::RepositoryId::from(uuid::Uuid::now_v7()),
-            revision_from: Hash::hash_buffer(&[1, 2, 3]),
-            revision_to: Hash::hash_buffer(&[4, 5, 6]),
-            tracking_from: false,
-            tracking_to: false,
-        }
-    }
-
-    /// A moved pin carries both revisions as the link's content addresses.
-    #[test]
-    fn pin_change_carries_both_revisions() {
-        let change = make_pin_change();
-        let mapped = link_pin_change_to_diff_change(&change, 2);
-
-        assert_eq!(mapped.path, "libs/shared");
-        assert!(mapped.path_from.is_empty());
-        assert_eq!(mapped.action, thin_client_v1::Action::Keep as i32);
-        assert_eq!(mapped.node_type, thin_client_v1::NodeType::Link as i32);
-        assert_eq!(mapped.content_from, Bytes::from(change.revision_from));
-        assert_eq!(mapped.content_to, Bytes::from(change.revision_to));
-        assert_eq!(mapped.link_repository_index, 2);
-        assert!(!mapped.automerged);
-    }
-
-    /// `tracking` describes the entry the change resolves to, so it mirrors
-    /// the pin's "to" side.
-    #[test]
-    fn pin_change_tracking_mirrors_to_side() {
-        let mut change = make_pin_change();
-
-        change.tracking_from = true;
-        change.tracking_to = false;
-        assert!(!link_pin_change_to_diff_change(&change, 0).tracking);
-
-        change.tracking_from = false;
-        change.tracking_to = true;
-        assert!(link_pin_change_to_diff_change(&change, 0).tracking);
     }
 }

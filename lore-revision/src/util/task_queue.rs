@@ -24,7 +24,7 @@ use lore_telemetry::InstrumentProvider;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
 use tokio::sync::OwnedSemaphorePermit;
-#[cfg(test)]
+#[cfg(feature = "test-util")]
 use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
 use tokio::sync::TryAcquireError;
@@ -82,7 +82,7 @@ where
     otel: Arc<Otel>,
     observability_task: JoinHandle<()>,
 
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     pub rate_limited_count: Arc<RwLock<AtomicU64>>,
 }
 
@@ -123,7 +123,7 @@ where
                 interval.tick().await;
 
                 let num_active_tasks = otel_clone.latent_num_active_tasks.load(Ordering::Acquire);
-                let submitted_tasks_update = otel_clone.latent_num_submitted_tasks.fetch_update(
+                let submitted_tasks_update = otel_clone.latent_num_submitted_tasks.try_update(
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                     |_| Some(0),
@@ -156,7 +156,7 @@ where
         // enforced the concurrency limit, but unfortunately there's no way to read directly from an
         // otel counter. So, for test config we create our own counter and increment/expose that as
         // needed.
-        #[cfg(test)]
+        #[cfg(feature = "test-util")]
         let (rate_limited_count_clone, rate_limited_count) = {
             let counter = Arc::new(RwLock::new(AtomicU64::new(0)));
             (counter.clone(), counter)
@@ -170,7 +170,7 @@ where
             otel: otel.clone(),
             observability_task,
 
-            #[cfg(test)]
+            #[cfg(feature = "test-util")]
             rate_limited_count,
         };
 
@@ -191,13 +191,13 @@ where
                             // If there's a new task available, check the concurrency rate limit to
                             // ensure we have capacity to process it. If not, wait until we acquire
                             // a permit before executing the task.
-                            #[cfg(not(test))]
+                            #[cfg(not(feature = "test-util"))]
                             let permit_future = TaskQueue::<T>::permit(
                                 task_limit.clone(),
                                 "concurrency",
                                 worker_otel.clone(),
                             );
-                            #[cfg(test)]
+                            #[cfg(feature = "test-util")]
                             let permit_future = TaskQueue::<T>::permit(
                                 task_limit.clone(),
                                 "concurrency",
@@ -291,7 +291,7 @@ where
         semaphore: Arc<Semaphore>,
         limit_type: &'static str,
         otel: Arc<Otel>,
-        #[cfg(test)] rate_limited_count: Arc<RwLock<AtomicU64>>,
+        #[cfg(feature = "test-util")] rate_limited_count: Arc<RwLock<AtomicU64>>,
     ) -> Result<OwnedSemaphorePermit, TaskQueueError> {
         // We use `try_acquire` so that we can track a metric when we're rate limited.
         match semaphore.clone().try_acquire_owned() {
@@ -315,7 +315,7 @@ where
                     lore_error!("num_rate_limited_counter not set");
                 }
 
-                #[cfg(test)]
+                #[cfg(feature = "test-util")]
                 rate_limited_count
                     .write()
                     .await
@@ -338,13 +338,13 @@ where
         &self,
         work: BoxFuture<'static, T>,
     ) -> Result<TaskProgress<T>, TaskQueueError> {
-        #[cfg(not(test))]
+        #[cfg(not(feature = "test-util"))]
         let permit_future = TaskQueue::<T>::permit(
             self.submission_limit.clone(),
             "submission",
             self.otel.clone(),
         );
-        #[cfg(test)]
+        #[cfg(feature = "test-util")]
         let permit_future = TaskQueue::<T>::permit(
             self.submission_limit.clone(),
             "lore_submission",
@@ -384,12 +384,12 @@ where
 
     #[allow(clippy::unused_async)]
     pub async fn rate_limited_count(&self) -> usize {
-        #[cfg(not(test))]
+        #[cfg(not(feature = "test-util"))]
         {
             0
         }
 
-        #[cfg(test)]
+        #[cfg(feature = "test-util")]
         {
             self.rate_limited_count.read().await.load(Ordering::Relaxed) as usize
         }

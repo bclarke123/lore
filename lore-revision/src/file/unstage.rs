@@ -9,7 +9,6 @@ use std::sync::atomic::Ordering;
 use dashmap::DashMap;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::errors::*;
@@ -42,10 +41,9 @@ use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
 use crate::path::resolve_user_paths;
-use crate::repository::DOT_LORE;
-use crate::repository::DOT_URC;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
+use crate::repository::is_reserved_node_name;
 use crate::state;
 use crate::state::NodeMapping;
 use crate::state::State;
@@ -55,7 +53,7 @@ use crate::util::path::RelativePath;
 
 /// Data for the event emitted when an unstage operation begins.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileUnstageBeginEventData {
     /// Number of paths requested for unstaging.
@@ -64,7 +62,7 @@ pub struct LoreFileUnstageBeginEventData {
 
 /// Running counts of items processed during an unstage operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileUnstageCountData {
     /// Number of directories that were unstaged.
@@ -81,7 +79,7 @@ pub struct LoreFileUnstageCountData {
 
 /// Data for the progress event emitted periodically during an unstage operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileUnstageProgressEventData {
     /// Current counts of items processed.
@@ -90,7 +88,7 @@ pub struct LoreFileUnstageProgressEventData {
 
 /// Data for the event emitted when an unstage operation completes.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileUnstageEndEventData {
     /// Final counts of items processed.
@@ -99,7 +97,7 @@ pub struct LoreFileUnstageEndEventData {
 
 /// Data for the event identifying the repository and revision involved in an unstage operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileUnstageRevisionEventData {
     /// Identifier of the repository.
@@ -110,7 +108,7 @@ pub struct LoreFileUnstageRevisionEventData {
 
 /// Data for the event emitted for each file affected by an unstage operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileUnstageFileEventData {
     /// Path of the file, relative to the root of the working tree.
@@ -302,7 +300,7 @@ async fn unstage_parent(
     let link_tracker = LinkTracker::new();
     let is_merge_or_cherry_pick_or_revert = state_staged.is_merge_or_cherry_pick_or_revert();
 
-    let mut clear = with_operation(repository.file_system(), true, async |operation| {
+    let mut clear = with_operation(repository.file_system(), async |operation| {
         unstage_each_path(UnstagePaths {
             operation: &operation,
             repository: &repository,
@@ -320,15 +318,10 @@ async fn unstage_parent(
     .await?;
 
     if !clear && !is_merge_or_cherry_pick_or_revert {
-        let has_staged = state_staged
-            .node_has_staged_children(repository.clone(), ROOT_NODE)
+        clear = !state_staged
+            .node_has_staged_or_dirty_children(repository.clone(), ROOT_NODE)
             .await
             .forward::<UnstageError>("Failed to find subnode")?;
-        let has_dirty = state_staged
-            .node_has_dirty_children(repository.clone(), ROOT_NODE)
-            .await
-            .forward::<UnstageError>("Failed to find subnode")?;
-        clear = !has_staged && !has_dirty;
     };
 
     // Even if we plan to clear, check for dirty nodes — preserve anchor if dirty remain
@@ -437,7 +430,7 @@ async fn unstage_from_layer(
     let discard = Arc::new(DashMap::<RepositoryId, Vec<u32>>::new());
     let link_tracker = LinkTracker::new();
 
-    with_operation(repository.file_system(), true, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         for remain in remains {
             Box::pin(unstage_path(
                 operation.clone(),
@@ -534,29 +527,17 @@ async fn unstage_each_path(args: UnstagePaths<'_>) -> Result<bool, UnstageError>
 
         lore_debug!("Unstage options: {:?}", options);
 
-        let mut task = {
-            let repository = repository.clone();
-            let state_current = state_current.clone();
-            let state_staged = state_staged.clone();
-            let discard = discard.clone();
-            let stats = stats.clone();
-            let link_tracker = link_tracker.clone();
-            let operation = operation.clone();
-            lore_spawn!(async move {
-                Box::pin(unstage_path(
-                    operation,
-                    repository,
-                    state_current,
-                    state_staged,
-                    relative_path,
-                    discard,
-                    options,
-                    stats,
-                    link_tracker,
-                ))
-                .await
-            })
-        };
+        let mut task = lore_spawn!(unstage_path(
+            operation.clone(),
+            repository.clone(),
+            state_current.clone(),
+            state_staged.clone(),
+            relative_path,
+            discard.clone(),
+            options,
+            stats.clone(),
+            link_tracker.clone(),
+        ));
 
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
         let result = loop {
@@ -891,7 +872,7 @@ async fn unstage_parent_chain(
             block_writer.mark_dirty()
         };
 
-        link_tracker.on_node_changed(repository.id);
+        link_tracker.on_node_changed(&repository);
 
         if dirtied {
             state_staged.block_modified(parent_block.clone(), parent_block_index);
@@ -934,7 +915,7 @@ async fn unstage_node(
         return Ok(());
     }
 
-    if name == DOT_URC || name == DOT_LORE {
+    if is_reserved_node_name(name) {
         lore_debug!("Ignore dot directory {name}");
         return Ok(());
     }
@@ -1042,7 +1023,7 @@ async fn unstage_node(
             }
         }
         node.clear_staged_flags();
-        link_tracker.on_node_changed(repository.id);
+        link_tracker.on_node_changed(&repository);
 
         if node.is_directory() {
             demote_subnodes_to_dirty(
@@ -1109,7 +1090,7 @@ async fn unstage_node(
 
         node.clear_staged_flags();
 
-        link_tracker.on_node_changed(repository.id);
+        link_tracker.on_node_changed(&repository);
 
         let dirtied = {
             let mut block_writer = block.write();
@@ -1415,9 +1396,13 @@ fn demote_subnodes_to_dirty<'a>(
                 .forward::<UnstageError>("Invalid node hierarchy in unstage walk")?;
             let next_child_sibling = child_node.sibling();
 
-            let child_name = child_block
-                .node_name_ref(child_node_index)
-                .forward::<UnstageError>("Failed to read node name")?;
+            let Some(child_name) = child_block
+                .node_name_ref_or_skip(child_node_index, child_node_id)
+                .forward::<UnstageError>("Failed to read node name")?
+            else {
+                child_node_iter = next_child_sibling;
+                continue;
+            };
             // Takes the name by value so its block read lock ends here, rather than reaching the
             // write below (see NodeNameLock docs).
             let child_path = relative_path.push_into_buf(child_name).freeze();

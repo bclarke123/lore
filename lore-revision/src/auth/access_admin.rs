@@ -14,6 +14,7 @@ use lore_credential::token_store::tokens_only_for_recipient_domain;
 use lore_error_set::prelude::*;
 pub use lore_transport::access_admin::AccessRepositoryRef;
 pub use lore_transport::access_admin::GrantRecord;
+use lore_transport::auth::authentication;
 
 use crate::auth::login::LoginError;
 use crate::lore::RepositoryId;
@@ -42,15 +43,17 @@ async fn resolve_token(remote_url: &str) -> Result<String, LoginError> {
         .get()
         .await
         .forward::<LoginError>("getting environment config")?;
-    let auth_url = environment
-        .endpoint
-        .and_then(|endpoint| endpoint.auth_url)
-        .unwrap_or_default();
-    if auth_url.is_empty() {
+    // The path the caller's `connect` takes, so the token store is read under
+    // the endpoint key its login stored the token under.
+    let mode = crate::lore::execution_context().globals().auth_mode;
+    let Some(selected) = authentication::select(mode, &environment)
+        .forward::<LoginError>("selecting the auth path")?
+    else {
         return Err(LoginError::internal(
             "Remote does not advertise an auth endpoint",
         ));
-    }
+    };
+    let auth_url = selected.endpoint.url;
 
     let remote_domain = lore_credential::get_domain_or_empty(parsed_remote.as_str());
     let identities = token_store::load_identities(&auth_url)
@@ -107,21 +110,4 @@ pub async fn list(
     lore_transport::access_admin::list(remote_url, &token, repository)
         .await
         .forward::<LoginError>("listing access grants")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn repository_ref_parses_ids_and_names() {
-        assert!(matches!(
-            repository_ref("0194b726b34e72b0b45550b88a967076"),
-            AccessRepositoryRef::Id(_)
-        ));
-        assert!(matches!(
-            repository_ref("project1"),
-            AccessRepositoryRef::Name(_)
-        ));
-    }
 }

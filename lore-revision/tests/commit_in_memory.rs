@@ -9,7 +9,6 @@ mod tests {
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Address;
-    use lore_base::types::BranchId;
     use lore_base::types::BranchPoint;
     use lore_base::types::Context;
     use lore_base::types::Hash;
@@ -19,9 +18,7 @@ mod tests {
     use lore_revision::metadata::CREATED_BY;
     use lore_revision::metadata::Metadata;
     use lore_revision::node::*;
-    use lore_revision::repository::InMemoryContext;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryWriteToken;
     use lore_revision::state::State;
     use lore_revision::state::StateNodeChildrenIterator;
     use lore_storage::hash::hash_string;
@@ -29,9 +26,12 @@ mod tests {
 
     include!("helper.rs");
 
-    struct InMemoryMarker;
-    impl InMemoryContext for InMemoryMarker {}
-    const IN_MEMORY_MARKER: InMemoryMarker = InMemoryMarker;
+    use in_memory::add;
+    use in_memory::branch_id;
+    use in_memory::directory;
+    use in_memory::file;
+    use in_memory::metadata_on;
+    use in_memory::token;
 
     /// A path-less context, as the memory-based revision tree handle builds, so the
     /// primitive is exercised against the shape it actually runs on.
@@ -44,77 +44,7 @@ mod tests {
         )
         .await
         .expect("Failed to create store");
-        Arc::new(
-            RepositoryContext::new(default_repository_creation_args(
-                immutable_store,
-                mutable_store,
-            ))
-            .with_write_token(RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER)),
-        )
-    }
-
-    fn file(name: &str) -> Node {
-        Node {
-            flags: NodeFlags::File.bits(),
-            mode: 0o644,
-            size: 10,
-            address: Address {
-                hash: Hash::from_u64(0x5a),
-                context: Context::from(uuid::Uuid::now_v7()),
-            },
-            name_hash: hash_string(name),
-            ..Default::default()
-        }
-    }
-
-    fn directory(name: &str) -> Node {
-        Node {
-            flags: NodeFlags::NoFlags.bits(),
-            mode: 0o755,
-            name_hash: hash_string(name),
-            ..Default::default()
-        }
-    }
-
-    /// Every write verb marks its staged action and dirties the ancestors, which is
-    /// what the freeze walks; `node_add` alone leaves neither.
-    async fn add(
-        state: &State,
-        repository: Arc<RepositoryContext>,
-        parent: NodeID,
-        node: Node,
-        name: &str,
-    ) -> NodeID {
-        let node_id = state
-            .node_add(repository.clone(), parent, node, name)
-            .await
-            .expect("adding the node must succeed");
-        state
-            .node_mark_staged(
-                repository,
-                node_id,
-                NodeFlags::StagedAdd,
-                NodeFlags::DirtyAdd,
-            )
-            .await
-            .expect("marking the addition must succeed");
-        node_id
-    }
-
-    fn metadata_on(branch: BranchId) -> Metadata {
-        let mut metadata = Metadata::new();
-        metadata
-            .set_branch(branch)
-            .expect("setting the branch must succeed");
-        metadata
-    }
-
-    fn token() -> RepositoryWriteToken {
-        RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER)
-    }
-
-    fn branch_id() -> BranchId {
-        Context::from(uuid::Uuid::now_v7())
+        in_memory::repository(immutable_store, mutable_store)
     }
 
     /// The directory is checked apart from the file: its flags are cleared by
@@ -128,7 +58,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let repository = test_repository(mutable).await;
                 let branch = branch_id();
-                let state = Arc::new(State::new());
+                let state = State::new();
                 let dir = add(
                     &state,
                     repository.clone(),
@@ -190,6 +120,81 @@ mod tests {
             .expect("Task failed");
     }
 
+    /// `first`, holding a file and the directory `inner`, beside `second`: the freeze must reach
+    /// all three. A directory it skipped would leave its file staged, which the commit refuses.
+    #[tokio::test]
+    async fn commit_in_memory_revision_freezes_every_directory_of_a_nested_tree() {
+        let (_immutable, mutable, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let repository = test_repository(mutable).await;
+                let branch = branch_id();
+                let state = State::new();
+                let first = add(
+                    &state,
+                    repository.clone(),
+                    ROOT_NODE,
+                    directory("first"),
+                    "first",
+                )
+                .await;
+                add(&state, repository.clone(), first, file("a.bin"), "a.bin").await;
+                let inner = add(
+                    &state,
+                    repository.clone(),
+                    first,
+                    directory("inner"),
+                    "inner",
+                )
+                .await;
+                add(&state, repository.clone(), inner, file("b.bin"), "b.bin").await;
+                let second = add(
+                    &state,
+                    repository.clone(),
+                    ROOT_NODE,
+                    directory("second"),
+                    "second",
+                )
+                .await;
+                add(&state, repository.clone(), second, file("c.bin"), "c.bin").await;
+
+                let revision = commit_in_memory_revision(
+                    repository.clone(),
+                    &token(),
+                    state,
+                    metadata_on(branch),
+                    Hash::default(),
+                    branch,
+                )
+                .await
+                .expect("a nested tree must commit");
+
+                let published = State::deserialize(repository.clone(), revision)
+                    .await
+                    .expect("the committed revision must deserialize");
+                for path in ["first/a.bin", "first/inner/b.bin", "second/c.bin"] {
+                    let link = published
+                        .find_node_link(repository.clone(), path)
+                        .await
+                        .unwrap_or_else(|err| {
+                            panic!("the committed tree must hold {path}: {err:?}")
+                        });
+                    let node = published
+                        .node(repository.clone(), link.node)
+                        .await
+                        .expect("the node must read back");
+                    assert!(
+                        !node.is_dirty_or_staged(),
+                        "{path} must carry no change flags, got 0x{:x}",
+                        node.flags
+                    );
+                }
+            }))
+            .await
+            .expect("Task failed");
+    }
+
     /// The freeze treats a staged link exactly like a file — there is nothing to
     /// fragment and no subtree of its own to walk, since that lives in the linked
     /// repository. What has to survive is its identity as a link: the address is the
@@ -203,7 +208,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let repository = test_repository(mutable).await;
                 let branch = branch_id();
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let target_revision = Hash::from_u64(0xabcd);
                 let target_repository = Context::from(uuid::Uuid::now_v7());
@@ -276,7 +281,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let repository = test_repository(mutable).await;
                 let branch = branch_id();
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let count = BLOCK_NODE_COUNT * 3;
                 let mut last = ROOT_NODE;
@@ -350,7 +355,7 @@ mod tests {
                 let error = commit_in_memory_revision(
                     repository,
                     &token(),
-                    Arc::new(State::new()),
+                    State::new(),
                     Metadata::new(),
                     Hash::default(),
                     branch,
@@ -384,7 +389,7 @@ mod tests {
                 commit_in_memory_revision(
                     repository,
                     &token(),
-                    Arc::new(State::new()),
+                    State::new(),
                     metadata_on(branch),
                     Hash::default(),
                     branch,
@@ -404,7 +409,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let repository = test_repository(mutable).await;
                 let branch = branch_id();
-                let state = Arc::new(State::new());
+                let state = State::new();
                 add(
                     &state,
                     repository.clone(),
@@ -457,7 +462,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let repository = test_repository(mutable).await;
                 let branch = branch_id();
-                let state = Arc::new(State::new());
+                let state = State::new();
                 add(
                     &state,
                     repository.clone(),
@@ -534,7 +539,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let repository = test_repository(mutable).await;
                 let branch = branch_id();
-                let state = Arc::new(State::new());
+                let state = State::new();
                 add(
                     &state,
                     repository.clone(),
@@ -604,7 +609,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let repository = test_repository(mutable).await;
                 let branch = branch_id();
-                let state = Arc::new(State::new());
+                let state = State::new();
                 let node_id = add(
                     &state,
                     repository.clone(),
@@ -656,7 +661,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let repository = test_repository(mutable).await;
                 let branch = branch_id();
-                let state = Arc::new(State::new());
+                let state = State::new();
                 let unhashed = Node {
                     address: Address::default(),
                     ..file("a.bin")
@@ -717,7 +722,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let repository = test_repository(mutable).await;
                 let branch = branch_id();
-                let state = Arc::new(State::new());
+                let state = State::new();
                 add(
                     &state,
                     repository.clone(),
@@ -786,7 +791,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let repository = test_repository(mutable).await;
                 let branch = branch_id();
-                let state = Arc::new(State::new());
+                let state = State::new();
                 add(
                     &state,
                     repository.clone(),
@@ -835,7 +840,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let repository = test_repository(mutable).await;
                 let branch = branch_id();
-                let state = Arc::new(State::new());
+                let state = State::new();
                 add(
                     &state,
                     repository.clone(),
@@ -896,7 +901,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let repository = test_repository(mutable).await;
                 let branch = branch_id();
-                let state = Arc::new(State::new());
+                let state = State::new();
                 add(
                     &state,
                     repository.clone(),
@@ -946,7 +951,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let repository = test_repository(mutable).await;
                 let branch = branch_id();
-                let state = Arc::new(State::new());
+                let state = State::new();
                 add(
                     &state,
                     repository.clone(),
@@ -987,7 +992,7 @@ mod tests {
 
                 let error = resolve_commit_branch(
                     repository,
-                    Arc::new(State::new()),
+                    State::new(),
                     &Metadata::new(),
                     Hash::default(),
                 )
@@ -1016,7 +1021,7 @@ mod tests {
 
                 let error = resolve_commit_branch(
                     repository,
-                    Arc::new(State::new()),
+                    State::new(),
                     &Metadata::new(),
                     Hash::from_u64(0x99),
                 )
@@ -1043,7 +1048,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let repository = test_repository(mutable).await;
                 let parent_branch = branch_id();
-                let state = Arc::new(State::new());
+                let state = State::new();
                 add(
                     &state,
                     repository.clone(),
@@ -1105,7 +1110,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let repository = test_repository(mutable).await;
                 let parent_branch = branch_id();
-                let state = Arc::new(State::new());
+                let state = State::new();
                 add(
                     &state,
                     repository.clone(),
@@ -1155,6 +1160,72 @@ mod tests {
                     error.is_invalid_arguments(),
                     "Expected InvalidArguments, got {error}"
                 );
+            }))
+            .await
+            .expect("Task failed");
+    }
+
+    /// A memory-based handle has no working tree, so a conflict on any kind of node has no file to
+    /// resolve and no markers to read. The freeze clears the flags of everything it walks, so an
+    /// unresolved one has to be refused rather than published as settled.
+    #[tokio::test]
+    async fn commit_in_memory_revision_rejects_an_unresolved_conflict() {
+        let (_immutable, mutable, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let repository = test_repository(mutable).await;
+
+                let linked = Node {
+                    flags: NodeFlags::Link.bits(),
+                    mode: 0o755,
+                    name_hash: hash_string("node"),
+                    child: 7,
+                    address: Address {
+                        hash: Hash::from_u64(0xabcd),
+                        context: Context::from(uuid::Uuid::now_v7()),
+                    },
+                    ..Default::default()
+                };
+
+                for conflicted in [file("node"), directory("node"), linked] {
+                    let branch = branch_id();
+                    let state = State::new();
+                    let node_id =
+                        add(&state, repository.clone(), ROOT_NODE, conflicted, "node").await;
+                    state
+                        .node_mark_staged(
+                            repository.clone(),
+                            node_id,
+                            NodeFlags::StagedMergeConflict,
+                            NodeFlags::NoFlags,
+                        )
+                        .await
+                        .expect("marking the conflict must succeed");
+
+                    let failure = commit_in_memory_revision(
+                        repository.clone(),
+                        &token(),
+                        state,
+                        metadata_on(branch),
+                        Hash::default(),
+                        branch,
+                    )
+                    .await
+                    .expect_err("an unresolved conflict must not reach a revision");
+
+                    assert!(
+                        failure.error.is_conflict(),
+                        "Expected Conflict, got {failure}"
+                    );
+                    assert!(
+                        branch::load_latest(repository.clone(), branch)
+                            .await
+                            .unwrap_or_default()
+                            .is_zero(),
+                        "the branch must hold no revision"
+                    );
+                }
             }))
             .await
             .expect("Task failed");

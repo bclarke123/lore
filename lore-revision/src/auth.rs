@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::interface::LoreString;
@@ -8,6 +7,10 @@ use crate::interface::LoreString;
 pub mod access_admin;
 pub mod login;
 pub mod userinfo;
+
+pub use lore_transport::auth::AuthMode;
+pub use lore_transport::auth::AuthPath;
+pub use lore_transport::auth::UnknownAuthMode;
 
 /////////////////////////////////
 // General Notes for Auth token handling
@@ -23,9 +26,28 @@ pub mod userinfo;
 
 /// Event data carrying an authentication URL for the user to open.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreAuthUrlEventData {
     /// Authentication URL
     pub url: LoreString,
+    /// Code the user enters or confirms at `url`. Empty when the login
+    /// doesn't ask for one.
+    pub user_code: LoreString,
+}
+
+/// Event data for one wait in an interactive login: the user has not
+/// approved it yet, and the client is about to wait `interval_secs` before
+/// asking again. Emitted once per poll, so a consumer can show that the
+/// login is still in progress against a provider with a long interval.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreAuthPendingEventData {
+    /// Whole seconds since polling began.
+    pub elapsed_secs: u64,
+    /// Whole seconds until the next poll.
+    pub interval_secs: u64,
+    /// Whole seconds left before the session expires unapproved.
+    pub remaining_secs: u64,
 }

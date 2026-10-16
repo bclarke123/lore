@@ -4,6 +4,9 @@ edition = "2024"
 version.workspace = true
 publish = false
 
+[lib]
+test = false
+
 [dependencies]
 async-trait = { workspace = true }
 opentelemetry = { workspace = true }
@@ -22,3 +25,6 @@ mockall = { workspace = true }
 rand = { workspace = true }
 temp-env = { workspace = true }
 uuid = { workspace = true }
+
+[lints]
+workspace = true

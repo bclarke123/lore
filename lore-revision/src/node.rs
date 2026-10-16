@@ -6,7 +6,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use bitflags::bitflags;
-use bytes::Bytes;
 use lore_base::allocator::HeapBox;
 use lore_base::allocator::HeapBuf;
 use lore_base::allocator::node_block_allocator;
@@ -29,6 +28,8 @@ use crate::immutable;
 use crate::immutable::ImmutableError;
 use crate::immutable::ReadBoxFromImmutable;
 use crate::interface::LoreNodeStagedAction;
+use crate::interface::LoreNodeType;
+use crate::link::LinkedState;
 use crate::lore::Address;
 use crate::lore::CloneHeapAlloc;
 use crate::lore::Hash;
@@ -36,8 +37,10 @@ use crate::lore::RepositoryId;
 use crate::lore::ZeroHeapAlloc;
 use crate::lore_debug;
 use crate::lore_trace;
+use crate::lore_warn;
 use crate::node;
 use crate::repository::RepositoryContext;
+use crate::repository::is_reserved_node_name;
 use crate::state::State;
 use crate::state::StateError;
 
@@ -209,6 +212,16 @@ bitflagsops!(NodeFlags, u16);
 impl NodeFlags {
     pub fn is_directory(&self) -> bool {
         !(self.contains(NodeFlags::File) || self.contains(NodeFlags::Link))
+    }
+
+    pub fn node_type(&self) -> LoreNodeType {
+        if self.contains(NodeFlags::File) {
+            LoreNodeType::File
+        } else if self.contains(NodeFlags::Link) {
+            LoreNodeType::Link
+        } else {
+            LoreNodeType::Directory
+        }
     }
 }
 
@@ -452,6 +465,10 @@ impl Node {
     /// Check if the node is a directory
     pub fn is_directory(&self) -> bool {
         !self.is_file() && !self.is_link()
+    }
+
+    pub fn node_type(&self) -> LoreNodeType {
+        NodeFlags::from_bits_retain(self.flags).node_type()
     }
 
     /// Check if node is marked as discarded
@@ -709,96 +726,6 @@ impl SiblingCycleGuard {
         }
         self.steps += 1;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod cycle_tests {
-    use super::*;
-
-    #[test]
-    fn clean_chain_passes() {
-        let mut guard = SiblingCycleGuard::new(1);
-        for id in 2..1000 {
-            guard.observe(id).expect("clean chain should not trip");
-        }
-    }
-
-    #[test]
-    fn self_loop_at_head_detected() {
-        // A.sibling = A, walked as A, A, A, ...
-        let mut guard = SiblingCycleGuard::new(1);
-        guard.observe(42).unwrap();
-        guard.observe(42).unwrap();
-        let err = guard.observe(42).expect_err("self loop must trip");
-        assert_eq!(err.node, 42);
-        assert_eq!(err.expected_parent, 1);
-        assert_eq!(err.actual_parent, 42);
-    }
-
-    #[test]
-    fn two_cycle_detected() {
-        // A -> B -> A -> B -> ...
-        let mut guard = SiblingCycleGuard::new(1);
-        guard.observe(10).unwrap();
-        guard.observe(20).unwrap();
-        guard.observe(10).unwrap();
-        guard.observe(20).expect_err("two-cycle must trip");
-    }
-
-    #[test]
-    fn three_cycle_detected() {
-        // A -> B -> C -> A -> B -> C -> A ...
-        let chain = [10u32, 20, 30, 10, 20, 30, 10];
-        let mut guard = SiblingCycleGuard::new(1);
-        let mut tripped_at = None;
-        for (i, id) in chain.iter().enumerate() {
-            if guard.observe(*id).is_err() {
-                tripped_at = Some(i);
-                break;
-            }
-        }
-        let i = tripped_at.expect("three-cycle must trip");
-        assert!(i <= 6, "expected detection within 7 steps, got step {i}");
-    }
-
-    #[test]
-    fn mid_chain_cycle_detected() {
-        // A -> B -> C -> D -> E -> F -> G -> D -> E -> F -> G -> D ...
-        let mut chain = vec![10u32, 20, 30, 40, 50, 60, 70];
-        for _ in 0..20 {
-            chain.extend_from_slice(&[40, 50, 60, 70]);
-        }
-        let mut guard = SiblingCycleGuard::new(1);
-        let mut tripped = false;
-        for id in &chain {
-            if guard.observe(*id).is_err() {
-                tripped = true;
-                break;
-            }
-        }
-        assert!(tripped, "mid-chain cycle must trip");
-    }
-
-    #[test]
-    fn worst_case_bound_holds_for_small_cycles() {
-        // For chain length N ≤ 2^k, detection step ≤ 3N.
-        // Try several cycle sizes and verify the bound.
-        for cycle_len in [1u32, 2, 3, 5, 8, 10, 13, 64, 256] {
-            let mut guard = SiblingCycleGuard::new(1);
-            let mut steps = 0u32;
-            loop {
-                let id = 100 + (steps % cycle_len);
-                steps += 1;
-                if guard.observe(id).is_err() {
-                    break;
-                }
-                assert!(
-                    steps < 3 * cycle_len.max(1) + 10,
-                    "cycle_len={cycle_len} took {steps} steps, exceeds bound",
-                );
-            }
-        }
     }
 }
 
@@ -1131,6 +1058,11 @@ impl NodeBlockOwnedReader {
     pub fn node_block(&self) -> &NodeBlockData {
         &self.lock.data
     }
+
+    /// The name table exactly as it is to be stored.
+    pub fn name_table(&self) -> &[u8] {
+        &self.lock.name
+    }
 }
 
 #[error_set]
@@ -1139,10 +1071,18 @@ pub enum NodeNameError {
     Oversized,
 }
 
+/// The content rules a name is held to on both the read and the write path: no traversal, no
+/// separator, no leading NUL, and not the repository's own directory in any ASCII case.
 fn validate_node_name(name: &str) -> Result<(), NodeNameError> {
     if name == ".." || name.starts_with('\0') || name.bytes().any(|b| b == b'/' || b == b'\\') {
         return Err(InvalidArguments {
             reason: format!("invalid node name: {name}"),
+        }
+        .into());
+    }
+    if is_reserved_node_name(name) {
+        return Err(InvalidArguments {
+            reason: format!("reserved node name: {name}"),
         }
         .into());
     }
@@ -1323,7 +1263,26 @@ impl NodeBlock {
     /// Callers must drop the returned value before calling `write()` on the same block,
     /// or the write lock acquisition will deadlock.
     pub fn node_name_ref(&self, node_index: usize) -> Result<NodeNameLock, NodeNameError> {
+        Self::name_lock(self.data.read_arc(), node_index)
+    }
+
+    /// A copy of a node and its name, both read under one read lock, which the name keeps
+    /// held; see [`Self::node_name_ref`].
+    pub fn node_and_name_ref(
+        &self,
+        node_index: usize,
+    ) -> (Node, Result<NodeNameLock, NodeNameError>) {
         let guard = self.data.read_arc();
+        let node = guard.data.node[node_index];
+        (node, Self::name_lock(guard, node_index))
+    }
+
+    /// The name of the node at `node_index`, read from the name table `guard` holds, which the
+    /// name keeps held.
+    fn name_lock(
+        guard: parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, NodeBlockRuntimeData>,
+        node_index: usize,
+    ) -> Result<NodeNameLock, NodeNameError> {
         let node = &guard.data.node[node_index];
         let offset = node.name_offset as usize;
         let length = node.name_length as usize;
@@ -1346,6 +1305,32 @@ impl NodeBlock {
         })
     }
 
+    /// [`Self::node_name_ref`], answering `None` for a node whose name the read path refuses,
+    /// logged as the node being skipped under `node_id`.
+    ///
+    /// A walk that lists or materializes content stands on this, so a name no node may carry
+    /// reaches neither disk nor a listing, and the walk carries on past the node. A name that
+    /// cannot be read at all is still an error.
+    ///
+    /// As with [`Self::node_name_ref`], the returned `NodeNameLock` holds a read lock on the
+    /// block data for its lifetime. Callers must drop it before calling `write()` on the same
+    /// block, or the write lock acquisition will deadlock. Nothing is held when the answer is
+    /// `None`.
+    pub fn node_name_ref_or_skip(
+        &self,
+        node_index: usize,
+        node_id: NodeID,
+    ) -> Result<Option<NodeNameLock>, NodeNameError> {
+        match self.node_name_ref(node_index) {
+            Ok(name) => Ok(Some(name)),
+            Err(err) if err.is_invalid_arguments() => {
+                lore_warn!("Skipping node {node_id} with invalid name: {err}");
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub async fn deserialize_nametable(
         &self,
         repository: Arc<RepositoryContext>,
@@ -1354,7 +1339,7 @@ impl NodeBlock {
             return Ok(());
         }
 
-        Box::pin(async move { self.deserialize_nametable_impl(repository).await }).await
+        Box::pin(self.deserialize_nametable_impl(repository)).await
     }
 
     async fn deserialize_nametable_impl(
@@ -1396,6 +1381,9 @@ impl NodeBlock {
         lock.node_name_repack();
     }
 
+    /// Reads the node block at `address`, falling back to the older block formats when it does not
+    /// read as the current one. The fallback is boxed, as only older repositories and failed reads
+    /// take it.
     pub async fn deserialize(
         repository: Arc<RepositoryContext>,
         state: &State,
@@ -1414,7 +1402,7 @@ impl NodeBlock {
             block_data.flags &= !NodeBlockFlags::DeferRepackNametable;
             Ok(NodeBlock::new(block_data))
         } else {
-            Self::deserialize_other_version(repository, state, address).await
+            Box::pin(Self::deserialize_other_version(repository, state, address)).await
         }
     }
 
@@ -1585,10 +1573,6 @@ impl NodeBlockReader<'_> {
         &self.lock.data.node[node_index]
     }
 
-    pub fn clone_name_table(&self) -> Bytes {
-        Bytes::copy_from_slice(&self.lock.name)
-    }
-
     /// Access the full node block
     pub fn node_block(&self) -> &NodeBlockData {
         &self.lock.data
@@ -1748,6 +1732,19 @@ impl NodeBlockWriter<'_> {
         prev_length: u32,
     ) -> Result<(u32, u32), NodeNameError> {
         validate_node_name_for_store(name)?;
+        self.node_name_store_unchecked(name, prev_offset, prev_length)
+    }
+
+    /// [`Self::node_name_store`] without the name rules. Only a test has a use for it: a
+    /// name table written before a rule existed can hold a name the rule refuses, and the
+    /// read path has to be shown refusing or skipping such a node.
+    #[lore_macro::test_pub]
+    fn node_name_store_unchecked(
+        &mut self,
+        name: &str,
+        prev_offset: u32,
+        prev_length: u32,
+    ) -> Result<(u32, u32), NodeNameError> {
         let prev_offset = prev_offset as usize;
         let prev_length = prev_length as usize;
         if name.len() <= prev_length && (prev_offset + prev_length) < self.lock.name.len() {
@@ -1853,12 +1850,20 @@ impl NodeLink {
         if self.is_valid_or_root()
             && (repository.id != self.repository || state.revision() != self.revision)
         {
-            let repository = repository.to_link_context(self.repository).await;
-            let state = State::deserialize(repository.clone(), self.revision).await?;
-            Ok((repository, state))
+            self.open(&repository).await
         } else {
             Ok((repository, state))
         }
+    }
+
+    /// The repository and revision state this link names, reached from `repository`.
+    pub async fn open(
+        &self,
+        repository: &Arc<RepositoryContext>,
+    ) -> Result<LinkedState, StateError> {
+        let repository = repository.to_link_context(self.repository).await;
+        let state = State::deserialize(repository.clone(), self.revision).await?;
+        Ok((repository, state))
     }
 }
 
@@ -1953,11 +1958,13 @@ impl NodeFileMetadata {
 pub const BLOCK_NODE_FILE_METADATA_COUNT: usize = BLOCK_NODE_COUNT;
 
 /// Old block count before the metadata block was extended to 512 elements
+#[lore_macro::test_pub]
 const BLOCK_NODE_FILE_METADATA_COUNT_V0: usize = 511;
 
-/// Block of file metadata, 65568 bytes, 32 bytes metadata, 512 blocks of 128 bytes each
+/// Block of file metadata, 65568 bytes, 32 bytes metadata, 512 blocks of 128 bytes each.
+/// Not `Copy`: at 64 KiB, an implicit copy puts the whole block on the stack.
 #[repr(C)]
-#[derive(Clone, Copy, IntoBytes, FromBytes, Immutable)]
+#[derive(Clone, IntoBytes, FromBytes, Immutable)]
 pub struct NodeFileMetadataBlockData {
     /// Block flags
     pub flags: u32,
@@ -1972,9 +1979,11 @@ pub struct NodeFileMetadataBlockData {
 impl ReadBoxFromImmutable for NodeFileMetadataBlockData {}
 block_payload_on_tree_heap!(NodeFileMetadataBlockData, ZeroHeapAlloc, CloneHeapAlloc);
 
-/// Legacy block of file metadata with 511 elements (old format before extension to 512)
+/// Legacy block of file metadata with 511 elements (old format before extension to 512).
+/// Not `Copy`: at 64 KiB, an implicit copy puts the whole block on the stack.
+#[lore_macro::test_pub]
 #[repr(C)]
-#[derive(Clone, Copy, IntoBytes, FromBytes, Immutable)]
+#[derive(IntoBytes, FromBytes, Immutable)]
 struct NodeFileMetadataBlockDataV0 {
     flags: u32,
     version: u32,
@@ -1988,7 +1997,8 @@ block_payload_on_tree_heap!(NodeFileMetadataBlockDataV0, ZeroHeapAlloc);
 impl NodeFileMetadataBlockDataV0 {
     /// Convert the old 511-element block into the current 512-element format.
     /// The last element is zero-initialized.
-    fn into_current(self) -> HeapBox<NodeFileMetadataBlockData> {
+    #[lore_macro::test_pub]
+    fn to_current(&self) -> HeapBox<NodeFileMetadataBlockData> {
         let mut block = NodeFileMetadataBlockData::new_from_heap_zeroed();
         block.flags = self.flags;
         block.version = self.version;
@@ -2014,7 +2024,7 @@ impl NodeFileMetadataBlockData {
                 )
                 .await
                 {
-                    Ok(old_block) => Ok(old_block.into_current()),
+                    Ok(old_block) => Ok(old_block.to_current()),
                     Err(_) => Err(original_err),
                 }
             }
@@ -2149,169 +2159,5 @@ impl NodeFileMetadataBlockWriter<'_> {
     /// [`NodeBlockWriter::clear_dirty`].
     pub fn clear_dirty(&mut self) {
         self.lock.dirty = false;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn node_with_flags(flags: u16) -> Node {
-        Node {
-            flags,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn dirty_flag_bit_positions() {
-        // V1: Dirty at bit 3
-        assert_eq!(NodeFlags::Dirty.bits(), 0b1000);
-        // V1: Dirty does not overlap with Staged (bit 4)
-        assert_eq!(NodeFlags::Dirty.bits() & NodeFlags::Staged.bits(), 0);
-        // V1: Dirty does not overlap with File/Module/ExternalName
-        assert_eq!(NodeFlags::Dirty.bits() & NodeFlags::File.bits(), 0);
-        assert_eq!(NodeFlags::Dirty.bits() & NodeFlags::Link.bits(), 0);
-
-        // V2: Dirty at bit 15
-        assert_eq!(NodeFlagsV2::Dirty.bits(), 1 << 15);
-        // V2: Dirty does not overlap with Staged (bit 16)
-        assert_eq!(NodeFlagsV2::Dirty.bits() & NodeFlagsV2::Staged.bits(), 0);
-    }
-
-    #[test]
-    fn dirty_compound_flags_v1() {
-        assert_eq!(
-            NodeFlags::DirtyModify.bits(),
-            NodeFlags::Dirty.bits() | NodeFlags::StagedModify.bits() & NodeFlags::ActionBits.bits()
-        );
-        assert_eq!(
-            NodeFlags::DirtyAdd.bits(),
-            NodeFlags::Dirty.bits() | NodeFlags::StagedAdd.bits() & NodeFlags::ActionBits.bits()
-        );
-        assert_eq!(
-            NodeFlags::DirtyDelete.bits(),
-            NodeFlags::Dirty.bits() | NodeFlags::StagedDelete.bits() & NodeFlags::ActionBits.bits()
-        );
-        assert_eq!(
-            NodeFlags::DirtyMove.bits(),
-            NodeFlags::Dirty.bits() | NodeFlags::StagedMove.bits() & NodeFlags::ActionBits.bits()
-        );
-        assert_eq!(
-            NodeFlags::DirtyCopy.bits(),
-            NodeFlags::Dirty.bits() | NodeFlags::StagedCopy.bits() & NodeFlags::ActionBits.bits()
-        );
-    }
-
-    #[test]
-    fn dirty_bits_mask() {
-        // DirtyBits = Dirty + ActionBits (bits 3, 5-9)
-        let expected = NodeFlags::Dirty.bits() | NodeFlags::ActionBits.bits();
-        assert_eq!(NodeFlags::DirtyBits.bits(), expected);
-        // DirtyBits does NOT include Staged (bit 4)
-        assert_eq!(NodeFlags::DirtyBits.bits() & NodeFlags::Staged.bits(), 0);
-        // DirtyBits does NOT include MergeBits
-        assert_eq!(NodeFlags::DirtyBits.bits() & NodeFlags::MergeBits.bits(), 0);
-    }
-
-    #[test]
-    fn action_bits_mask() {
-        // ActionBits = bits 5-9 (shared between Dirty and Staged)
-        let expected = (NodeFlags::StagedModify.bits()
-            | NodeFlags::StagedAdd.bits()
-            | NodeFlags::StagedDelete.bits()
-            | NodeFlags::StagedMove.bits()
-            | NodeFlags::StagedCopy.bits())
-            & !NodeFlags::Staged.bits();
-        assert_eq!(NodeFlags::ActionBits.bits(), expected);
-    }
-
-    #[test]
-    fn node_is_dirty_queries() {
-        // Clean node
-        let node = Node::default();
-        assert!(!node.is_dirty());
-        assert!(!node.is_dirty_modify());
-
-        // Dirty only
-        let node = node_with_flags(NodeFlags::DirtyModify.bits());
-        assert!(node.is_dirty());
-        assert!(node.is_dirty_modify());
-        assert!(!node.is_dirty_add());
-        assert!(!node.is_staged());
-
-        // Dirty+Staged (orthogonal)
-        let node = node_with_flags(NodeFlags::Dirty.bits() | NodeFlags::StagedModify.bits());
-        assert!(node.is_dirty());
-        assert!(node.is_staged());
-        assert!(node.is_staged_modify());
-        assert!(node.is_dirty_or_staged());
-    }
-
-    #[test]
-    fn node_has_any_change_flags() {
-        assert!(!Node::default().has_any_change_flags());
-        assert!(node_with_flags(NodeFlags::Dirty.bits()).has_any_change_flags());
-        assert!(node_with_flags(NodeFlags::Staged.bits()).has_any_change_flags());
-        assert!(!node_with_flags(NodeFlags::File.bits()).has_any_change_flags());
-    }
-
-    #[test]
-    fn clear_staged_flags_preserves_dirty() {
-        let mut node = node_with_flags(NodeFlags::Dirty.bits() | NodeFlags::StagedModify.bits());
-        node.clear_staged_flags();
-        assert!(node.is_dirty());
-        assert!(!node.is_staged());
-        assert_ne!(node.flags & NodeFlags::ActionBits.bits(), 0);
-    }
-
-    #[test]
-    fn clear_staged_flags_clears_action_when_no_dirty() {
-        let mut node = node_with_flags(NodeFlags::StagedModify.bits());
-        node.clear_staged_flags();
-        assert_eq!(
-            node.flags & (NodeFlags::StagedBits.bits() | NodeFlags::Dirty.bits()),
-            0
-        );
-    }
-
-    #[test]
-    fn clear_dirty_flags_preserves_staged() {
-        let mut node = node_with_flags(NodeFlags::Dirty.bits() | NodeFlags::StagedModify.bits());
-        node.clear_dirty_flags();
-        assert!(!node.is_dirty());
-        assert!(node.is_staged());
-        assert!(node.is_staged_modify());
-    }
-
-    #[test]
-    fn clear_dirty_flags_clears_action_when_no_staged() {
-        let mut node = node_with_flags(NodeFlags::DirtyModify.bits());
-        node.clear_dirty_flags();
-        assert_eq!(
-            node.flags & (NodeFlags::DirtyBits.bits() | NodeFlags::StagedBits.bits()),
-            0
-        );
-    }
-
-    #[test]
-    fn clear_all_change_flags() {
-        let mut node = node_with_flags(
-            NodeFlags::File.bits() | NodeFlags::Dirty.bits() | NodeFlags::StagedModify.bits(),
-        );
-        node.clear_all_change_flags();
-        assert!(node.is_file());
-        assert!(!node.is_dirty());
-        assert!(!node.is_staged());
-        assert_eq!(node.flags & NodeFlags::ActionBits.bits(), 0);
-    }
-
-    #[test]
-    fn action_bits_extraction() {
-        let node = node_with_flags(NodeFlags::DirtyMove.bits());
-        assert_eq!(
-            node.action_bits(),
-            NodeFlags::StagedMove.bits() & NodeFlags::ActionBits.bits()
-        );
     }
 }

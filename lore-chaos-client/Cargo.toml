@@ -26,3 +26,13 @@ test = false
 [lib]
 name = "lore_chaos_client"
 path = "src/lib.rs"
+test = false
+
+[features]
+test-util = []
+
+[dev-dependencies]
+lore-chaos-client = { path = ".", features = ["test-util"] }
+
+[lints]
+workspace = true

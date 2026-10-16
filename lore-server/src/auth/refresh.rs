@@ -142,8 +142,8 @@ impl RefreshTokenStore {
         }
     }
 
-    #[cfg(test)]
-    fn with_reuse_grace_ms(mut self, grace_ms: u64) -> Self {
+    #[cfg(feature = "test-util")]
+    pub fn with_reuse_grace_ms(mut self, grace_ms: u64) -> Self {
         self.reuse_grace_ms = grace_ms;
         self
     }
@@ -166,12 +166,12 @@ impl RefreshTokenStore {
     }
 
     /// Only token hashes touch storage; the raw value never does.
-    fn token_key(&self, token: &str) -> Hash {
+    fn token_key(token: &str) -> Hash {
         let digest = ring::digest::digest(&ring::digest::SHA256, token.as_bytes());
         lore_storage::hash::hash_function_arg_slice(b"lore", TOKEN_FUNCTION, digest.as_ref())
     }
 
-    fn family_key(&self, family: &str) -> Hash {
+    fn family_key(family: &str) -> Hash {
         lore_storage::hash::hash_function_arg(b"lore", FAMILY_FUNCTION, family)
     }
 
@@ -185,8 +185,7 @@ impl RefreshTokenStore {
         .await
         {
             Ok(pointer) if pointer != Hash::default() => pointer,
-            Ok(_) => return Ok(None),
-            Err(lore_storage::StoreError::AddressNotFound(_)) => return Ok(None),
+            Ok(_) | Err(lore_storage::StoreError::AddressNotFound(_)) => return Ok(None),
             Err(err) => return Err(RefreshError::Store(err.to_string())),
         };
         let metadata = Self::scoped(Metadata::deserialize(context, pointer))
@@ -239,9 +238,9 @@ impl RefreshTokenStore {
             rotated_at_ms: 0,
             successor: None,
         };
-        let key = self.token_key(&token);
+        let key = Self::token_key(&token);
         self.store_record(key, &record).await?;
-        self.store_value(self.family_key(&family), key).await?;
+        self.store_value(Self::family_key(&family), key).await?;
         Ok(token)
     }
 
@@ -249,7 +248,7 @@ impl RefreshTokenStore {
     /// The presented token is rotated away; presenting it again revokes the
     /// whole family.
     pub async fn refresh(&self, token: &str) -> Result<(ExternalIdentity, String), RefreshError> {
-        let key = self.token_key(token);
+        let key = Self::token_key(token);
         let Some(mut record) = self.load_record(key).await? else {
             return Err(RefreshError::Unknown);
         };
@@ -275,7 +274,7 @@ impl RefreshTokenStore {
                 idp = record.idp,
                 "Refresh token reuse detected; revoking family"
             );
-            let family_key = self.family_key(&record.family);
+            let family_key = Self::family_key(&record.family);
             let context = self.context();
             if let Some(handle) = context.try_write_mutable_store() {
                 // Load the family's active token key and tombstone it.
@@ -313,7 +312,7 @@ impl RefreshTokenStore {
         // Rotate: mark the presented token used, issue a successor in the
         // same family.
         let successor = random_token();
-        let successor_key = self.token_key(&successor);
+        let successor_key = Self::token_key(&successor);
         let successor_record = RefreshRecord {
             rotated: false,
             rotated_at_ms: 0,
@@ -322,7 +321,7 @@ impl RefreshTokenStore {
             ..record.clone()
         };
         self.store_record(successor_key, &successor_record).await?;
-        self.store_value(self.family_key(&record.family), successor_key)
+        self.store_value(Self::family_key(&record.family), successor_key)
             .await?;
         let identity = record.identity();
         record.rotated = true;
@@ -332,143 +331,5 @@ impl RefreshTokenStore {
 
         info!(idp = identity.idp, "Refresh token rotated");
         Ok((identity, successor))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use lore_base::runtime::LORE_CONTEXT;
-
-    use super::*;
-    use crate::store::test_store_create;
-
-    fn identity() -> ExternalIdentity {
-        ExternalIdentity {
-            subject: "alice".to_string(),
-            email: Some("alice@example.com".to_string()),
-            display_name: Some("Alice".to_string()),
-            idp: "static".to_string(),
-        }
-    }
-
-    async fn store(
-        ttl_seconds: u64,
-    ) -> (
-        RefreshTokenStore,
-        Arc<lore_revision::interface::ExecutionContext>,
-    ) {
-        let (immutable, mutable, execution) = test_store_create().await.expect("test stores");
-        (
-            RefreshTokenStore::new(immutable, mutable, ttl_seconds),
-            execution,
-        )
-    }
-
-    #[tokio::test]
-    async fn issue_then_refresh_rotates() {
-        let (store, execution) = store(3600).await;
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let token = store.issue(&identity()).await.expect("issue");
-
-            let (refreshed_identity, successor) = store.refresh(&token).await.expect("refresh");
-            assert_eq!(refreshed_identity, identity());
-            assert_ne!(successor, token);
-
-            // The successor works too.
-            let (_, third) = store.refresh(&successor).await.expect("second refresh");
-            assert_ne!(third, successor);
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn unknown_token_is_refused() {
-        let (store, execution) = store(3600).await;
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            assert!(matches!(
-                store.refresh("never-issued").await,
-                Err(RefreshError::Unknown)
-            ));
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn expired_token_is_refused() {
-        let (store, execution) = store(0).await;
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let token = store.issue(&identity()).await.expect("issue");
-            assert!(matches!(
-                store.refresh(&token).await,
-                Err(RefreshError::Unknown)
-            ));
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn concurrent_replay_within_grace_converges_on_one_successor() {
-        let (store, execution) = store(3600).await;
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let token = store.issue(&identity()).await.expect("issue");
-            let (_, successor) = store.refresh(&token).await.expect("refresh");
-
-            // A racing process replays the same token: same successor, no
-            // revocation — both processes now hold the same live token.
-            let (_, replayed) = store.refresh(&token).await.expect("replay in grace");
-            assert_eq!(replayed, successor);
-            store
-                .refresh(&successor)
-                .await
-                .expect("family survives the race");
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn reuse_revokes_the_family() {
-        // Grace 0 = every replay is past the window (the theft path).
-        let (store, execution) = store(3600).await;
-        let store = store.with_reuse_grace_ms(0);
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let token = store.issue(&identity()).await.expect("issue");
-            let (_, successor) = store.refresh(&token).await.expect("refresh");
-
-            // Replaying the rotated token is reuse...
-            assert!(matches!(
-                store.refresh(&token).await,
-                Err(RefreshError::ReuseDetected)
-            ));
-            // ...which revokes the active successor as well.
-            assert!(matches!(
-                store.refresh(&successor).await,
-                Err(RefreshError::Unknown)
-            ));
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn families_are_independent() {
-        let (store, execution) = store(3600).await;
-        let store = store.with_reuse_grace_ms(0);
-        Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let first_login = store.issue(&identity()).await.expect("issue");
-            let second_login = store.issue(&identity()).await.expect("issue");
-
-            // Killing the first family leaves the second alone.
-            let (_, successor) = store.refresh(&first_login).await.expect("refresh");
-            let _ = store.refresh(&first_login).await;
-            assert!(matches!(
-                store.refresh(&successor).await,
-                Err(RefreshError::Unknown)
-            ));
-
-            store
-                .refresh(&second_login)
-                .await
-                .expect("second family lives");
-        }))
-        .await;
     }
 }

@@ -421,6 +421,45 @@ fn oidc_invalid_tier_2_fails_validation_naming_both_settings() {
     }
 }
 
+/// A template without `{id}` names the same resource for every partition: the client
+/// would ask for one token for all of them, and the server would match one claim entry
+/// against every partition. Each is refused at startup, naming the setting.
+#[test]
+fn a_partition_template_without_its_placeholder_fails_validation() {
+    let cases = [
+        (
+            settings_with_oidc_keys(
+                TIER_2,
+                r#"resource_template = "https://lore.example.com/partitions/{ID}""#,
+            ),
+            "server.auth.oidc.resource_template",
+        ),
+        (
+            settings_with_oidc_keys(TIER_2, r#"scope_template = "partition""#),
+            "server.auth.oidc.scope_template",
+        ),
+        (
+            settings_with_oidc_keys(
+                r#"
+                    resource_claim = "resources"
+                    resource_id_template = "urc-all"
+                    "#,
+                r#"resource_template = "https://lore.example.com/partitions/{id}""#,
+            ),
+            "server.auth.resource_id_template",
+        ),
+    ];
+    for (settings, setting) in cases {
+        let error = validate_auth_config(&settings)
+            .expect_err("a template without {id} must fail validation");
+        let message = error.to_string();
+        assert!(
+            message.contains(setting) && message.contains("{id}"),
+            "the error must name {setting} and the placeholder: {message}"
+        );
+    }
+}
+
 #[test]
 fn oidc_with_a_keyword_jwt_issuer_fails_validation() {
     let settings = settings_with_auth_keys(
@@ -588,6 +627,25 @@ fn auth_with_token_minting_rejects_both_oidc_templates() {
     .expect("both templates still parse");
     validate_auth_config(&settings)
         .expect_err("resource_template and scope_template exclude each other");
+}
+
+#[test]
+fn auth_with_token_minting_rejects_oidc_template_without_placeholder() {
+    let settings = settings_with_auth_keys(
+        r#"
+        [server.auth.token]
+        generate_signing_key = true
+        issuer = "https://lore.example.com"
+        audience = ["lore.example.com"]
+        env = "test"
+        [server.auth.oidc]
+        client_id = "lore-cli"
+        resource_template = "https://lore.example.com/partitions"
+    "#,
+    )
+    .expect("a template without the placeholder still parses");
+    validate_auth_config(&settings)
+        .expect_err("an advertised resource_template must name the partition");
 }
 
 /// An empty list parses but would reject every token, which is never what

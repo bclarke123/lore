@@ -237,11 +237,20 @@ fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> 
             ));
         }
     }
+    if !auth.resource_id_template.contains(PARTITION_PLACEHOLDER) {
+        return Err(config::ConfigError::Message(format!(
+            "server.auth.resource_id_template must contain {PARTITION_PLACEHOLDER}, which stands \
+             for the partition ID"
+        )));
+    }
     if is_local_issuer {
         return validate_local_oidc_config(auth);
     }
     validate_oidc_config(auth, authorizer)
 }
+
+/// Where a partition template puts the partition ID.
+const PARTITION_PLACEHOLDER: &str = "{id}";
 
 /// A server that mints its own tokens serves its own login (the gRPC auth
 /// service and the OAuth endpoints) and authorizes from its grant store, so
@@ -260,6 +269,23 @@ fn validate_local_oidc_config(auth: &AuthSettings) -> Result<(), config::ConfigE
             "server.auth.oidc.resource_template and server.auth.oidc.scope_template are \
              both set. Set one",
         );
+    }
+    for (setting, template) in [
+        (
+            "server.auth.oidc.resource_template",
+            &oidc.resource_template,
+        ),
+        ("server.auth.oidc.scope_template", &oidc.scope_template),
+    ] {
+        if is_set(template)
+            && !template
+                .as_deref()
+                .is_some_and(|template| template.contains(PARTITION_PLACEHOLDER))
+        {
+            return error(&format!(
+                "{setting} must contain {PARTITION_PLACEHOLDER}, which stands for the partition ID"
+            ));
+        }
     }
     Ok(())
 }
@@ -310,6 +336,23 @@ fn validate_oidc_config(
         }
         (resource, scope) => resource || scope,
     };
+    for (setting, template) in [
+        (
+            "server.auth.oidc.resource_template",
+            &oidc.resource_template,
+        ),
+        ("server.auth.oidc.scope_template", &oidc.scope_template),
+    ] {
+        if is_set(template)
+            && !template
+                .as_deref()
+                .is_some_and(|template| template.contains(PARTITION_PLACEHOLDER))
+        {
+            return error(&format!(
+                "{setting} must contain {PARTITION_PLACEHOLDER}, which stands for the partition ID"
+            ));
+        }
+    }
     if is_set(&oidc.token_exchange_issuer) && !has_template {
         return error(
             "server.auth.oidc.token_exchange_issuer is set without \

@@ -66,10 +66,8 @@ enum SessionInner {
         resolver: PendingResolver,
         /// The session the resolver produced, read by every operation without a lock. Null
         /// before the first resolution and after an [`invalidate`](StorageSession::invalidate),
-        /// which forces a fresh `session_start` on the next operation — needed when a QUIC
-        /// reconnect has invalidated the server-side session map (the same connection-id is
-        /// gone, so our `session_id` is unknown on the new connection). Written only under
-        /// `resolution`.
+        /// which forces a fresh `session_start` on the next operation, as a read's retry of a
+        /// failed session asks for. Written only under `resolution`.
         current: Atomic<Arc<StorageSession>>,
         /// Serialises resolutions and invalidations, and holds a failed resolution's error.
         ///
@@ -548,6 +546,16 @@ impl SessionPool {
         *self.correlation_id == *correlation_id && !self.is_stale()
     }
 
+    /// Whether the connection this pool's first session runs on is marked stale, as the transport
+    /// marks one it has given up on. A connector starts every session of a pool on one connection.
+    pub fn connection_is_stale(&self) -> bool {
+        matches!(
+            self.sessions.first().map(|session| &session.inner),
+            Some(SessionInner::Resolved(resolved))
+                if resolved.connection.stale.load(Ordering::Relaxed)
+        )
+    }
+
     /// Returns the next session in the pool via round-robin.
     ///
     /// Every call advances the cursor, so only a caller that is going to use the
@@ -687,8 +695,7 @@ impl StorageConnector {
     /// another correlation id alike. Each started session is held as a [`StorageSession`], which
     /// stops it when its last reference drops: a losing racer's as its pool drops, and a failed
     /// or dropped start's as each start task ends, which it runs to even when this future is
-    /// dropped. A replaced entry's ids may name sessions this one started, since a reconnect
-    /// restarts the server's session ids.
+    /// dropped.
     pub async fn session_pool(
         &self,
         partition: Partition,

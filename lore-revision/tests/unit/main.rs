@@ -29,6 +29,7 @@ mod lock;
 mod merge;
 mod metadata;
 mod node;
+mod protocol;
 mod relay;
 mod repository;
 mod revision;

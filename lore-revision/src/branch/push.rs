@@ -1217,8 +1217,12 @@ async fn push_local_history(
     let dry_run = execution_context().globals().dry_run();
     let mut current_latest = Hash::default();
     let mut fast_forward_merged = false;
-    for current_revision in history.iter().rev() {
-        let mut current_revision = *current_revision;
+    // The revision pushed in the previous iteration, as (signature in local
+    // history, signature on the server). The next revision may follow its
+    // parent only to a revision the server stored under a new signature.
+    let mut renumbered_previous: Option<(Hash, Hash)> = None;
+    for original_revision in history.iter().rev() {
+        let mut current_revision = *original_revision;
 
         let state = State::deserialize(repository.clone(), current_revision)
             .await
@@ -1226,7 +1230,10 @@ async fn push_local_history(
 
         push_revision_links(repository, token, options, &state, branch).await?;
 
-        if !current_latest.is_zero() && state.parent_self() != current_latest {
+        if let Some((local, stored)) = renumbered_previous
+            && local != stored
+            && state.parent_self() == local
+        {
             // Rebase on new latest revision
             // TODO(mjansson): This only handles revision number rewrite for now, implement proper
             //                 automatic rebase if the push resulted in a clean rebase
@@ -1236,12 +1243,12 @@ async fn push_local_history(
                 LoreBranchPushRevisionUpdateBeginEventData {
                     revision: state.revision(),
                     old_parent: state.parent_self(),
-                    new_parent: current_latest,
+                    new_parent: stored,
                 },
             )
             .send();
 
-            state.set_parent_self(current_latest);
+            state.set_parent_self(stored);
             current_revision = state
                 .serialize(repository.clone(), token)
                 .await
@@ -1325,6 +1332,8 @@ async fn push_local_history(
 
                 remote_latest = response.revision;
                 current_latest = response.revision;
+                // The server stored what we pushed as the merge's other parent.
+                renumbered_previous = Some((*original_revision, current_revision));
 
                 event::LoreEvent::BranchPushRevisionPushEnd(
                     LoreBranchPushRevisionPushEndEventData {
@@ -1369,8 +1378,11 @@ async fn push_local_history(
 
             remote_latest = response.revision;
             current_latest = response.revision;
+            // The server rewrote the revision number, which changes the signature.
+            renumbered_previous = Some((*original_revision, response.revision));
         } else {
             current_latest = current_revision;
+            renumbered_previous = Some((*original_revision, current_revision));
         }
 
         let current_number = State::deserialize(repository.clone(), current_latest)
